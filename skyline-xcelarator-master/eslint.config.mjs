@@ -12,8 +12,8 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
-    "skyline-xcelarator-master/**",
   ]),
 ]);
+
 
 export default eslintConfig;

@@ -13,11 +13,15 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Xcelerator Query Brain",
-  description: "CSR order inquiry lookup for Xcelerator",
+  title: "PDF Parser",
+  description: "Upload a PDF to extract its text and metadata.",
 };
 
-export default function RootLayout({ children }: LayoutProps<"/">) {
+export default function RootLayout({
+  children,
+}: Readonly<{
+  children: React.ReactNode;
+}>) {
   return (
     <html
       lang="en"
