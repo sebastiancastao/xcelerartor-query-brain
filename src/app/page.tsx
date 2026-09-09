@@ -89,6 +89,44 @@ function Badge({ tone, children }: { tone: BadgeTone; children: ReactNode }) {
   );
 }
 
+function Field({ label, value }: { label: string; value: ReactNode }) {
+  if (value === null || value === undefined || value === "") return null;
+  return (
+    <div>
+      <p className="text-xs font-medium uppercase tracking-wide text-zinc-500 dark:text-zinc-400">
+        {label}
+      </p>
+      <p className="mt-0.5 text-sm text-zinc-800 dark:text-zinc-200">{value}</p>
+    </div>
+  );
+}
+
+function formatFullAddress(
+  street: string | null,
+  street2: string | null,
+  location: string,
+  zip: string | null,
+): string | null {
+  const lines = [street, street2].filter(Boolean).join(", ");
+  const cityStateZip = [location, zip].filter(Boolean).join(" ");
+  const combined = [lines, cityStateZip].filter(Boolean).join(", ");
+  return combined || null;
+}
+
+function formatContact(contact: string | null, phone: string | null, email: string | null): string | null {
+  return [contact, phone, email].filter(Boolean).join(" · ") || null;
+}
+
+function formatWeight(value: number | null): string | null {
+  if (value === null || value === 0) return null;
+  return `${value} lb`;
+}
+
+function formatDims(pkg: { length: number | null; width: number | null; height: number | null }): string | null {
+  if (pkg.length === null || pkg.width === null || pkg.height === null) return null;
+  return `${pkg.length} x ${pkg.width} x ${pkg.height} in`;
+}
+
 function StatusRow({
   label,
   answer,
@@ -116,6 +154,276 @@ function StatusRow({
     </div>
   );
 }
+
+const IFRAME_SHIPMENT_DETAILS_HTML = String.raw`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f6f8fb;
+      color: #18181b;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      padding: 24px;
+      background:
+        linear-gradient(135deg, rgba(79, 70, 229, 0.08), transparent 34%),
+        #f6f8fb;
+    }
+
+    .shipment {
+      width: min(100%, 920px);
+      margin: 0 auto;
+      overflow: hidden;
+      border: 1px solid #e4e4e7;
+      border-radius: 8px;
+      background: #ffffff;
+      box-shadow: 0 18px 45px rgba(24, 24, 27, 0.08);
+    }
+
+    .header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 22px 24px;
+      border-bottom: 1px solid #eef0f3;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 20px;
+      line-height: 1.2;
+      font-weight: 700;
+      letter-spacing: 0;
+    }
+
+    .invoice {
+      min-width: max-content;
+      border: 1px solid #dbe1ea;
+      border-radius: 8px;
+      padding: 8px 10px;
+      color: #52525b;
+      font-size: 12px;
+      font-weight: 600;
+      text-transform: uppercase;
+    }
+
+    .invoice strong {
+      display: block;
+      margin-top: 2px;
+      color: #18181b;
+      font-size: 15px;
+      text-transform: none;
+    }
+
+    .content {
+      padding: 24px;
+    }
+
+    .summary,
+    .totals {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 16px;
+    }
+
+    .totals {
+      margin-top: 22px;
+      padding-top: 20px;
+      border-top: 1px solid #eef0f3;
+    }
+
+    .stops {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 22px;
+      margin-top: 22px;
+      padding-top: 22px;
+      border-top: 1px solid #eef0f3;
+    }
+
+    .stop-title {
+      margin: 0 0 14px;
+      color: #71717a;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+
+    dl {
+      margin: 0;
+    }
+
+    .field {
+      min-width: 0;
+      overflow-wrap: anywhere;
+    }
+
+    .field + .field {
+      margin-top: 13px;
+    }
+
+    dt {
+      color: #71717a;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      line-height: 1.35;
+      text-transform: uppercase;
+    }
+
+    dd {
+      margin: 3px 0 0;
+      color: #27272a;
+      font-size: 14px;
+      line-height: 1.45;
+    }
+
+    .summary .field + .field,
+    .totals .field + .field {
+      margin-top: 0;
+    }
+
+    @media (max-width: 720px) {
+      body {
+        padding: 12px;
+      }
+
+      .header,
+      .content {
+        padding: 18px;
+      }
+
+      .header,
+      .stops {
+        grid-template-columns: 1fr;
+      }
+
+      .header {
+        display: grid;
+      }
+
+      .summary,
+      .totals {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+
+    @media (max-width: 440px) {
+      .summary,
+      .totals {
+        grid-template-columns: 1fr;
+      }
+
+      .invoice {
+        width: 100%;
+      }
+    }
+  </style>
+</head>
+<body>
+  <section class="shipment" aria-labelledby="shipment-title">
+    <header class="header">
+      <h1 id="shipment-title">Shipment details</h1>
+      <div class="invoice">Invoice #<strong>FR8T-2256</strong></div>
+    </header>
+
+    <div class="content">
+      <dl class="summary">
+        <div class="field">
+          <dt>Order type</dt>
+          <dd>PD</dd>
+        </div>
+        <div class="field">
+          <dt>Service</dt>
+          <dd>ASAP</dd>
+        </div>
+        <div class="field">
+          <dt>Vehicle</dt>
+          <dd>Straight Truck</dd>
+        </div>
+      </dl>
+
+      <div class="stops">
+        <section>
+          <h2 class="stop-title">Shipper</h2>
+          <dl>
+            <div class="field">
+              <dt>Company</dt>
+              <dd>Package All</dd>
+            </div>
+            <div class="field">
+              <dt>Address</dt>
+              <dd>1412 Battlecreek Rd, Suite 200, Jonesboro, GA 30236</dd>
+            </div>
+            <div class="field">
+              <dt>Contact</dt>
+              <dd>Ryan Stapleton &middot; 631 838-3999</dd>
+            </div>
+            <div class="field">
+              <dt>Target window</dt>
+              <dd>7/15/2025, 3:30:00 PM</dd>
+            </div>
+            <div class="field">
+              <dt>Departed</dt>
+              <dd>7/14/2025, 3:50:00 PM</dd>
+            </div>
+          </dl>
+        </section>
+
+        <section>
+          <h2 class="stop-title">Consignee</h2>
+          <dl>
+            <div class="field">
+              <dt>Company</dt>
+              <dd>Catalyst Nutraceuticals</dd>
+            </div>
+            <div class="field">
+              <dt>Address</dt>
+              <dd>1720 Peachtree Industrial Blvd, Buford, GA 30518</dd>
+            </div>
+            <div class="field">
+              <dt>Contact</dt>
+              <dd>Lou Pena</dd>
+            </div>
+            <div class="field">
+              <dt>Target window</dt>
+              <dd>7/15/2025, 3:30:00 PM</dd>
+            </div>
+            <div class="field">
+              <dt>Departed</dt>
+              <dd>7/15/2025, 8:45:00 AM</dd>
+            </div>
+          </dl>
+        </section>
+      </div>
+
+      <dl class="totals">
+        <div class="field">
+          <dt>Pieces</dt>
+          <dd>8</dd>
+        </div>
+        <div class="field">
+          <dt>Total weight</dt>
+          <dd>3956 lb</dd>
+        </div>
+      </dl>
+    </div>
+  </section>
+</body>
+</html>`;
 
 export default function Home() {
   const [referenceNumber, setReferenceNumber] = useState("");
@@ -404,6 +712,145 @@ export default function Home() {
             </section>
 
             <section className="rounded-2xl border border-zinc-200/70 bg-white p-6 shadow-sm dark:border-zinc-800/70 dark:bg-zinc-900">
+              <h2 className="mb-4 text-sm font-semibold text-zinc-900 dark:text-zinc-100">Shipment details</h2>
+
+              <div className="grid grid-cols-2 gap-4 sm:grid-cols-3">
+                <Field label="Reference 2" value={order.referenceNumber2} />
+                <Field label="Reference 3" value={order.referenceNumber3} />
+                <Field label="Reference 4" value={order.referenceNumber4} />
+                <Field label="Invoice #" value={order.invoiceNumber} />
+                <Field label="Order type" value={order.orderType} />
+                <Field label="Service" value={order.service} />
+                <Field label="Vehicle" value={order.vehicle} />
+                <Field label="Third-party tracking #" value={order.thirdPartyTrackingRefNo} />
+              </div>
+
+              {(order.caller.name || order.caller.department || order.caller.phone || order.caller.email) && (
+                <div className="mt-5 grid grid-cols-2 gap-4 border-t border-zinc-100 pt-4 dark:border-zinc-800 sm:grid-cols-3">
+                  <Field label="Called in by" value={order.caller.name} />
+                  <Field label="Department" value={order.caller.department} />
+                  <Field
+                    label="Caller contact"
+                    value={formatContact(null, order.caller.phone, order.caller.email)}
+                  />
+                </div>
+              )}
+
+              <div className="mt-5 grid gap-4 border-t border-zinc-100 pt-4 dark:border-zinc-800 sm:grid-cols-2">
+                <div className="space-y-3">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-zinc-400 dark:text-zinc-500">
+                    Shipper
+                  </p>
+                  <Field label="Company" value={order.pickup.company} />
+                  <Field
+                    label="Address"
+                    value={formatFullAddress(
+                      order.pickup.street,
+                      order.pickup.street2,
+                      order.pickup.location,
+                      order.pickup.zip,
+                    )}
+                  />
+                  <Field
+                    label="Contact"
+                    value={formatContact(order.pickup.contact, order.pickup.phone, order.pickup.email)}
+                  />
+                  <Field label="Target window" value={formatMaybeDate(order.pickup.scheduledTo)} />
+                  <Field label="Departed" value={formatMaybeDate(order.pickup.departedAt)} />
+                  <Field label="Special instructions" value={order.pickup.specialInstructions} />
+                </div>
+                <div className="space-y-3">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-zinc-400 dark:text-zinc-500">
+                    Consignee
+                  </p>
+                  <Field label="Company" value={order.delivery.company} />
+                  <Field
+                    label="Address"
+                    value={formatFullAddress(
+                      order.delivery.street,
+                      order.delivery.street2,
+                      order.delivery.location,
+                      order.delivery.zip,
+                    )}
+                  />
+                  <Field
+                    label="Contact"
+                    value={formatContact(order.delivery.contact, order.delivery.phone, order.delivery.email)}
+                  />
+                  <Field label="Target window" value={formatMaybeDate(order.delivery.scheduledTo)} />
+                  <Field label="Departed" value={formatMaybeDate(order.delivery.departedAt)} />
+                  <Field label="Special instructions" value={order.delivery.specialInstructions} />
+                </div>
+              </div>
+
+              {(order.shipment.pieces || order.shipment.weight || order.shipment.declaredValue) && (
+                <div className="mt-5 grid grid-cols-2 gap-4 border-t border-zinc-100 pt-4 dark:border-zinc-800 sm:grid-cols-3">
+                  <Field label="Pieces" value={order.shipment.pieces} />
+                  <Field label="Total weight" value={formatWeight(order.shipment.weight)} />
+                  <Field
+                    label="Declared value"
+                    value={
+                      order.shipment.declaredValue
+                        ? new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(
+                            order.shipment.declaredValue,
+                          )
+                        : null
+                    }
+                  />
+                </div>
+              )}
+
+              {order.shipment.packages.length > 0 && (
+                <div className="mt-5 overflow-x-auto border-t border-zinc-100 pt-4 dark:border-zinc-800">
+                  <table className="w-full min-w-[420px] border-collapse text-left text-sm">
+                    <thead className="text-xs uppercase text-zinc-500 dark:text-zinc-400">
+                      <tr>
+                        <th className="py-1 pr-4 font-medium">Package</th>
+                        <th className="py-1 pr-4 font-medium">Ref #</th>
+                        <th className="py-1 pr-4 font-medium">Weight</th>
+                        <th className="py-1 font-medium">Dimensions</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-zinc-100 dark:divide-zinc-800">
+                      {order.shipment.packages.map((pkg, i) => (
+                        <tr key={pkg.refNo ?? i}>
+                          <td className="py-2 pr-4 text-zinc-800 dark:text-zinc-200">{pkg.name ?? "—"}</td>
+                          <td className="py-2 pr-4 text-zinc-800 dark:text-zinc-200">{pkg.refNo ?? "—"}</td>
+                          <td className="py-2 pr-4 text-zinc-800 dark:text-zinc-200">
+                            {formatWeight(pkg.weight) ?? "—"}
+                          </td>
+                          <td className="py-2 text-zinc-800 dark:text-zinc-200">{formatDims(pkg) ?? "—"}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+
+              {(order.cod.amount || order.specialInstructions || order.documents.length > 0) && (
+                <div className="mt-5 grid grid-cols-2 gap-4 border-t border-zinc-100 pt-4 dark:border-zinc-800 sm:grid-cols-3">
+                  <Field
+                    label="COD"
+                    value={
+                      order.cod.amount
+                        ? `${new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(order.cod.amount)}${order.cod.location ? ` (${order.cod.location})` : ""}`
+                        : null
+                    }
+                  />
+                  <Field label="Order-level instructions" value={order.specialInstructions} />
+                  <Field
+                    label="Documents"
+                    value={
+                      order.documents.length > 0
+                        ? order.documents.map((doc) => doc.name ?? doc.fileFormat ?? "file").join(", ")
+                        : null
+                    }
+                  />
+                </div>
+              )}
+            </section>
+
+            <section className="rounded-2xl border border-zinc-200/70 bg-white p-6 shadow-sm dark:border-zinc-800/70 dark:bg-zinc-900">
               <div className="mb-3 flex items-center justify-between">
                 <div className="flex items-center gap-2">
                   <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">AI-suggested reply</h2>
@@ -427,6 +874,17 @@ export default function Home() {
             </section>
           </div>
         )}
+
+        <section className="rounded-2xl border border-zinc-200/70 bg-white p-4 shadow-sm dark:border-zinc-800/70 dark:bg-zinc-900 sm:p-5">
+          <div className="mb-3 flex items-center justify-between">
+            <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Shipment details iframe</h2>
+          </div>
+          <iframe
+            srcDoc={IFRAME_SHIPMENT_DETAILS_HTML}
+            title="Formatted shipment details"
+            className="h-[650px] w-full rounded-xl border border-zinc-200 dark:border-zinc-800"
+          />
+        </section>
       </main>
     </div>
   );

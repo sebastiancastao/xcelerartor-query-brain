@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import {
   AxisApiError,
+  chargeLineItems,
   getAllOrdersFromAxisRaw,
   isAxisApiConfigured,
   type TrackOrderV4Response,
@@ -15,34 +16,89 @@ import { xceleratorConfigFromEnv } from "@/lib/xcelerator-portal";
 // debug button actually show something; ?from=/?to= override it.
 const DEFAULT_LOOKBACK_DAYS = 365;
 
+// Deliberately as wide as each source actually offers — this is the raw-debug
+// endpoint, so the point is to show everything Axis (or the ClientPortal
+// fallback) sends back rather than the trimmed-down shape CompletedOrderSummary/
+// OrderInquiry use elsewhere. Fields the current source can't supply (the
+// ClientPortal list endpoint has no pickup/delivery target or arrival times
+// and no itemized charge breakdown — see PortalOrderRow's comment in
+// xcelerator.ts) come back null/empty rather than guessed at.
 type DebugOrderRow = {
   orderTrackingId: string | null;
+  accountNo: string | null;
   oDate: string | null;
   status: string | null;
   clientRefNo: string | null;
   pickupCompany: string | null;
+  pickupCity: string | null;
+  pickupState: string | null;
+  pickupTargetFrom: string | null;
+  pickupArrival: string | null;
   deliveryCompany: string | null;
+  deliveryCity: string | null;
+  deliveryState: string | null;
+  deliveryTargetFrom: string | null;
+  deliveryArrival: string | null;
+  podCompletion: string | null;
+  hasPodSignature: boolean | null;
+  podName: string | null;
+  grandTotal: number | null;
+  chargeBreakdown: { label: string; amount: number }[];
+  documents: { name: string | null; fileFormat: string | null }[];
 };
 
 function fromAxisOrder(order: TrackOrderV4Response): DebugOrderRow {
   return {
     orderTrackingId: String(order.OrderTrackingId),
+    accountNo: order.AccountNo ?? null,
     oDate: order.oDate ?? null,
     status: order.Status ?? null,
     clientRefNo: order.ClientRefNo ?? null,
     pickupCompany: order.PCoName ?? null,
+    pickupCity: order.PCity ?? null,
+    pickupState: order.PState ?? null,
+    pickupTargetFrom: order.PickupTargetFrom ?? null,
+    pickupArrival: order.PickupArrival ?? null,
     deliveryCompany: order.DCoName ?? null,
+    deliveryCity: order.DCity ?? null,
+    deliveryState: order.DState ?? null,
+    deliveryTargetFrom: order.DeliveryTargetFrom ?? null,
+    deliveryArrival: order.DeliveryArrival ?? null,
+    podCompletion: order.PODcompletion ?? null,
+    hasPodSignature: order.HasPODsignature ?? null,
+    podName: order.PODname ?? null,
+    grandTotal: typeof order.GrandTotal === "number" ? order.GrandTotal : null,
+    chargeBreakdown: chargeLineItems(order),
+    documents: (order.OrderDocuments ?? []).map((doc) => ({
+      name: doc.Name ?? doc.Details ?? null,
+      fileFormat: doc.FileFormat ?? null,
+    })),
   };
 }
 
 function fromPortalRow(row: PortalOrderRow): DebugOrderRow {
   return {
     orderTrackingId: row.orderTrackingId,
+    accountNo: row.accountNo,
     oDate: null,
     status: row.status !== null ? String(row.status) : null,
     clientRefNo: row.clientRefNo,
     pickupCompany: row.pickupCompany,
+    pickupCity: row.pickupCity,
+    pickupState: row.pickupState,
+    pickupTargetFrom: null,
+    pickupArrival: null,
     deliveryCompany: row.deliveryCompany,
+    deliveryCity: row.deliveryCity,
+    deliveryState: row.deliveryState,
+    deliveryTargetFrom: null,
+    deliveryArrival: row.deliveryArrival,
+    podCompletion: row.podCompletion,
+    hasPodSignature: row.podCompletion !== null ? Boolean(row.podCompletion) : null,
+    podName: null,
+    grandTotal: row.grandTotal,
+    chargeBreakdown: [],
+    documents: [],
   };
 }
 

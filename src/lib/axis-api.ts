@@ -166,24 +166,84 @@ type AxisOrderDocument = {
   Location?: string | null;
 };
 
+// Matches definitions.OrderPackageItemV4 in the live spec — per-package
+// weight/dimensions/reference when the account is set to use individual
+// package items (see OrderInquiry.shipment.packages in xcelerator.ts).
+type AxisOrderPackageItem = {
+  PackageName?: string | null;
+  RefNo?: string | null;
+  Weight?: number | null;
+  Length?: number | null;
+  Width?: number | null;
+  Height?: number | null;
+};
+
+// Confirmed against this deployment's live Swagger/OpenAPI document
+// (2026-09-09 re-check — see the file header note) for definitions.
+// TrackOrderV4Response. Still a subset of that definition — everything
+// below is real, but the full response also has scheduling/notification/
+// GPS/memo fields this client has no use for and deliberately omits.
 export type TrackOrderV4Response = {
   OrderTrackingId: number;
   oDate?: string | null;
   Status?: string | null;
+  OrderType?: string | null;
+  AccountNo?: string | null;
+  Caller?: string | null;
+  Department?: string | null;
+  Phone?: string | null;
+  Email?: string | null;
+  SpecInstr?: string | null;
   ClientRefNo?: string | null;
+  ClientRefNo2?: string | null;
+  ClientRefNo3?: string | null;
+  ClientRefNo4?: string | null;
+  ServiceName?: string | null;
+  VehicleName?: string | null;
+  RouteNo?: string | null;
+  DriverNo?: string | null;
+  DriverFirstName?: string | null;
+  DriverLastName?: string | null;
   PCoName?: string | null;
-  DCoName?: string | null;
+  PContact?: string | null;
+  PPhone?: string | null;
+  PEmail?: string | null;
+  PStreet?: string | null;
+  PStreet2?: string | null;
   PCity?: string | null;
   PState?: string | null;
+  PZip?: string | null;
+  PLocRefNo?: string | null;
+  PSpecInstr?: string | null;
+  DCoName?: string | null;
+  DContact?: string | null;
+  DPhone?: string | null;
+  DEmail?: string | null;
+  DStreet?: string | null;
+  DStreet2?: string | null;
   DCity?: string | null;
   DState?: string | null;
+  DZip?: string | null;
+  DLocRefNo?: string | null;
+  DSpecInstr?: string | null;
+  sWeight?: number | null;
+  sValue?: number | null;
+  COD?: number | null;
+  CODloc?: string | null;
   PickupTargetFrom?: string | null;
+  PickupTargetTo?: string | null;
   PickupArrival?: string | null;
+  PickupDeparture?: string | null;
   DeliveryTargetFrom?: string | null;
+  DeliveryTargetTo?: string | null;
   DeliveryArrival?: string | null;
+  DeliveryDeparture?: string | null;
   PODcompletion?: string | null;
   HasPODsignature?: boolean | null;
   PODname?: string | null;
+  ThirdPartyCarrierId?: number | null;
+  ThirdPartyTrackingRefNo?: string | null;
+  OrderPackageItems?: AxisOrderPackageItem[] | null;
   GrandTotal?: number | null;
   OrderCharge?: number | null;
   MiscCharge?: number | null;
@@ -287,7 +347,7 @@ async function resolvePodDocumentUrl(
   return null;
 }
 
-function chargeLineItems(order: TrackOrderV4Response): { label: string; amount: number }[] {
+export function chargeLineItems(order: TrackOrderV4Response): { label: string; amount: number }[] {
   const candidates: [string, number | null | undefined][] = [
     ["Base charge", order.OrderCharge],
     ["Package charge", order.PackageCharge],
@@ -308,6 +368,19 @@ function chargeLineItems(order: TrackOrderV4Response): { label: string; amount: 
     .map(([label, amount]) => ({ label, amount: amount as number }));
 }
 
+function mapAxisPackageItems(
+  items: AxisOrderPackageItem[] | null | undefined,
+): { name: string | null; refNo: string | null; weight: number | null; length: number | null; width: number | null; height: number | null }[] {
+  return (items ?? []).map((item) => ({
+    name: item.PackageName ?? null,
+    refNo: item.RefNo ?? null,
+    weight: item.Weight ?? null,
+    length: item.Length ?? null,
+    width: item.Width ?? null,
+    height: item.Height ?? null,
+  }));
+}
+
 async function mapAxisOrderToInquiry(
   order: TrackOrderV4Response,
   cfg: AxisApiConfig,
@@ -319,21 +392,68 @@ async function mapAxisOrderToInquiry(
 
   return {
     referenceNumber: order.ClientRefNo || trackingId,
+    referenceNumber2: order.ClientRefNo2 || null,
+    referenceNumber3: order.ClientRefNo3 || null,
+    referenceNumber4: order.ClientRefNo4 || null,
+    // Axis's TrackOrderV4Response has no InvoiceNo field — only the
+    // ClientPortal endpoints do (see xcelerator.ts).
+    invoiceNumber: null,
     customer: order.PCoName ?? order.DCoName ?? "Unknown",
     carrier: "Skyline Courier & Logistics",
     status: delivered ? "delivered" : order.PickupArrival ? "in_transit" : "pending_pickup",
+    orderType: order.OrderType ?? null,
+    service: order.ServiceName ?? null,
+    vehicle: order.VehicleName ?? null,
+    caller: {
+      name: order.Caller || null,
+      department: order.Department || null,
+      phone: order.Phone || null,
+      email: order.Email || null,
+    },
     pickup: {
       location: formatLocation(order.PCity, order.PState),
+      company: order.PCoName ?? null,
+      street: order.PStreet ?? null,
+      street2: order.PStreet2 ?? null,
+      zip: order.PZip ?? null,
+      contact: order.PContact ?? null,
+      phone: order.PPhone ?? null,
+      email: order.PEmail ?? null,
       scheduledAt: order.PickupTargetFrom ?? "",
+      scheduledTo: order.PickupTargetTo ?? null,
       arrived: Boolean(order.PickupArrival),
       arrivedAt: order.PickupArrival ?? null,
+      departedAt: order.PickupDeparture ?? null,
+      specialInstructions: order.PSpecInstr || null,
     },
     delivery: {
       location: formatLocation(order.DCity, order.DState),
+      company: order.DCoName ?? null,
+      street: order.DStreet ?? null,
+      street2: order.DStreet2 ?? null,
+      zip: order.DZip ?? null,
+      contact: order.DContact ?? null,
+      phone: order.DPhone ?? null,
+      email: order.DEmail ?? null,
       scheduledAt: order.DeliveryTargetFrom ?? "",
+      scheduledTo: order.DeliveryTargetTo ?? null,
       delivered,
       deliveredAt: completedAt,
+      departedAt: order.DeliveryDeparture ?? null,
+      specialInstructions: order.DSpecInstr || null,
     },
+    shipment: {
+      pieces: order.OrderPackageItems?.length ?? null,
+      weight: order.sWeight ?? null,
+      declaredValue: order.sValue ?? null,
+      packages: mapAxisPackageItems(order.OrderPackageItems),
+    },
+    cod: {
+      amount: order.COD ?? null,
+      location: order.CODloc || null,
+    },
+    thirdPartyTrackingRefNo: order.ThirdPartyTrackingRefNo || null,
+    specialInstructions: order.SpecInstr || null,
     pod: {
       available: Boolean(order.HasPODsignature),
       receivedBy: order.PODname || null,
@@ -345,6 +465,10 @@ async function mapAxisOrderToInquiry(
       finalized: typeof order.GrandTotal === "number" && order.GrandTotal > 0,
       lineItems,
     },
+    documents: (order.OrderDocuments ?? []).map((doc) => ({
+      name: doc.Name ?? doc.Details ?? null,
+      fileFormat: doc.FileFormat ?? null,
+    })),
   };
 }
 
