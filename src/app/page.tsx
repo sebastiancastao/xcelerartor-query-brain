@@ -155,12 +155,7 @@ function StatusRow({
   );
 }
 
-const IFRAME_SHIPMENT_DETAILS_HTML = String.raw`<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <style>
+const IFRAME_SHIPMENT_DETAILS_CSS = String.raw`
     :root {
       color-scheme: light;
       font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -331,99 +326,128 @@ const IFRAME_SHIPMENT_DETAILS_HTML = String.raw`<!doctype html>
         width: 100%;
       }
     }
-  </style>
+`;
+
+function escapeIframeHtml(value: string | number): string {
+  return String(value).replace(/[&<>"']/g, (char) => {
+    switch (char) {
+      case "&":
+        return "&amp;";
+      case "<":
+        return "&lt;";
+      case ">":
+        return "&gt;";
+      case '"':
+        return "&quot;";
+      default:
+        return "&#39;";
+    }
+  });
+}
+
+function iframeField(label: string, value: string | number | null | undefined): string {
+  if (value === null || value === undefined || value === "") return "";
+  return `
+        <div class="field">
+          <dt>${escapeIframeHtml(label)}</dt>
+          <dd>${escapeIframeHtml(value)}</dd>
+        </div>`;
+}
+
+function iframeFieldList(fields: [string, string | number | null | undefined][]): string {
+  return fields.map(([label, value]) => iframeField(label, value)).join("");
+}
+
+function buildShipmentDetailsIframeHtml(order: OrderInquiry): string {
+  const headerDetail = order.invoiceNumber
+    ? { label: "Invoice #", value: order.invoiceNumber }
+    : { label: "Reference #", value: order.referenceNumber };
+  const pickupAddress = formatFullAddress(
+    order.pickup.street,
+    order.pickup.street2,
+    order.pickup.location,
+    order.pickup.zip,
+  );
+  const deliveryAddress = formatFullAddress(
+    order.delivery.street,
+    order.delivery.street2,
+    order.delivery.location,
+    order.delivery.zip,
+  );
+  const summaryFields = iframeFieldList([
+    ["Reference #", order.referenceNumber],
+    ["Invoice #", order.invoiceNumber],
+    ["Order type", order.orderType],
+    ["Service", order.service],
+    ["Vehicle", order.vehicle],
+    ["Third-party tracking #", order.thirdPartyTrackingRefNo],
+  ]);
+  const shipmentFields = iframeFieldList([
+    ["Pieces", order.shipment.pieces],
+    ["Total weight", formatWeight(order.shipment.weight)],
+    [
+      "Declared value",
+      order.shipment.declaredValue
+        ? new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(
+            order.shipment.declaredValue,
+          )
+        : null,
+    ],
+  ]);
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>${IFRAME_SHIPMENT_DETAILS_CSS}</style>
 </head>
 <body>
   <section class="shipment" aria-labelledby="shipment-title">
     <header class="header">
       <h1 id="shipment-title">Shipment details</h1>
-      <div class="invoice">Invoice #<strong>FR8T-2256</strong></div>
+      <div class="invoice">${escapeIframeHtml(headerDetail.label)}<strong>${escapeIframeHtml(headerDetail.value)}</strong></div>
     </header>
 
     <div class="content">
-      <dl class="summary">
-        <div class="field">
-          <dt>Order type</dt>
-          <dd>PD</dd>
-        </div>
-        <div class="field">
-          <dt>Service</dt>
-          <dd>ASAP</dd>
-        </div>
-        <div class="field">
-          <dt>Vehicle</dt>
-          <dd>Straight Truck</dd>
-        </div>
+      <dl class="summary">${summaryFields}
       </dl>
 
       <div class="stops">
         <section>
           <h2 class="stop-title">Shipper</h2>
-          <dl>
-            <div class="field">
-              <dt>Company</dt>
-              <dd>Package All</dd>
-            </div>
-            <div class="field">
-              <dt>Address</dt>
-              <dd>1412 Battlecreek Rd, Suite 200, Jonesboro, GA 30236</dd>
-            </div>
-            <div class="field">
-              <dt>Contact</dt>
-              <dd>Ryan Stapleton &middot; 631 838-3999</dd>
-            </div>
-            <div class="field">
-              <dt>Target window</dt>
-              <dd>7/15/2025, 3:30:00 PM</dd>
-            </div>
-            <div class="field">
-              <dt>Departed</dt>
-              <dd>7/14/2025, 3:50:00 PM</dd>
-            </div>
+          <dl>${iframeFieldList([
+            ["Company", order.pickup.company],
+            ["Address", pickupAddress],
+            ["Contact", formatContact(order.pickup.contact, order.pickup.phone, order.pickup.email)],
+            ["Target window", formatMaybeDate(order.pickup.scheduledTo ?? order.pickup.scheduledAt)],
+            ["Departed", formatMaybeDate(order.pickup.departedAt)],
+            ["Special instructions", order.pickup.specialInstructions],
+          ])}
           </dl>
         </section>
 
         <section>
           <h2 class="stop-title">Consignee</h2>
-          <dl>
-            <div class="field">
-              <dt>Company</dt>
-              <dd>Catalyst Nutraceuticals</dd>
-            </div>
-            <div class="field">
-              <dt>Address</dt>
-              <dd>1720 Peachtree Industrial Blvd, Buford, GA 30518</dd>
-            </div>
-            <div class="field">
-              <dt>Contact</dt>
-              <dd>Lou Pena</dd>
-            </div>
-            <div class="field">
-              <dt>Target window</dt>
-              <dd>7/15/2025, 3:30:00 PM</dd>
-            </div>
-            <div class="field">
-              <dt>Departed</dt>
-              <dd>7/15/2025, 8:45:00 AM</dd>
-            </div>
+          <dl>${iframeFieldList([
+            ["Company", order.delivery.company],
+            ["Address", deliveryAddress],
+            ["Contact", formatContact(order.delivery.contact, order.delivery.phone, order.delivery.email)],
+            ["Target window", formatMaybeDate(order.delivery.scheduledTo ?? order.delivery.scheduledAt)],
+            ["Departed", formatMaybeDate(order.delivery.departedAt)],
+            ["Special instructions", order.delivery.specialInstructions],
+          ])}
           </dl>
         </section>
       </div>
 
-      <dl class="totals">
-        <div class="field">
-          <dt>Pieces</dt>
-          <dd>8</dd>
-        </div>
-        <div class="field">
-          <dt>Total weight</dt>
-          <dd>3956 lb</dd>
-        </div>
-      </dl>
+      ${shipmentFields ? `<dl class="totals">${shipmentFields}
+      </dl>` : ""}
     </div>
   </section>
 </body>
 </html>`;
+}
 
 export default function Home() {
   const [referenceNumber, setReferenceNumber] = useState("");
@@ -872,19 +896,20 @@ export default function Home() {
                 className="w-full resize-none rounded-xl border border-zinc-200 bg-zinc-50 p-3.5 font-mono text-xs leading-relaxed text-zinc-800 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-200"
               />
             </section>
+
+            <section className="rounded-2xl border border-zinc-200/70 bg-white p-4 shadow-sm dark:border-zinc-800/70 dark:bg-zinc-900 sm:p-5">
+              <div className="mb-3 flex items-center justify-between">
+                <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Shipment details iframe</h2>
+              </div>
+              <iframe
+                srcDoc={buildShipmentDetailsIframeHtml(order)}
+                title={`Formatted shipment details for ${order.referenceNumber}`}
+                sandbox=""
+                className="h-[650px] w-full rounded-xl border border-zinc-200 dark:border-zinc-800"
+              />
+            </section>
           </div>
         )}
-
-        <section className="rounded-2xl border border-zinc-200/70 bg-white p-4 shadow-sm dark:border-zinc-800/70 dark:bg-zinc-900 sm:p-5">
-          <div className="mb-3 flex items-center justify-between">
-            <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Shipment details iframe</h2>
-          </div>
-          <iframe
-            srcDoc={IFRAME_SHIPMENT_DETAILS_HTML}
-            title="Formatted shipment details"
-            className="h-[650px] w-full rounded-xl border border-zinc-200 dark:border-zinc-800"
-          />
-        </section>
       </main>
     </div>
   );
