@@ -5,6 +5,7 @@ import type { ReactNode } from "react";
 import type { OrderInquiry, OrderLookupSource } from "@/lib/xcelerator";
 import { buildSuggestedReply } from "@/lib/email";
 import { detectOrderReferences, type DetectedReference } from "@/lib/reference-detection";
+import { MissiveEmailSense, type MissiveSenseStatus } from "@/components/MissiveEmailSense";
 
 type LookupState =
   | { status: "idle" }
@@ -173,15 +174,20 @@ export default function Home() {
   const [aiDrafting, setAiDrafting] = useState(false);
   const [reply, setReply] = useState<ReplyState>({ status: "idle" });
 
-  // "Paste an email" panel: lets a CSR paste a customer email so an order or
-  // reference number gets detected and dropped into the search box above —
-  // it only ever fills the box, it never submits the lookup itself.
+  // Order/reference detection: the primary source is MissiveEmailSense
+  // below, which senses whichever email the CSR currently has open in
+  // Missive. "Paste an email instead" is a manual fallback for when this
+  // page isn't embedded in Missive (or Missive isn't configured) — either
+  // path only ever fills the search box, it never submits the lookup itself.
   const [showEmailPanel, setShowEmailPanel] = useState(false);
   const [emailText, setEmailText] = useState("");
   const [detectedRefs, setDetectedRefs] = useState<DetectedReference[]>([]);
-  // Tracks the value we last auto-filled so re-detecting on every keystroke
-  // doesn't fight a value the CSR has since edited by hand in the search box.
+  // Tracks the value we last auto-filled so re-detecting doesn't fight a
+  // value the CSR has since edited by hand in the search box.
   const lastAutoFilledRef = useRef<string | null>(null);
+  // Auto-opens the paste fallback once, the first time we learn Missive
+  // sensing isn't available — never re-opens it if the CSR then hides it.
+  const autoOpenedPasteRef = useRef(false);
 
   useEffect(() => {
     fetch("/api/config")
@@ -250,19 +256,40 @@ export default function Home() {
     }
   }
 
-  // Re-scans the pasted email on every change and, when a new top candidate
-  // shows up, drops it into the search box — but only ever sets state, never
-  // calls handleLookup. The search box stays a normal controlled input, so
-  // the CSR can freely retype or correct it afterward.
-  function handleEmailTextChange(value: string) {
-    setEmailText(value);
-    const detected = detectOrderReferences(value);
+  // Shared by both detection sources (Missive-sensed text and the manual
+  // paste fallback): scans the text and, when a new top candidate shows up,
+  // drops it into the search box — but only ever sets state, never calls
+  // handleLookup. The search box stays a normal controlled input, so the
+  // CSR can freely retype or correct it afterward.
+  function applyDetectedText(text: string) {
+    const detected = detectOrderReferences(text);
     setDetectedRefs(detected);
 
     const top = detected[0];
     if (top && top.value !== lastAutoFilledRef.current) {
       lastAutoFilledRef.current = top.value;
       setReferenceNumber(top.value);
+    }
+  }
+
+  function handleEmailTextChange(value: string) {
+    setEmailText(value);
+    applyDetectedText(value);
+  }
+
+  // Called by MissiveEmailSense whenever the CSR opens a different email in
+  // Missive. Mirrors the pasted text into the same textarea (so expanding
+  // the fallback panel shows exactly what was scanned, and can be
+  // hand-corrected) and runs the same detection path.
+  function handleMissiveEmailText(text: string) {
+    setEmailText(text);
+    applyDetectedText(text);
+  }
+
+  function handleMissiveStatusChange(status: MissiveSenseStatus) {
+    if (!autoOpenedPasteRef.current && (status === "not-embedded" || status === "not-configured")) {
+      autoOpenedPasteRef.current = true;
+      setShowEmailPanel(true);
     }
   }
 
@@ -340,18 +367,43 @@ export default function Home() {
             </button>
           </form>
 
-          <div className="mt-3">
+          <div className="mt-3 flex flex-col gap-2">
+            {/* Primary path: senses whichever email is open in Missive and
+                fills the search box above automatically — no paste needed. */}
+            <MissiveEmailSense onEmailText={handleMissiveEmailText} onStatusChange={handleMissiveStatusChange} />
+
+            {detectedRefs.length > 0 && (
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-xs text-zinc-500 dark:text-zinc-400">Detected:</span>
+                {detectedRefs.map((ref) => (
+                  <button
+                    key={ref.value}
+                    type="button"
+                    title={ref.reason}
+                    onClick={() => applyDetectedReference(ref.value)}
+                    className={`rounded-full border px-2.5 py-1 text-xs font-medium transition-colors ${
+                      referenceNumber === ref.value
+                        ? "border-indigo-500 bg-indigo-50 text-indigo-700 dark:border-indigo-400 dark:bg-indigo-950 dark:text-indigo-300"
+                        : "border-zinc-300 text-zinc-600 hover:border-indigo-400 hover:text-indigo-600 dark:border-zinc-700 dark:text-zinc-300 dark:hover:border-indigo-500 dark:hover:text-indigo-400"
+                    }`}
+                  >
+                    {ref.value}
+                  </button>
+                ))}
+              </div>
+            )}
+
             <button
               type="button"
               onClick={() => setShowEmailPanel((prev) => !prev)}
-              className="inline-flex items-center gap-1.5 text-xs font-medium text-zinc-500 transition-colors hover:text-indigo-600 dark:text-zinc-400 dark:hover:text-indigo-400"
+              className="inline-flex w-fit items-center gap-1.5 text-xs font-medium text-zinc-500 transition-colors hover:text-indigo-600 dark:text-zinc-400 dark:hover:text-indigo-400"
             >
               <MailIcon className="h-3.5 w-3.5" />
-              {showEmailPanel ? "Hide email paste" : "Paste a customer email to find the order #"}
+              {showEmailPanel ? "Hide pasted email" : "Paste an email instead"}
             </button>
 
             {showEmailPanel && (
-              <div className="mt-2 rounded-xl border border-zinc-200 bg-zinc-50 p-3 dark:border-zinc-800 dark:bg-zinc-950/40">
+              <div className="rounded-xl border border-zinc-200 bg-zinc-50 p-3 dark:border-zinc-800 dark:bg-zinc-950/40">
                 <textarea
                   value={emailText}
                   onChange={(e) => handleEmailTextChange(e.target.value)}
@@ -360,32 +412,14 @@ export default function Home() {
                   className="w-full resize-y rounded-lg border border-zinc-300 bg-white p-2.5 text-xs leading-relaxed text-zinc-800 outline-none transition-shadow focus:border-indigo-500 focus:ring-4 focus:ring-indigo-500/15 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200"
                 />
                 <div className="mt-2 flex flex-wrap items-center gap-2">
-                  {detectedRefs.length > 0 ? (
-                    <>
-                      <span className="text-xs text-zinc-500 dark:text-zinc-400">Detected:</span>
-                      {detectedRefs.map((ref) => (
-                        <button
-                          key={ref.value}
-                          type="button"
-                          title={ref.reason}
-                          onClick={() => applyDetectedReference(ref.value)}
-                          className={`rounded-full border px-2.5 py-1 text-xs font-medium transition-colors ${
-                            referenceNumber === ref.value
-                              ? "border-indigo-500 bg-indigo-50 text-indigo-700 dark:border-indigo-400 dark:bg-indigo-950 dark:text-indigo-300"
-                              : "border-zinc-300 text-zinc-600 hover:border-indigo-400 hover:text-indigo-600 dark:border-zinc-700 dark:text-zinc-300 dark:hover:border-indigo-500 dark:hover:text-indigo-400"
-                          }`}
-                        >
-                          {ref.value}
-                        </button>
-                      ))}
-                    </>
-                  ) : emailText.trim() ? (
-                    <span className="text-xs text-zinc-500 dark:text-zinc-400">
-                      No order or reference number detected — you can still type one into the search box above.
-                    </span>
-                  ) : (
-                    <span className="text-xs text-zinc-400 dark:text-zinc-500">Nothing pasted yet.</span>
-                  )}
+                  {detectedRefs.length === 0 &&
+                    (emailText.trim() ? (
+                      <span className="text-xs text-zinc-500 dark:text-zinc-400">
+                        No order or reference number detected — you can still type one into the search box above.
+                      </span>
+                    ) : (
+                      <span className="text-xs text-zinc-400 dark:text-zinc-500">Nothing pasted yet.</span>
+                    ))}
                   {emailText && (
                     <button
                       type="button"
