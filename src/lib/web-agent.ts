@@ -43,6 +43,8 @@ export type WebAgentStep = {
 export type WebAgentResult = {
   order: OrderInquiry | null;
   foundViaCaller: string | null;
+  /** Xcelerator's own id for the order (e.g. "11.092426"), when found. */
+  orderTrackingId: string | null;
   steps: WebAgentStep[];
   warning?: string;
 };
@@ -208,21 +210,185 @@ async function quickTrack(
   await search.fill(value);
   await page.locator("#qtrack #divBtnAdd").click();
 
-  // The result renders in a separate #qtrackresult panel within about half a
-  // second. Its #QT_OrderTrackingID field holds the order's tracking id on a
-  // hit and "[Not Found]" on a miss (with the #QT_Fail box shown), so wait for
-  // that field to fill rather than a fixed pause.
-  await page.waitForFunction(
+  // Two different screens come back (both confirmed live):
+  //  - miss: the #qtrackresult panel, whose #QT_OrderTrackingID field reads
+  //    "[Not Found]" and the #QT_Fail box is shown;
+  //  - hit: the order window #orderdetailspopup opens instead. It is always
+  //    in the page, hidden and empty (so its labels alone prove nothing); on
+  //    a hit it is shown and its fields, e.g. #op_OrderTrackingID2, fill in
+  //    once the order has loaded.
+  // Wait for whichever appears rather than a fixed pause.
+  const outcome = await page.waitForFunction(
     () => {
-      const el = document.querySelector<HTMLElement>("#QT_OrderTrackingID");
-      return !!el && el.offsetParent !== null && (el.textContent ?? "").trim().length > 0;
+      const popup = document.querySelector<HTMLElement>("#orderdetailspopup");
+      const trackingId = (document.querySelector("#op_OrderTrackingID2")?.textContent ?? "").trim();
+      if (popup && getComputedStyle(popup).display !== "none" && trackingId) return "hit";
+      const id = document.querySelector<HTMLElement>("#QT_OrderTrackingID");
+      const text = (id?.textContent ?? "").trim();
+      if (id && id.offsetParent !== null && text) return /not found/i.test(text) ? "miss" : "hit";
+      return null;
     },
     undefined,
-    { timeout: 15_000 },
+    { timeout: 20_000 },
   );
-  const idText = (await page.locator("#QT_OrderTrackingID").innerText()).trim();
+  const result = await outcome.jsonValue();
   const failShown = await page.locator("#QT_Fail").isVisible().catch(() => false);
-  return { found: !/not found/i.test(idText) && !failShown };
+  return { found: result === "hit" && !failShown };
+}
+
+type OrderWindowFields = {
+  fields: Record<string, string>;
+  charges: { label: string; amount: number }[];
+  grandTotal: number | null;
+  statusLines: string[];
+  podImage: boolean;
+};
+
+/**
+ * Reads the order window the way it is laid out (confirmed live on order
+ * 11.092426): every value sits in a span with a stable id, op_<Field>
+ * (op_ClientRefNo, op_PickupArrival, op_DeliveryArrival, op_Service, ...);
+ * charges are label/amount rows under #div_chargeDetailItems; the POD
+ * signature is an <img id="op_PODSignature"> whose src is empty until signed.
+ * Reading these directly is exact, unlike asking a model to read the text,
+ * which invented an arrival time and a "delivered" status in testing.
+ */
+async function readOrderWindowFields(page: Page): Promise<OrderWindowFields | null> {
+  return page.evaluate(() => {
+    const popup = document.querySelector<HTMLElement>("#orderdetailspopup");
+    if (!popup || getComputedStyle(popup).display === "none") return null;
+    const fields: Record<string, string> = {};
+    popup.querySelectorAll<HTMLElement>("[id^='op_']").forEach((el) => {
+      if (el.tagName === "IMG") return;
+      fields[el.id.slice(3)] = (el.textContent ?? "").replace(/\s+/g, " ").trim();
+    });
+    if (!fields.OrderTrackingID2 && !fields.OrderTrackingID) return null;
+
+    const money = (t: string) => {
+      const n = Number(t.replace(/[^0-9.-]/g, ""));
+      return t.trim() && Number.isFinite(n) ? n : null;
+    };
+    const charges: { label: string; amount: number }[] = [];
+    let grandTotal: number | null = null;
+    popup.querySelectorAll("#div_chargeDetailItems .SmlInputArea").forEach((row) => {
+      const label = (row.querySelector(".InputText")?.textContent ?? "").trim();
+      const cells = Array.from(row.querySelectorAll(".SmlColumnRightText")).map((c) => (c.textContent ?? "").trim());
+      const amount = money(cells.filter(Boolean).pop() ?? "");
+      if (!label || amount === null) return;
+      if (/grand total/i.test(label)) grandTotal = amount;
+      else charges.push({ label, amount });
+    });
+
+    const statusLines = ((popup.querySelector("#op_StatusContainer") as HTMLElement | null)?.innerText ?? "")
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean);
+    const pod = popup.querySelector<HTMLImageElement>("#op_PODSignature");
+    const podImage = !!pod && !!pod.getAttribute("src");
+    return { fields, charges, grandTotal, statusLines, podImage };
+  });
+}
+
+/**
+ * Portal times are shown as "09/24/2026 2:00 pm" (sometimes with a trailing
+ * zone like "-05"). Kept as a zone-less ISO string so the page displays the
+ * same wall-clock time the portal shows, whatever the server's timezone.
+ */
+function portalDate(value: string | undefined): string | null {
+  const m = value?.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2})\s*(am|pm)?/i);
+  if (!m) return null;
+  let hour = Number(m[4]) % 12;
+  if ((m[6] ?? "").toLowerCase() === "pm") hour += 12;
+  if (!m[6] && Number(m[4]) === 12) hour = 12;
+  const pad = (n: number | string) => String(n).padStart(2, "0");
+  return `${m[3]}-${pad(m[1])}-${pad(m[2])}T${pad(hour)}:${m[5]}:00`;
+}
+
+function numberOrNull(value: string | undefined): number | null {
+  if (!value?.trim()) return null;
+  const n = Number(value.replace(/[^0-9.-]/g, ""));
+  return Number.isFinite(n) ? n : null;
+}
+
+function orderFromWindow(w: OrderWindowFields, referenceNumber: string): OrderInquiry {
+  const f = (name: string) => w.fields[name]?.trim() || null;
+  const pickupArrivedAt = portalDate(f("PickupArrival") ?? undefined);
+  const deliveredAt = portalDate(f("DeliveryArrival") ?? undefined);
+  const delivered = Boolean(f("DeliveryArrival"));
+  const arrived = delivered || Boolean(f("PickupArrival"));
+  const total = w.grandTotal ?? w.charges.reduce((sum, c) => sum + c.amount, 0);
+  const cityStateZip = (v: string | null) => v ?? "";
+
+  return {
+    referenceNumber: f("ClientRefNo") ?? referenceNumber,
+    referenceNumber2: f("ClientRefNo2"),
+    referenceNumber3: f("ClientRefNo3"),
+    referenceNumber4: f("ClientRefNo4"),
+    invoiceNumber: null,
+    customer: f("PCoName") ?? "Unknown customer",
+    carrier: "Skyline Courier & Logistics",
+    status: delivered ? "delivered" : arrived ? "in_transit" : "pending_pickup",
+    orderType: null,
+    service: f("Service"),
+    vehicle: f("Vehicle"),
+    caller: {
+      name: f("Caller")?.replace(/\s*-\s*$/, "") || null,
+      department: f("Department"),
+      phone: f("Phone"),
+      email: f("Email"),
+    },
+    pickup: {
+      location: cityStateZip(f("PCityStateZip")) || "pickup location",
+      company: f("PCoName"),
+      street: f("PStreet"),
+      street2: null,
+      zip: null,
+      contact: f("PContact"),
+      phone: f("PPhone"),
+      email: null,
+      scheduledAt: portalDate(f("PickupTargetFrom") ?? undefined) ?? "",
+      scheduledTo: portalDate(f("PickupTargetTo") ?? undefined),
+      arrived,
+      arrivedAt: pickupArrivedAt,
+      departedAt: null,
+      specialInstructions: f("PSpecialInstructions"),
+    },
+    delivery: {
+      location: cityStateZip(f("DCityStateZip")) || "delivery location",
+      company: f("DCoName"),
+      street: f("DStreet"),
+      street2: null,
+      zip: null,
+      contact: f("DContact"),
+      phone: f("DPhone"),
+      email: null,
+      scheduledAt: portalDate(f("DeliveryTargetFrom") ?? undefined) ?? "",
+      scheduledTo: portalDate(f("DeliveryTargetTo") ?? undefined),
+      delivered,
+      deliveredAt,
+      departedAt: null,
+      specialInstructions: f("DSpecialInstructions"),
+    },
+    shipment: {
+      pieces: numberOrNull(f("sPieces") ?? undefined),
+      weight: numberOrNull(f("sWeight") ?? undefined),
+      declaredValue: numberOrNull(f("sValue") ?? undefined),
+      packages: [],
+    },
+    cod: { amount: null, location: null },
+    thirdPartyTrackingRefNo: null,
+    specialInstructions: f("SpecialInstructions"),
+    // Not yet seen on a signed order: a signature image means POD exists;
+    // who signed is not in a labelled field, so it stays null.
+    pod: { available: w.podImage, receivedBy: null, documentUrl: null },
+    charges: {
+      currency: "USD",
+      total,
+      finalized: w.grandTotal !== null,
+      lineItems: w.charges,
+    },
+    documents: [],
+  };
 }
 
 // --- Page snapshot -------------------------------------------------------------
@@ -428,6 +594,18 @@ const TOOLS: ToolDefinition[] = [
             },
           },
           specialInstructions: nullableString,
+          refNo2: nullableString,
+          refNo3: nullableString,
+          refNo4: nullableString,
+          callerDepartment: nullableString,
+          callerPhone: nullableString,
+          callerEmail: nullableString,
+          pickupContact: nullableString,
+          pickupPhone: nullableString,
+          pickupSpecialInstructions: nullableString,
+          deliveryContact: nullableString,
+          deliveryPhone: nullableString,
+          deliverySpecialInstructions: nullableString,
         },
         required: ["referenceNumber", "podAvailable"],
       },
@@ -482,6 +660,18 @@ type ReportArgs = {
   chargesTotal?: number | null;
   chargeLineItems?: { label: string; amount: number }[];
   specialInstructions?: string | null;
+  refNo2?: string | null;
+  refNo3?: string | null;
+  refNo4?: string | null;
+  callerDepartment?: string | null;
+  callerPhone?: string | null;
+  callerEmail?: string | null;
+  pickupContact?: string | null;
+  pickupPhone?: string | null;
+  pickupSpecialInstructions?: string | null;
+  deliveryContact?: string | null;
+  deliveryPhone?: string | null;
+  deliverySpecialInstructions?: string | null;
 };
 
 // --- Mapping ---------------------------------------------------------------------
@@ -504,9 +694,9 @@ function mapReportToOrder(r: ReportArgs, fallbackRef: string): OrderInquiry {
 
   return {
     referenceNumber: r.referenceNumber || fallbackRef,
-    referenceNumber2: r.orderTrackingId ?? null,
-    referenceNumber3: null,
-    referenceNumber4: null,
+    referenceNumber2: r.refNo2 ?? null,
+    referenceNumber3: r.refNo3 ?? null,
+    referenceNumber4: r.refNo4 ?? null,
     invoiceNumber: null,
     customer: r.customer ?? "Unknown customer",
     carrier: "Skyline Courier & Logistics",
@@ -514,22 +704,27 @@ function mapReportToOrder(r: ReportArgs, fallbackRef: string): OrderInquiry {
     orderType: null,
     service: r.service ?? null,
     vehicle: r.vehicle ?? null,
-    caller: { name: r.callerName ?? null, department: null, phone: null, email: null },
+    caller: {
+      name: r.callerName ?? null,
+      department: r.callerDepartment ?? null,
+      phone: r.callerPhone ?? null,
+      email: r.callerEmail ?? null,
+    },
     pickup: {
       location: r.pickupAddress ?? "pickup location",
       company: r.pickupCompany ?? null,
       street: null,
       street2: null,
       zip: null,
-      contact: null,
-      phone: null,
+      contact: r.pickupContact ?? null,
+      phone: r.pickupPhone ?? null,
       email: null,
       scheduledAt: toIso(r.pickupScheduledAt) ?? "",
       scheduledTo: null,
       arrived,
       arrivedAt: pickupArrivedAt,
       departedAt: null,
-      specialInstructions: null,
+      specialInstructions: r.pickupSpecialInstructions ?? null,
     },
     delivery: {
       location: r.deliveryAddress ?? "delivery location",
@@ -537,15 +732,15 @@ function mapReportToOrder(r: ReportArgs, fallbackRef: string): OrderInquiry {
       street: null,
       street2: null,
       zip: null,
-      contact: null,
-      phone: null,
+      contact: r.deliveryContact ?? null,
+      phone: r.deliveryPhone ?? null,
       email: null,
       scheduledAt: toIso(r.deliveryScheduledAt) ?? "",
       scheduledTo: null,
       delivered,
       deliveredAt,
       departedAt: null,
-      specialInstructions: null,
+      specialInstructions: r.deliverySpecialInstructions ?? null,
     },
     shipment: { pieces: r.pieces ?? null, weight: r.weight ?? null, declaredValue: null, packages: [] },
     cod: { amount: null, location: null },
@@ -565,7 +760,7 @@ function mapReportToOrder(r: ReportArgs, fallbackRef: string): OrderInquiry {
 // --- Agent loop --------------------------------------------------------------------
 
 type CallerOutcome =
-  | { kind: "found"; order: OrderInquiry }
+  | { kind: "found"; order: OrderInquiry; orderTrackingId: string | null }
   | { kind: "not_found"; reason: string };
 
 /**
@@ -689,9 +884,10 @@ async function agentLoop(
           break;
         }
         case "report_order": {
-          const order = mapReportToOrder(args as unknown as ReportArgs, referenceNumber);
+          const report = args as unknown as ReportArgs;
+          const order = mapReportToOrder(report, referenceNumber);
           log("read order", order.referenceNumber);
-          return { kind: "found", order };
+          return { kind: "found", order, orderTrackingId: report.orderTrackingId ?? null };
         }
         case "give_up": {
           const reason = String(args.reason ?? "not found");
@@ -715,7 +911,7 @@ async function agentLoop(
 
 // --- Per-caller search ------------------------------------------------------------
 
-type CallerHit = { order: OrderInquiry; attempts: SearchAttempt[] };
+type CallerHit = { order: OrderInquiry; orderTrackingId: string | null; attempts: SearchAttempt[] };
 
 /**
  * One caller's search: log in, run the learned Quick Track plan in code
@@ -752,6 +948,17 @@ async function searchCaller(
       log("quick track", `${trackBy} = "${referenceNumber}" ${result.found ? "HIT" : "miss"} (${ms} ms)`);
       if (!result.found) continue;
 
+      // Usual case: the order window opened; read its labelled fields directly.
+      const window = await readOrderWindowFields(page);
+      if (window) {
+        const order = orderFromWindow(window, referenceNumber);
+        const orderTrackingId = window.fields.OrderTrackingID2 || window.fields.OrderTrackingID || null;
+        log("read order", `${orderTrackingId ?? order.referenceNumber}: ${order.status.replace("_", " ")}`);
+        return { order, orderTrackingId, attempts };
+      }
+
+      // Otherwise let the model look around the result screen.
+      if (!isOpenAIConfigured()) throw new Error("Found the order but the result screen was not the usual order window.");
       const read = await agentLoop(page, caller, referenceNumber, log, {
         goal:
           "A Quick Track search already found this order and its result is on screen. " +
@@ -760,18 +967,20 @@ async function searchCaller(
         history: [`quick_track ${trackBy} = "${referenceNumber}" -> result shown`],
         maxSteps: READ_MAX_STEPS,
       });
-      if (read.kind === "found") return { order: read.order, attempts };
+      if (read.kind === "found") return { order: read.order, orderTrackingId: read.orderTrackingId, attempts };
       throw new Error(`Quick Track found the order but it could not be read: ${read.reason}`);
     }
 
-    if (FREE_BROWSE_FALLBACK && !stop.value) {
+    if (FREE_BROWSE_FALLBACK && isOpenAIConfigured() && !stop.value) {
       log("free browse", "Learned searches missed; letting the model explore");
       const outcome = await agentLoop(page, caller, referenceNumber, log, {
         goal: "Find this order in the portal and read its pickup, delivery, POD and charges details.",
         history: plan.map((t) => `quick_track ${t} = "${referenceNumber}" -> [Not Found]`),
         maxSteps: MAX_STEPS,
       });
-      if (outcome.kind === "found") return { order: outcome.order, attempts };
+      if (outcome.kind === "found") {
+        return { order: outcome.order, orderTrackingId: outcome.orderTrackingId, attempts };
+      }
     }
     return null;
   } finally {
@@ -780,14 +989,11 @@ async function searchCaller(
 }
 
 export function isWebAgentConfigured(): boolean {
-  return isOpenAIConfigured() && xceleratorCallersFromEnv().length > 0;
+  return xceleratorCallersFromEnv().length > 0;
 }
 
 export async function findOrderWithWebAgent(referenceNumber: string): Promise<WebAgentResult> {
   const steps: WebAgentStep[] = [];
-  if (!isOpenAIConfigured()) {
-    throw new WebAgentError("The web agent needs OPENAI_API_KEY to read the order screen.", 503);
-  }
   const callers = xceleratorCallersFromEnv();
   if (callers.length === 0) {
     throw new WebAgentError("No Xcelerator caller is configured. Set XCELERATOR_CALLER_1_USERNAME and _PASSWORD.", 503);
@@ -837,6 +1043,7 @@ export async function findOrderWithWebAgent(referenceNumber: string): Promise<We
     return {
       order: winner.hit.order,
       foundViaCaller: winner.caller,
+      orderTrackingId: winner.hit.orderTrackingId,
       steps,
       warning: failures.length ? `Other callers had problems: ${failures.join("; ")}` : undefined,
     };
@@ -847,6 +1054,7 @@ export async function findOrderWithWebAgent(referenceNumber: string): Promise<We
   return {
     order: null,
     foundViaCaller: null,
+    orderTrackingId: null,
     steps,
     warning: failures.length ? `Some callers could not be searched: ${failures.join("; ")}` : undefined,
   };

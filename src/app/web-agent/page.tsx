@@ -18,6 +18,8 @@ type LookupState =
       order: OrderInquiry;
       /** Caller (portal login) the agent found the order under. */
       foundViaCaller: string | null;
+      /** Xcelerator's own id for the order, read off the order window. */
+      orderTrackingId: string | null;
       /** e.g. "found under the QUKIN account instead of the default one" or "the default Xcelerator login is currently failing" — surfaced so a CSR knows to flag it rather than the app silently papering over it. */
       warning?: string;
     };
@@ -230,6 +232,7 @@ export default function WebAgentHome() {
       const body: {
         order: OrderInquiry;
         foundViaCaller: string | null;
+        orderTrackingId: string | null;
         warning?: string;
         steps: WebAgentStep[];
       } = await res.json();
@@ -238,6 +241,7 @@ export default function WebAgentHome() {
         status: "success",
         order: body.order,
         foundViaCaller: body.foundViaCaller,
+        orderTrackingId: body.orderTrackingId ?? null,
         warning: body.warning,
       });
       loadReplyForOrder(body.order);
@@ -324,6 +328,7 @@ export default function WebAgentHome() {
 
   const order = state.status === "success" ? state.order : null;
   const foundViaCaller = state.status === "success" ? state.foundViaCaller : null;
+  const orderTrackingId = state.status === "success" ? state.orderTrackingId : null;
   const lookupWarning = state.status === "success" ? state.warning : null;
 
   return (
@@ -528,6 +533,7 @@ export default function WebAgentHome() {
                   <Badge tone="indigo">
                     Source: Web agent{foundViaCaller ? ` (${foundViaCaller})` : ""}
                   </Badge>
+                  {orderTrackingId && <Badge tone="zinc">Tracking ID {orderTrackingId}</Badge>}
                 </div>
                 <span className="text-xs text-zinc-500 dark:text-zinc-400">Carrier: {order.carrier}</span>
               </div>
