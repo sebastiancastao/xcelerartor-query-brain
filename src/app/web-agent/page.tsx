@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import type { ReactNode } from "react";
 import type { OrderInquiry } from "@/lib/xcelerator";
 import type { WebAgentStep } from "@/lib/web-agent";
@@ -171,7 +171,28 @@ function StatusRow({
   );
 }
 
+// Embed mode: on automatically when this page runs inside an iframe (e.g. a
+// Missive sidebar or another app), or forced with ?embed=1. Read through
+// useSyncExternalStore so the server render (never embedded) and the first
+// client render agree, then it switches once the browser is known.
+function detectEmbedded(): boolean {
+  try {
+    if (new URLSearchParams(window.location.search).has("embed")) return true;
+    return window.self !== window.top;
+  } catch {
+    return true; // cross-origin access to window.top throws only when framed
+  }
+}
+const noopSubscribe = () => () => {};
+
+function useEmbedded(): boolean {
+  return useSyncExternalStore(noopSubscribe, detectEmbedded, () => false);
+}
+
 export default function WebAgentHome() {
+  const embedded = useEmbedded();
+  // Card padding shrinks in embed mode, where the page sits in a narrow panel.
+  const card = embedded ? "p-4" : "p-6";
   const [referenceNumber, setReferenceNumber] = useState("");
   const [state, setState] = useState<LookupState>({ status: "idle" });
   const [copied, setCopied] = useState(false);
@@ -267,12 +288,30 @@ export default function WebAgentHome() {
   }
 
   async function handleCopy(text: string) {
+    // Inside an iframe the Clipboard API is often blocked unless the parent
+    // grants allow="clipboard-write", so fall back to the older copy command.
+    let ok = false;
     try {
       await navigator.clipboard.writeText(text);
+      ok = true;
+    } catch {
+      try {
+        const area = document.createElement("textarea");
+        area.value = text;
+        area.setAttribute("readonly", "");
+        area.style.position = "fixed";
+        area.style.opacity = "0";
+        document.body.appendChild(area);
+        area.select();
+        ok = document.execCommand("copy");
+        area.remove();
+      } catch {
+        ok = false;
+      }
+    }
+    if (ok) {
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
-    } catch {
-      // clipboard access denied — nothing to do
     }
   }
 
@@ -333,30 +372,36 @@ export default function WebAgentHome() {
 
   return (
     <div className="flex flex-1 flex-col bg-gradient-to-b from-zinc-50 to-white font-sans dark:from-zinc-950 dark:to-zinc-900">
-      <main className="mx-auto flex w-full max-w-5xl flex-1 flex-col gap-8 px-6 py-10">
+      <main
+        className={`mx-auto flex w-full max-w-5xl flex-1 flex-col ${embedded ? "gap-4 px-3 py-3" : "gap-8 px-6 py-10"}`}
+      >
         <header className="flex flex-col gap-4">
           <div className="flex flex-wrap items-center gap-3">
-            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-indigo-500 to-indigo-700 text-base font-bold text-white shadow-sm dark:from-indigo-400 dark:to-indigo-600">
+            <div className={`flex ${embedded ? "h-8 w-8 text-sm" : "h-10 w-10 text-base"} shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-indigo-500 to-indigo-700 font-bold text-white shadow-sm dark:from-indigo-400 dark:to-indigo-600`}>
               X
             </div>
             <div>
               <div className="flex flex-wrap items-center gap-2">
-                <h1 className="text-xl font-semibold tracking-tight text-zinc-900 dark:text-zinc-50">
+                <h1 className={`${embedded ? "text-base" : "text-xl"} font-semibold tracking-tight text-zinc-900 dark:text-zinc-50`}>
                   Xcelerator Query Brain
                 </h1>
                 <Badge tone="indigo">Web agent</Badge>
               </div>
-              <p className="mt-0.5 text-sm text-zinc-600 dark:text-zinc-400">
-                A browser agent signs in to the Xcelerator portal and reads the order off the screen, with no API calls.
-              </p>
+              {!embedded && (
+                <p className="mt-0.5 text-sm text-zinc-600 dark:text-zinc-400">
+                  A browser agent signs in to the Xcelerator portal and reads the order off the screen, with no API calls.
+                </p>
+              )}
             </div>
+            {!embedded && (
             <Link
               href="/"
               className="ml-auto text-xs font-medium text-zinc-400 hover:text-indigo-600 hover:underline dark:hover:text-indigo-400"
             >
               API version
             </Link>
-            {process.env.NODE_ENV !== "production" && (
+            )}
+            {!embedded && process.env.NODE_ENV !== "production" && (
               <Link
                 href="/debug"
                 className="text-xs font-medium text-zinc-400 hover:text-indigo-600 hover:underline dark:hover:text-indigo-400"
@@ -492,7 +537,7 @@ export default function WebAgentHome() {
         )}
 
         {state.status === "idle" && (
-          <div className="flex flex-col items-center gap-3 rounded-2xl border border-dashed border-zinc-300 bg-white/60 px-6 py-16 text-center dark:border-zinc-700 dark:bg-zinc-900/40">
+          <div className={`flex flex-col items-center gap-3 rounded-2xl border border-dashed border-zinc-300 bg-white/60 px-6 ${embedded ? "py-6" : "py-16"} text-center dark:border-zinc-700 dark:bg-zinc-900/40`}>
             <div className="flex h-12 w-12 items-center justify-center rounded-full bg-indigo-50 text-indigo-600 dark:bg-indigo-950 dark:text-indigo-400">
               <SearchIcon className="h-5 w-5" />
             </div>
@@ -509,7 +554,7 @@ export default function WebAgentHome() {
         )}
 
         {state.status === "loading" && (
-          <div className="animate-pulse rounded-2xl border border-zinc-200/70 bg-white p-6 dark:border-zinc-800/70 dark:bg-zinc-900">
+          <div className={`animate-pulse rounded-2xl border border-zinc-200/70 bg-white ${card} dark:border-zinc-800/70 dark:bg-zinc-900`}>
             <div className="h-4 w-56 rounded-full bg-zinc-200 dark:bg-zinc-800" />
             <p className="mt-2 text-xs text-zinc-500 dark:text-zinc-400">
               The agent is signing in and searching the portal. This usually takes 20 to 90 seconds.
@@ -524,7 +569,7 @@ export default function WebAgentHome() {
 
         {order && (
           <div className="flex flex-col gap-6">
-            <section className="rounded-2xl border border-zinc-200/70 bg-white p-6 shadow-sm dark:border-zinc-800/70 dark:bg-zinc-900">
+            <section className={`rounded-2xl border border-zinc-200/70 bg-white ${card} shadow-sm dark:border-zinc-800/70 dark:bg-zinc-900`}>
               <div className="mb-1 flex flex-wrap items-center justify-between gap-2">
                 <div className="flex flex-wrap items-center gap-2">
                   <h2 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">
@@ -617,7 +662,7 @@ export default function WebAgentHome() {
               </div>
             </section>
 
-            <section className="rounded-2xl border border-zinc-200/70 bg-white p-6 shadow-sm dark:border-zinc-800/70 dark:bg-zinc-900">
+            <section className={`rounded-2xl border border-zinc-200/70 bg-white ${card} shadow-sm dark:border-zinc-800/70 dark:bg-zinc-900`}>
               <h2 className="mb-4 text-sm font-semibold text-zinc-900 dark:text-zinc-100">Shipment details</h2>
 
               <div className="grid grid-cols-2 gap-4 sm:grid-cols-3">
@@ -756,7 +801,7 @@ export default function WebAgentHome() {
               )}
             </section>
 
-            <section className="rounded-2xl border border-zinc-200/70 bg-white p-6 shadow-sm dark:border-zinc-800/70 dark:bg-zinc-900">
+            <section className={`rounded-2xl border border-zinc-200/70 bg-white ${card} shadow-sm dark:border-zinc-800/70 dark:bg-zinc-900`}>
               <div className="mb-3 flex items-center justify-between">
                 <div className="flex items-center gap-2">
                   <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">AI-suggested reply</h2>
@@ -782,7 +827,7 @@ export default function WebAgentHome() {
           </div>
         )}
         {steps.length > 0 && state.status !== "loading" && (
-          <section className="rounded-2xl border border-zinc-200/70 bg-white p-6 shadow-sm dark:border-zinc-800/70 dark:bg-zinc-900">
+          <section className={`rounded-2xl border border-zinc-200/70 bg-white ${card} shadow-sm dark:border-zinc-800/70 dark:bg-zinc-900`}>
             <h2 className="mb-3 text-sm font-semibold text-zinc-900 dark:text-zinc-100">What the agent did</h2>
             <ol className="flex flex-col gap-1.5 text-xs text-zinc-600 dark:text-zinc-400">
               {steps.map((step, i) => (
