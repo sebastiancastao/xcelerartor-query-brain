@@ -128,7 +128,7 @@ export async function loadMemory(): Promise<WebAgentMemory> {
 
   if (fileCache) return fileCache;
   try {
-    fileCache = parseMemory(await fs.readFile(memoryFile(), "utf8"));
+    fileCache = parseMemory(await fs.readFile(/*turbopackIgnore: true*/ memoryFile(), "utf8"));
   } catch {
     fileCache = emptyMemory();
   }
@@ -147,10 +147,12 @@ function persist(memory: WebAgentMemory): Promise<void> {
         return;
       }
       const file = memoryFile();
-      await fs.mkdir(path.dirname(file), { recursive: true });
+      // The file store is only for local/long-running servers; keep the build
+      // tracer from bundling the whole project because of these dynamic paths.
+      await fs.mkdir(/*turbopackIgnore: true*/ path.dirname(file), { recursive: true });
       const tmp = `${file}.tmp`;
-      await fs.writeFile(tmp, JSON.stringify(memory, null, 1), "utf8");
-      await fs.rename(tmp, file);
+      await fs.writeFile(/*turbopackIgnore: true*/ tmp, JSON.stringify(memory, null, 1), "utf8");
+      await fs.rename(/*turbopackIgnore: true*/ tmp, file);
     })
     .catch((err) => {
       console.warn("[web-agent-memory] could not save:", err instanceof Error ? err.message : err);
