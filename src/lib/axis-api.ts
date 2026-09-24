@@ -31,6 +31,16 @@
 //      sample (downloadable from inside Xcelerator — see the FAQ) documents
 //      the real mechanism directly; that's the authoritative source once
 //      available.
+// 2026-09-23: Key Software Systems (Axis) support confirmed the endpoint
+// itself works — they called GET /v4/Order/GetOrderByReference?clientRefNo=
+// ClientRefNo&value=1088033 and got the order back — and told Skyline to
+// "confirm you are sending the token with this request, and that your token
+// is still valid." So a token IS the auth mechanism (not username/password
+// Basic), and the request shape below already matches theirs. What's missing
+// here is the token itself, not a code change: it has to come from whoever
+// holds Skyline's Axis credentials (support's mail was addressed to Brett
+// Kennedy). Put the full header value in AXIS_API_TOKEN.
+//
 // Until one of these is confirmed, AXIS_API_TOKEN is the escape hatch: paste
 // the exact header value once you have it (e.g. "Bearer xxxxx") and it wins
 // over the Basic-auth guess below. getOrderByReferenceNumber() in
@@ -94,6 +104,105 @@ export function axisApiConfigFromEnv(): AxisApiConfig {
 export function isAxisApiConfigured(): boolean {
   const cfg = axisApiConfigFromEnv();
   return Boolean(cfg.token || (cfg.username && cfg.password));
+}
+
+export type AxisAuthDescription = {
+  mode: "token" | "basic" | "none";
+  /** The scheme word of the Authorization header ("Bearer", "Basic", ...) when there is one. Never the credential itself. */
+  scheme: string | null;
+  baseUrl: string;
+};
+
+/** How this app will authenticate to Axis right now, safe to show on screen: says which mechanism, never the secret. */
+export function describeAxisAuth(): AxisAuthDescription {
+  const cfg = axisApiConfigFromEnv();
+  if (cfg.token) {
+    // A token may be a bare value with no scheme prefix, in which case its
+    // first word IS the secret, so only report a scheme we recognise.
+    const first = cfg.token.trim().split(/\s+/)[0] ?? "";
+    const scheme = /^(bearer|basic|token)$/i.test(first) ? first : null;
+    return { mode: "token", scheme, baseUrl: cfg.baseUrl };
+  }
+  if (cfg.username && cfg.password) return { mode: "basic", scheme: "Basic", baseUrl: cfg.baseUrl };
+  return { mode: "none", scheme: null, baseUrl: cfg.baseUrl };
+}
+
+export type AxisProbeResult = {
+  /** The URL that was called (no credentials are ever in it). */
+  url: string;
+  auth: AxisAuthDescription;
+  /** HTTP status, or null if the request never got a response (network error, or no credentials configured). */
+  status: number | null;
+  ok: boolean;
+  elapsedMs: number;
+  /** First part of the response body, so a 401 message or a real order can be read directly. */
+  body: string | null;
+  bodyTruncated: boolean;
+  error: string | null;
+};
+
+const PROBE_BODY_LIMIT = 2000;
+
+/**
+ * Makes exactly one raw GET /v4/Order/GetOrderByReference call, the same
+ * request shape Axis support used when they reproduced it, and reports what
+ * came back instead of mapping it. For telling apart "wrong credential"
+ * (401), "no such order" (200 with an empty list), and "can't reach Axis at
+ * all" without reading server logs.
+ */
+export async function probeAxisReference(
+  referenceNumber: string,
+  cfg: AxisApiConfig = axisApiConfigFromEnv(),
+): Promise<AxisProbeResult> {
+  const auth = describeAxisAuth();
+  const url = new URL(`${cfg.baseUrl}/v4/Order/GetOrderByReference`);
+  url.searchParams.set("clientRefNo", "ClientRefNo");
+  url.searchParams.set("value", referenceNumber.trim());
+
+  let authorization: string;
+  try {
+    authorization = authHeaderValue(cfg);
+  } catch (err) {
+    return {
+      url: url.toString(),
+      auth,
+      status: null,
+      ok: false,
+      elapsedMs: 0,
+      body: null,
+      bodyTruncated: false,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+
+  const startedAt = Date.now();
+  try {
+    const res = await fetch(url, {
+      headers: { Accept: "application/json", Authorization: authorization },
+    });
+    const text = await res.text();
+    return {
+      url: url.toString(),
+      auth,
+      status: res.status,
+      ok: res.ok,
+      elapsedMs: Date.now() - startedAt,
+      body: text.slice(0, PROBE_BODY_LIMIT),
+      bodyTruncated: text.length > PROBE_BODY_LIMIT,
+      error: null,
+    };
+  } catch (err) {
+    return {
+      url: url.toString(),
+      auth,
+      status: null,
+      ok: false,
+      elapsedMs: Date.now() - startedAt,
+      body: null,
+      bodyTruncated: false,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
 }
 
 export class AxisApiError extends Error {
@@ -368,6 +477,47 @@ export function chargeLineItems(order: TrackOrderV4Response): { label: string; a
     .map(([label, amount]) => ({ label, amount: amount as number }));
 }
 
+// Real order 1088033 (first populated Axis order seen, 2026-09-23) was
+// delivered, had a PODcompletion time and a PODname ("Moses Lee"), yet
+// HasPODsignature was false. Keying "POD available" on the signature flag
+// alone told the CSR "not yet available" for a delivered, signed-for order.
+// The signature image is a separate thing (see resolvePodDocumentUrl, which
+// still requires the flag); POD *information* exists once the driver has
+// completed it, which is also how the ClientPortal path decides (its list
+// mapper uses PODcompletion).
+function hasPodInfo(order: TrackOrderV4Response): boolean {
+  return Boolean(order.HasPODsignature || order.PODname || order.PODcompletion);
+}
+
+// The itemized charge fields don't cover the whole GrandTotal: on order
+// 1088033 they summed to 117.98 against 168.73, and the 50.75 gap was exactly
+// TotalExtras (17.50) + TotalSurcharges (33.25), which Axis reports only as
+// totals here (OrderExtras came back null). A reply listing "Base 95.00,
+// Weight 7.98, Wait time 15.00" beside a 168.73 total invites the customer to
+// ask where the rest went. Rather than guess which totals overlap with which
+// itemized fields on other orders, add one line for whatever is left, so the
+// listed amounts always add up to the total. A negative remainder means a
+// discount or adjustment. Only applied to the order mapping: chargeLineItems
+// stays the raw itemization the debug route shows.
+function withReconcilingLine(
+  items: { label: string; amount: number }[],
+  grandTotal: number | null | undefined,
+): { label: string; amount: number }[] {
+  if (typeof grandTotal !== "number" || grandTotal <= 0) return items;
+
+  const listed = items.reduce((total, item) => total + item.amount, 0);
+  const gap = Math.round((grandTotal - listed) * 100) / 100;
+  if (Math.abs(gap) < 0.01) return items;
+
+  return [
+    ...items,
+    {
+      label: gap > 0 ? "Other charges (extras, surcharges, taxes)" : "Discounts and adjustments",
+      amount: gap,
+    },
+  ];
+}
+
 function mapAxisPackageItems(
   items: AxisOrderPackageItem[] | null | undefined,
 ): { name: string | null; refNo: string | null; weight: number | null; length: number | null; width: number | null; height: number | null }[] {
@@ -387,7 +537,7 @@ async function mapAxisOrderToInquiry(
 ): Promise<OrderInquiry> {
   const completedAt = order.DeliveryArrival ?? order.PODcompletion ?? null;
   const delivered = Boolean(completedAt);
-  const lineItems = chargeLineItems(order);
+  const lineItems = withReconcilingLine(chargeLineItems(order), order.GrandTotal);
   const trackingId = formatOrderTrackingId(order.OrderTrackingId);
 
   return {
@@ -455,7 +605,7 @@ async function mapAxisOrderToInquiry(
     thirdPartyTrackingRefNo: order.ThirdPartyTrackingRefNo || null,
     specialInstructions: order.SpecInstr || null,
     pod: {
-      available: Boolean(order.HasPODsignature),
+      available: hasPodInfo(order),
       receivedBy: order.PODname || null,
       documentUrl: await resolvePodDocumentUrl(order, cfg),
     },
@@ -561,7 +711,7 @@ function mapAxisOrderToCompletedSummary(order: TrackOrderV4Response): CompletedO
     pickupLocation: formatLocation(order.PCity, order.PState),
     deliveryLocation: formatLocation(order.DCity, order.DState),
     completedAt,
-    podAvailable: Boolean(order.HasPODsignature),
+    podAvailable: hasPodInfo(order),
     charges: {
       currency: "USD",
       total: typeof order.GrandTotal === "number" ? order.GrandTotal : 0,

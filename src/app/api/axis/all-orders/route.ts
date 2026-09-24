@@ -151,7 +151,7 @@ export async function GET(request: Request) {
     return NextResponse.json(
       {
         error:
-          "Neither the Axis API nor the ClientPortal are configured. Set AXIS_API_TOKEN / AXIS_USERNAME+AXIS_PASSWORD, or XCELERATOR_USERNAME+XCELERATOR_PASSWORD.",
+          "Neither the Axis API nor the ClientPortal are configured. Set AXIS_API_TOKEN / AXIS_USERNAME+AXIS_PASSWORD, or XCELERATOR_CALLER_1_USERNAME+XCELERATOR_CALLER_1_PASSWORD.",
       },
       { status: 400 },
     );

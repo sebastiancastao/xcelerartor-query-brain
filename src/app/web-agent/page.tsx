@@ -2,8 +2,9 @@
 
 import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
-import type { FormEvent, ReactNode } from "react";
-import type { CallerOrderMatch, OrderInquiry, OrderLookupSource } from "@/lib/xcelerator";
+import type { ReactNode } from "react";
+import type { OrderInquiry } from "@/lib/xcelerator";
+import type { WebAgentStep } from "@/lib/web-agent";
 import { buildSuggestedReply } from "@/lib/email";
 import { detectOrderReferences, type DetectedReference } from "@/lib/reference-detection";
 import { MissiveEmailSense, type MissiveSenseStatus } from "@/components/MissiveEmailSense";
@@ -15,7 +16,8 @@ type LookupState =
   | {
       status: "success";
       order: OrderInquiry;
-      source: OrderLookupSource;
+      /** Caller (portal login) the agent found the order under. */
+      foundViaCaller: string | null;
       /** e.g. "found under the QUKIN account instead of the default one" or "the default Xcelerator login is currently failing" — surfaced so a CSR knows to flag it rather than the app silently papering over it. */
       warning?: string;
     };
@@ -24,8 +26,6 @@ type ReplyState =
   | { status: "idle" }
   | { status: "loading" }
   | { status: "ready"; text: string };
-
-const SAMPLE_REFS = ["REF-1001", "REF-1002", "REF-1003", "REF-1004"];
 
 function formatMaybeDate(value: string | null): string {
   if (!value) return "TBD";
@@ -79,20 +79,6 @@ function MailIcon({ className }: { className?: string }) {
     <svg viewBox="0 0 20 20" fill="none" className={className} aria-hidden="true">
       <rect x="2.75" y="4.75" width="14.5" height="10.5" rx="1.5" stroke="currentColor" strokeWidth="1.5" />
       <path d="M3.25 5.5l6.75 5 6.75-5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
-    </svg>
-  );
-}
-
-function PhoneIcon({ className }: { className?: string }) {
-  return (
-    <svg viewBox="0 0 20 20" fill="none" className={className} aria-hidden="true">
-      <path
-        d="M5.2 3.75h2.2l1 3-1.6 1.3a8.5 8.5 0 0 0 4.15 4.15l1.3-1.6 3 1v2.2a1.4 1.4 0 0 1-1.5 1.4A12.5 12.5 0 0 1 3.8 5.25a1.4 1.4 0 0 1 1.4-1.5Z"
-        stroke="currentColor"
-        strokeWidth="1.5"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
     </svg>
   );
 }
@@ -183,13 +169,16 @@ function StatusRow({
   );
 }
 
-export default function Home() {
+export default function WebAgentHome() {
   const [referenceNumber, setReferenceNumber] = useState("");
   const [state, setState] = useState<LookupState>({ status: "idle" });
   const [copied, setCopied] = useState(false);
   const [live, setLive] = useState<boolean | null>(null);
   const [aiDrafting, setAiDrafting] = useState(false);
   const [reply, setReply] = useState<ReplyState>({ status: "idle" });
+  // What the browser agent did (login, clicks, typing), shown under the
+  // result so a CSR can see how the answer was reached.
+  const [steps, setSteps] = useState<WebAgentStep[]>([]);
 
   // Order/reference detection: the primary source is MissiveEmailSense
   // below, which senses whichever email the CSR currently has open in
@@ -205,19 +194,6 @@ export default function Home() {
   // Auto-opens the paste fallback once, the first time we learn Missive
   // sensing isn't available — never re-opens it if the CSR then hides it.
   const autoOpenedPasteRef = useRef(false);
-
-  // "Search by caller" — for when a CSR only has who's on the phone, not a
-  // reference number, to go on. Picking a result only fills the search box
-  // (same "never auto-submit" rule as detected references above); the CSR
-  // still clicks Look up themselves.
-  const [showCallerPanel, setShowCallerPanel] = useState(false);
-  const [callerQuery, setCallerQuery] = useState("");
-  const [callerSearch, setCallerSearch] = useState<
-    | { status: "idle" }
-    | { status: "loading" }
-    | { status: "error"; message: string }
-    | { status: "ready"; matches: CallerOrderMatch[]; warning?: string }
-  >({ status: "idle" });
 
   useEffect(() => {
     fetch("/api/config")
@@ -237,11 +213,13 @@ export default function Home() {
     setState({ status: "loading" });
     setReply({ status: "idle" });
     setCopied(false);
+    setSteps([]);
 
     try {
-      const res = await fetch(`/api/orders/${encodeURIComponent(ref)}`);
+      const res = await fetch(`/api/web-agent/orders/${encodeURIComponent(ref)}`);
       if (!res.ok) {
         const body = await res.json().catch(() => null);
+        setSteps(body?.steps ?? []);
         const baseMessage = body?.error ?? `Lookup failed (${res.status})`;
         setState({
           status: "error",
@@ -249,11 +227,17 @@ export default function Home() {
         });
         return;
       }
-      const body: { order: OrderInquiry; source: OrderLookupSource; warning?: string } = await res.json();
+      const body: {
+        order: OrderInquiry;
+        foundViaCaller: string | null;
+        warning?: string;
+        steps: WebAgentStep[];
+      } = await res.json();
+      setSteps(body.steps ?? []);
       setState({
         status: "success",
         order: body.order,
-        source: body.source,
+        foundViaCaller: body.foundViaCaller,
         warning: body.warning,
       });
       loadReplyForOrder(body.order);
@@ -266,10 +250,10 @@ export default function Home() {
     setReply({ status: "loading" });
 
     try {
-      const res = await fetch("/api/reply", {
+      const res = await fetch("/api/web-agent/reply", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ referenceNumber: order.referenceNumber }),
+        body: JSON.stringify({ order }),
       });
       const data = await res.json().catch(() => null);
       setReply({ status: "ready", text: data?.reply ?? buildSuggestedReply(order) });
@@ -338,33 +322,8 @@ export default function Home() {
     lastAutoFilledRef.current = null;
   }
 
-  async function handleCallerSearch(e?: FormEvent) {
-    e?.preventDefault();
-    const q = callerQuery.trim();
-    if (!q) return;
-
-    setCallerSearch({ status: "loading" });
-    try {
-      const res = await fetch(`/api/callers/search?q=${encodeURIComponent(q)}`);
-      const data = await res.json().catch(() => null);
-      if (!res.ok) {
-        setCallerSearch({ status: "error", message: data?.error ?? `Search failed (${res.status})` });
-        return;
-      }
-      setCallerSearch({ status: "ready", matches: data?.matches ?? [], warning: data?.warning });
-    } catch {
-      setCallerSearch({ status: "error", message: "Network error — please try again." });
-    }
-  }
-
-  // Same rule as applyDetectedReference: picking a caller match only fills
-  // the search box, it never looks the order up on its own.
-  function applyCallerMatch(match: CallerOrderMatch) {
-    setReferenceNumber(match.referenceNumber);
-  }
-
   const order = state.status === "success" ? state.order : null;
-  const lookupSource = state.status === "success" ? state.source : null;
+  const foundViaCaller = state.status === "success" ? state.foundViaCaller : null;
   const lookupWarning = state.status === "success" ? state.warning : null;
 
   return (
@@ -380,16 +339,22 @@ export default function Home() {
                 <h1 className="text-xl font-semibold tracking-tight text-zinc-900 dark:text-zinc-50">
                   Xcelerator Query Brain
                 </h1>
-                {live !== null && <Badge tone={live ? "emerald" : "zinc"}>{live ? "Live Xcelerator" : "Mock data"}</Badge>}
+                <Badge tone="indigo">Web agent</Badge>
               </div>
               <p className="mt-0.5 text-sm text-zinc-600 dark:text-zinc-400">
-                Pull pickup, delivery, POD, and charge status straight from Xcelerator.
+                A browser agent signs in to the Xcelerator portal and reads the order off the screen, with no API calls.
               </p>
             </div>
+            <Link
+              href="/"
+              className="ml-auto text-xs font-medium text-zinc-400 hover:text-indigo-600 hover:underline dark:hover:text-indigo-400"
+            >
+              API version
+            </Link>
             {process.env.NODE_ENV !== "production" && (
               <Link
                 href="/debug"
-                className="ml-auto text-xs font-medium text-zinc-400 hover:text-indigo-600 hover:underline dark:hover:text-indigo-400"
+                className="text-xs font-medium text-zinc-400 hover:text-indigo-600 hover:underline dark:hover:text-indigo-400"
               >
                 Debug
               </Link>
@@ -422,7 +387,7 @@ export default function Home() {
               {state.status === "loading" ? (
                 <>
                   <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-white/40 border-t-white" />
-                  Looking up…
+                  Agent browsing…
                 </>
               ) : (
                 <>
@@ -500,101 +465,14 @@ export default function Home() {
             )}
           </div>
 
-          <div className="mt-3 flex flex-col gap-2">
-            <button
-              type="button"
-              onClick={() => setShowCallerPanel((prev) => !prev)}
-              className="inline-flex w-fit items-center gap-1.5 text-xs font-medium text-zinc-500 transition-colors hover:text-indigo-600 dark:text-zinc-400 dark:hover:text-indigo-400"
-            >
-              <PhoneIcon className="h-3.5 w-3.5" />
-              {showCallerPanel ? "Hide caller search" : "Only have who's calling? Search by caller"}
-            </button>
-
-            {showCallerPanel && (
-              <div className="rounded-xl border border-zinc-200 bg-zinc-50 p-3 dark:border-zinc-800 dark:bg-zinc-950/40">
-                <form onSubmit={handleCallerSearch} className="flex gap-2">
-                  <input
-                    value={callerQuery}
-                    onChange={(e) => setCallerQuery(e.target.value)}
-                    placeholder="Caller name, phone, or email"
-                    className="w-full rounded-lg border border-zinc-300 bg-white px-2.5 py-2 text-xs text-zinc-900 outline-none transition-shadow focus:border-indigo-500 focus:ring-4 focus:ring-indigo-500/15 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200"
-                  />
-                  <button
-                    type="submit"
-                    disabled={callerSearch.status === "loading" || !callerQuery.trim()}
-                    className="shrink-0 rounded-lg bg-indigo-600 px-3 py-2 text-xs font-medium text-white transition-colors hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-indigo-500 dark:hover:bg-indigo-400"
-                  >
-                    {callerSearch.status === "loading" ? "Searching…" : "Search"}
-                  </button>
-                </form>
-
-                <div className="mt-2">
-                  {callerSearch.status === "error" && (
-                    <p className="text-xs text-red-600 dark:text-red-400">{callerSearch.message}</p>
-                  )}
-                  {callerSearch.status === "ready" && callerSearch.warning && (
-                    <p className="mb-2 text-xs text-amber-700 dark:text-amber-400">{callerSearch.warning}</p>
-                  )}
-                  {callerSearch.status === "ready" && callerSearch.matches.length === 0 && (
-                    <p className="text-xs text-zinc-500 dark:text-zinc-400">
-                      No orders found for that caller.
-                    </p>
-                  )}
-                  {callerSearch.status === "ready" && callerSearch.matches.length > 0 && (
-                    <ul className="flex flex-col gap-1.5">
-                      {callerSearch.matches.map((match) => (
-                        <li key={`${match.referenceNumber}-${match.orderTrackingId ?? ""}`}>
-                          <button
-                            type="button"
-                            onClick={() => applyCallerMatch(match)}
-                            className={`w-full rounded-lg border px-2.5 py-2 text-left text-xs transition-colors ${
-                              referenceNumber === match.referenceNumber
-                                ? "border-indigo-500 bg-indigo-50 dark:border-indigo-400 dark:bg-indigo-950"
-                                : "border-zinc-200 bg-white hover:border-indigo-400 dark:border-zinc-800 dark:bg-zinc-900 dark:hover:border-indigo-500"
-                            }`}
-                          >
-                            <div className="flex items-center justify-between gap-2">
-                              <span className="font-medium text-zinc-900 dark:text-zinc-100">
-                                {match.referenceNumber}
-                              </span>
-                              <span className="text-[10px] uppercase tracking-wide text-zinc-400 dark:text-zinc-500">
-                                matched {match.matchedOn}
-                              </span>
-                            </div>
-                            <div className="mt-0.5 text-zinc-600 dark:text-zinc-400">
-                              {[match.callerName, match.callerPhone, match.callerEmail]
-                                .filter(Boolean)
-                                .join(" · ") || "No caller contact on file"}
-                              {match.customer ? ` — ${match.customer}` : ""}
-                            </div>
-                            <div className="mt-0.5 text-[10px] text-indigo-600 dark:text-indigo-400">
-                              Found via caller: {match.foundViaCaller}
-                            </div>
-                          </button>
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-                </div>
-              </div>
-            )}
-          </div>
-
-          {live === false && (
-            <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-zinc-500 dark:text-zinc-400">
-              <span>Sample refs (mock data):</span>
-              {SAMPLE_REFS.map((ref) => (
-                <button
-                  key={ref}
-                  onClick={() => handleLookup(ref)}
-                  className="rounded-full border border-zinc-300 px-2.5 py-1 transition-colors hover:border-indigo-400 hover:text-indigo-600 dark:border-zinc-700 dark:hover:border-indigo-500 dark:hover:text-indigo-400"
-                >
-                  {ref}
-                </button>
-              ))}
-            </div>
-          )}
         </section>
+
+        {live === false && (
+          <p className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:border-amber-900/60 dark:bg-amber-950 dark:text-amber-300">
+            No Xcelerator caller is configured, so the web agent has nothing to sign in with. Set
+            XCELERATOR_CALLER_1_USERNAME and XCELERATOR_CALLER_1_PASSWORD.
+          </p>
+        )}
 
         {state.status === "error" && (
           <p className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 dark:border-red-900/60 dark:bg-red-950 dark:text-red-300">
@@ -628,6 +506,9 @@ export default function Home() {
         {state.status === "loading" && (
           <div className="animate-pulse rounded-2xl border border-zinc-200/70 bg-white p-6 dark:border-zinc-800/70 dark:bg-zinc-900">
             <div className="h-4 w-56 rounded-full bg-zinc-200 dark:bg-zinc-800" />
+            <p className="mt-2 text-xs text-zinc-500 dark:text-zinc-400">
+              The agent is signing in and searching the portal. This usually takes 20 to 90 seconds.
+            </p>
             <div className="mt-6 space-y-4">
               <div className="h-3 w-full rounded-full bg-zinc-100 dark:bg-zinc-800" />
               <div className="h-3 w-5/6 rounded-full bg-zinc-100 dark:bg-zinc-800" />
@@ -644,15 +525,9 @@ export default function Home() {
                   <h2 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">
                     {order.referenceNumber}
                   </h2>
-                  {lookupSource && (
-                    <Badge tone={lookupSource === "axis" ? "emerald" : lookupSource === "portal" ? "amber" : "zinc"}>
-                      {lookupSource === "axis"
-                        ? "Source: Axis API"
-                        : lookupSource === "portal"
-                          ? "Source: ClientPortal fallback"
-                          : "Source: Mock data"}
-                    </Badge>
-                  )}
+                  <Badge tone="indigo">
+                    Source: Web agent{foundViaCaller ? ` (${foundViaCaller})` : ""}
+                  </Badge>
                 </div>
                 <span className="text-xs text-zinc-500 dark:text-zinc-400">Carrier: {order.carrier}</span>
               </div>
@@ -899,6 +774,23 @@ export default function Home() {
             </section>
 
           </div>
+        )}
+        {steps.length > 0 && state.status !== "loading" && (
+          <section className="rounded-2xl border border-zinc-200/70 bg-white p-6 shadow-sm dark:border-zinc-800/70 dark:bg-zinc-900">
+            <h2 className="mb-3 text-sm font-semibold text-zinc-900 dark:text-zinc-100">What the agent did</h2>
+            <ol className="flex flex-col gap-1.5 text-xs text-zinc-600 dark:text-zinc-400">
+              {steps.map((step, i) => (
+                <li key={i} className="flex gap-2">
+                  <span className="w-5 shrink-0 text-right text-zinc-400 dark:text-zinc-500">{i + 1}.</span>
+                  <span>
+                    <span className="font-medium text-zinc-800 dark:text-zinc-200">{step.action}</span>
+                    {step.detail ? ` ${step.detail}` : ""}
+                    <span className="text-zinc-400 dark:text-zinc-500"> · {step.caller}</span>
+                  </span>
+                </li>
+              ))}
+            </ol>
+          </section>
         )}
       </main>
     </div>

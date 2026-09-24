@@ -2,15 +2,57 @@ import {
   loginToPortal,
   portalJson,
   postPortalJson,
+  xceleratorCallersFromEnv,
   xceleratorConfigFromEnv,
   XceleratorPortalError,
+  type NamedXceleratorCaller,
+  type PortalSession,
   type XceleratorPortalConfig,
 } from "./xcelerator-portal";
 import {
+  getAllOrdersFromAxisRaw,
   getCompletedOrdersFromAxis,
   getOrderByReferenceFromAxis,
   isAxisApiConfigured,
+  type TrackOrderV4Response,
 } from "./axis-api";
+import {
+  loginPerformanceSnapshot,
+  getAdaptiveTimeoutMs,
+  recordLoginAttempt,
+  shouldSkipLogin,
+} from "./login-performance";
+import { firstHitInPriorityOrder, type Skipped } from "./ordered-first-match";
+
+export { loginPerformanceSnapshot };
+
+// Resolves once `promise` settles, or rejects with a timeout error once
+// `ms` elapses, whichever comes first. Doesn't cancel `promise` itself —
+// there's no AbortController threaded through loginToPortal — so a call
+// this gives up on keeps running in the background and, on success, still
+// populates fetchPortalOrderRows' cache and login-performance.ts's
+// latency history for next time. That's a deliberate feature, not a leak:
+// a login that was slow this once still gets to "prove" it eventually so
+// the next search's cache or adaptive timeout benefits from it.
+class TimeoutError extends Error {}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new TimeoutError(`Timed out waiting for "${label}" after ${ms}ms`));
+    }, ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
+}
 
 export type OrderStatus = "pending_pickup" | "in_transit" | "delivered";
 
@@ -332,8 +374,7 @@ const MOCK_ORDERS: Record<string, OrderInquiry> = {
 const MOCK_LATENCY_MS = 350;
 
 export function isXceleratorConfigured(): boolean {
-  const cfg = xceleratorConfigFromEnv();
-  return Boolean(cfg.username && cfg.password);
+  return xceleratorCallersFromEnv().length > 0;
 }
 
 export type OrderLookupSource = "axis" | "portal" | "mock";
@@ -363,11 +404,19 @@ export async function getOrderByReferenceNumberDetailed(
   // Authorization header format is unconfirmed (see that file's header
   // comment), so any failure there — auth included — falls back to the
   // proven ClientPortal session lookup below rather than surfacing an error.
-  if (isAxisApiConfigured()) {
+  // Tracked in login-performance.ts under the "axis" key: after a few
+  // consecutive failures (this deployment's known 401 — see axis-api.ts's
+  // header comment — reproduces every time), this stops even trying Axis
+  // for a 5-minute cooldown instead of paying for a doomed call on every
+  // single lookup.
+  if (isAxisApiConfigured() && !shouldSkipLogin("axis")) {
+    const axisStartedAt = Date.now();
     try {
       const order = await getOrderByReferenceFromAxis(referenceNumber);
+      recordLoginAttempt("axis", Date.now() - axisStartedAt, true);
       return { order, source: "axis" };
     } catch (err) {
+      recordLoginAttempt("axis", Date.now() - axisStartedAt, false);
       axisFailureMessage = err instanceof Error ? err.message : String(err);
       console.warn(
         "Axis REST API order lookup failed, falling back to ClientPortal session lookup:",
@@ -376,43 +425,51 @@ export async function getOrderByReferenceNumberDetailed(
     }
   }
 
-  const cfg = xceleratorConfigFromEnv();
-  if (cfg.username && cfg.password) {
-    const order = await getOrderFromXcelerator(referenceNumber, cfg);
-    if (order) {
-      return {
-        order,
-        source: "portal",
-        warning: axisFailureMessage
-          ? `Axis order lookup failed, showing ClientPortal data instead: ${axisFailureMessage}`
-          : undefined,
-      };
-    }
+  // Every configured caller is checked the same way (see
+  // xceleratorCallersFromEnv). A caller whose login fails, times out, or is
+  // circuit-broken doesn't block the lookup, it's just reported as
+  // unchecked below so a "not found" can't silently hide that part of the
+  // search never ran.
+  const callers = xceleratorCallersFromEnv();
+  if (callers.length > 0) {
+    const { winner, unchecked } = await lookupAcrossCallers(referenceNumber.trim(), callers);
 
-    // getorderproperties (the endpoint getOrderFromXcelerator just tried)
-    // has narrower visibility than getorders — confirmed live, it returns
-    // Data: [] for real orders getorders finds fine. Try that broader
-    // search before giving up.
-    const bulkOrder = await getOrderByReferenceFromXceleratorBulkSearch(referenceNumber, cfg);
-    if (bulkOrder) {
+    const notes = [
+      axisFailureMessage ? `Axis order lookup failed (${axisFailureMessage}).` : null,
+      ...unchecked.map((u) => `Caller "${u.label}" could not be checked (${u.message}).`),
+    ];
+
+    if (winner) {
       return {
-        order: bulkOrder,
+        order: winner.hit.order,
         source: "portal",
-        warning: [
-          axisFailureMessage ? `Axis order lookup failed (${axisFailureMessage}).` : null,
-          "ClientPortal's order-detail search found nothing, so this is limited data from the order list instead — pickup arrival time and itemized charges aren't available this way.",
-        ]
-          .filter(Boolean)
-          .join(" "),
+        warning:
+          [
+            ...notes,
+            callers.length > 1 ? `Found via caller "${winner.caller.label}".` : null,
+            winner.hit.limited
+              ? "ClientPortal's order-detail search found nothing, so this is limited data from the order list instead: pickup arrival time and itemized charges aren't available this way."
+              : null,
+          ]
+            .filter(Boolean)
+            .join(" ") || undefined,
       };
     }
 
     return {
       order: null,
       source: "portal",
-      warning: axisFailureMessage
-        ? `Axis order lookup failed, and ClientPortal found no match either: ${axisFailureMessage}`
-        : undefined,
+      warning:
+        notes.filter(Boolean).length > 0
+          ? [
+              ...notes,
+              callers.length > 1
+                ? "None of the callers that could be checked had a match."
+                : "No match either.",
+            ]
+              .filter(Boolean)
+              .join(" ")
+          : undefined,
     };
   }
 
@@ -900,7 +957,7 @@ function buildOrderInquiryFromPortal(n: NormalizedPortalOrder): OrderInquiry {
   };
 }
 
-// Last-resort fallback (see getOrderByReferenceFromXceleratorBulkSearch's
+// Last-resort fallback (see searchOrderUnderSession's
 // comment) — but no longer meaningfully lower-fidelity than
 // mapPortalOrderToInquiry below: pickup/delivery target and arrival times,
 // full contact/address detail, and shipment weight/pieces are all present
@@ -1088,13 +1145,90 @@ async function lookupOrderProperties(
   return result.Data?.find((props) => Boolean(props.OrderTrackingID)) ?? null;
 }
 
+// Every caller-facing "bulk" lookup in this file (getCompletedOrdersFromXcelerator,
+// getAllOrdersFromXceleratorPortal, the reference bulk-search fallback below,
+// and searchOrdersByCaller) ultimately asks this same getorders endpoint for
+// the same status+date-range row set — a single ClientPortal login plus one
+// (often large) JSON response. Without caching, e.g. searching for three
+// different callers back to back means three fresh logins and three full
+// re-fetches of the same underlying rows. A short TTL cache, keyed by the
+// actual query shape (not by what the caller is filtering for afterward),
+// turns "N distinct searches" into "1 network round-trip, N in-memory
+// filters" as long as they land within the window. In-flight de-duping
+// additionally collapses two requests that land in the same tick (e.g. a
+// double-click) into one.
+const PORTAL_ROWS_CACHE_TTL_MS = 60_000;
+const portalRowsCache = new Map<string, { rows: PortalOrderListRow[]; expiresAt: number }>();
+const portalRowsInFlight = new Map<string, Promise<PortalOrderListRow[]>>();
+
+function portalRowsCacheKey(
+  status: string,
+  start: Date,
+  end: Date,
+  cfg: ReturnType<typeof xceleratorConfigFromEnv>,
+): string {
+  // Rounded to the day: every caller of this function passes `new Date()` as
+  // `end` (and a `-N days` offset as `start`), which would otherwise mint a
+  // unique cache key on every single call and never hit.
+  const day = (d: Date) => d.toISOString().slice(0, 10);
+  return [status, day(start), day(end), cfg.username ?? ""].join("|");
+}
+
 async function fetchPortalOrderRows(
   status: string,
   start: Date,
   end: Date,
   cfg: ReturnType<typeof xceleratorConfigFromEnv>,
+  /**
+   * An already-logged-in session to reuse on a cache miss, instead of paying
+   * for another portal login (15-90s each in practice). When given, the
+   * caller owns recording this attempt in login-performance.ts, since the
+   * login it made covers more than this one fetch.
+   */
+  session?: PortalSession,
 ): Promise<PortalOrderListRow[]> {
-  const session = await loginToPortal(cfg);
+  const cacheKey = portalRowsCacheKey(status, start, end, cfg);
+  const cached = portalRowsCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.rows;
+  }
+
+  const inFlight = portalRowsInFlight.get(cacheKey);
+  if (inFlight) return inFlight;
+
+  // Every caller of this function goes through here on a cache miss, so
+  // instrumenting this one spot gives login-performance.ts visibility
+  // into every login (default and additional alike) for free, regardless
+  // of which higher-level function asked for the rows.
+  const loginKey = cfg.username ?? "unknown-login";
+  const startedAt = Date.now();
+  const promise = fetchPortalOrderRowsUncached(status, start, end, cfg, session)
+    .then((rows) => {
+      if (!session) recordLoginAttempt(loginKey, Date.now() - startedAt, true);
+      portalRowsCache.set(cacheKey, { rows, expiresAt: Date.now() + PORTAL_ROWS_CACHE_TTL_MS });
+      purgeExpired(portalRowsCache);
+      return rows;
+    })
+    .catch((err) => {
+      if (!session) recordLoginAttempt(loginKey, Date.now() - startedAt, false);
+      throw err;
+    })
+    .finally(() => {
+      portalRowsInFlight.delete(cacheKey);
+    });
+
+  portalRowsInFlight.set(cacheKey, promise);
+  return promise;
+}
+
+async function fetchPortalOrderRowsUncached(
+  status: string,
+  start: Date,
+  end: Date,
+  cfg: ReturnType<typeof xceleratorConfigFromEnv>,
+  existingSession?: PortalSession,
+): Promise<PortalOrderListRow[]> {
+  const session = existingSession ?? (await loginToPortal(cfg));
   const bufferDays = targetDateBufferDays();
   const params = new URLSearchParams({
     ServiceIDs: process.env.XCELERATOR_TRACKING_SERVICE_IDS || "0",
@@ -1226,49 +1360,438 @@ export async function getAllOrdersFromXceleratorPortal(
 const BULK_SEARCH_LOOKBACK_DAYS = 730;
 const TRACKING_ID_PATTERN = /^\d+(\.\d+)?$/;
 
-/**
- * Last-resort single-order lookup: searches the same all-statuses
- * getorders row set getAllOrdersFromXceleratorPortal uses (proven live to
- * see orders getorderproperties/getOrderFromXcelerator below can't) for a
- * row whose OrderTrackingID or ClientRefNo matches. Only reached when both
- * Axis and the normal ClientPortal single-order lookup have already come up
- * empty. Returns lower-fidelity data — see mapPortalOrderListRowToInquiryFallback.
- */
-async function getOrderByReferenceFromXceleratorBulkSearch(
+type CallerLookupHit = {
+  order: OrderInquiry;
+  /** True when this came from the order-list search: less detail than the order-properties search (no itemized charges, see mapPortalOrderListRowToInquiryFallback). */
+  limited: boolean;
+};
+
+async function searchOrderUnderSession(
+  session: PortalSession,
   referenceNumber: string,
   cfg: XceleratorPortalConfig,
-): Promise<OrderInquiry | null> {
-  const search = referenceNumber.trim();
-  if (!search) return null;
-
-  const end = new Date();
-  const start = addDays(end, -BULK_SEARCH_LOOKBACK_DAYS);
-  const rows = await fetchPortalOrderRows(TRACKING_ALL_STATUSES_FILTER, start, end, cfg);
-
-  const isTrackingId = TRACKING_ID_PATTERN.test(search);
-  const match = rows.find((row) =>
-    isTrackingId
-      ? formatOrderTrackingId(row.OrderTrackingID) === search
-      : (row.ClientRefNo ?? "").trim().toLowerCase() === search.toLowerCase(),
-  );
-
-  return match ? mapPortalOrderListRowToInquiryFallback(match) : null;
-}
-
-async function getOrderFromXcelerator(
-  referenceNumber: string,
-  cfg: ReturnType<typeof xceleratorConfigFromEnv>,
-): Promise<OrderInquiry | null> {
-  const search = referenceNumber.trim();
-  if (!search) return null;
-
-  const session = await loginToPortal(cfg);
+): Promise<CallerLookupHit | null> {
   for (const searchBy of ORDER_LOOKUP_FIELDS) {
-    const props = await lookupOrderProperties(session, searchBy, search);
-    if (props) return mapPortalOrderToInquiry(props);
+    const props = await lookupOrderProperties(session, searchBy, referenceNumber);
+    if (props) return { order: mapPortalOrderToInquiry(props), limited: false };
   }
 
-  return null;
+  // getorderproperties has narrower visibility than getorders: confirmed
+  // live, it returns Data: [] for real orders getorders finds fine. So when
+  // it finds nothing, search the broader all-statuses order list before
+  // giving up. Reuses this same session rather than logging in again.
+  const end = new Date();
+  const start = addDays(end, -BULK_SEARCH_LOOKBACK_DAYS);
+  const rows = await fetchPortalOrderRows(TRACKING_ALL_STATUSES_FILTER, start, end, cfg, session);
+
+  const isTrackingId = TRACKING_ID_PATTERN.test(referenceNumber);
+  const match = rows.find((row) =>
+    isTrackingId
+      ? formatOrderTrackingId(row.OrderTrackingID) === referenceNumber
+      : (row.ClientRefNo ?? "").trim().toLowerCase() === referenceNumber.toLowerCase(),
+  );
+
+  return match ? { order: mapPortalOrderListRowToInquiryFallback(match), limited: true } : null;
+}
+
+/**
+ * Looks a reference number up under ONE caller, using one portal login for
+ * both searches (a login is the slow part: 15-90s each in practice, so
+ * paying for a second one just to run the list search would double the
+ * cost of every miss). Returns null when this caller has no such order;
+ * throws on login/portal failures. Records the outcome in
+ * login-performance.ts: a login that works but finds nothing is a success,
+ * since the caller itself is healthy.
+ */
+async function lookupOrderViaCaller(
+  referenceNumber: string,
+  cfg: XceleratorPortalConfig,
+): Promise<CallerLookupHit | null> {
+  const search = referenceNumber.trim();
+  if (!search) return null;
+
+  const loginKey = cfg.username ?? "unknown-caller";
+  const startedAt = Date.now();
+  try {
+    const session = await loginToPortal(cfg);
+    const hit = await searchOrderUnderSession(session, search, cfg);
+    recordLoginAttempt(loginKey, Date.now() - startedAt, true);
+    return hit;
+  } catch (err) {
+    recordLoginAttempt(loginKey, Date.now() - startedAt, false);
+    throw err;
+  }
+}
+
+type AcrossCallersResult = {
+  winner: { caller: NamedXceleratorCaller; hit: CallerLookupHit } | null;
+  /** Callers that couldn't be checked as of when this resolved: login failed, timed out, or skipped by the circuit breaker. A "not found" with entries here means "not found among the callers that could be checked." */
+  unchecked: { label: string; message: string }[];
+};
+
+/**
+ * Checks every caller for a reference number at once and resolves as soon as
+ * the answer is settled, without waiting on slower callers it doesn't need
+ * (see firstHitInPriorityOrder for the exact rule). Every caller is a peer,
+ * with list order as the tie-break when the same reference exists under more
+ * than one. Callers still running when this resolves keep going in the
+ * background and still feed the row cache and login-performance.ts, same as
+ * any other abandoned wait (see withTimeout).
+ *
+ * Each caller also gets the adaptive layer from login-performance.ts: one
+ * that has failed repeatedly is skipped for a cooldown, and each waits only
+ * as long as its own recent history suggests.
+ */
+async function lookupAcrossCallers(
+  referenceNumber: string,
+  callers: NamedXceleratorCaller[],
+): Promise<AcrossCallersResult> {
+  const entries: (Promise<CallerLookupHit | null> | Skipped)[] = callers.map((caller) => {
+    const loginKey = caller.cfg.username ?? caller.label;
+    if (shouldSkipLogin(loginKey)) {
+      return { skipped: "skipped, it has failed repeatedly recently (circuit open)" };
+    }
+    return withTimeout(
+      lookupOrderViaCaller(referenceNumber, caller.cfg),
+      getAdaptiveTimeoutMs(loginKey),
+      caller.label,
+    );
+  });
+
+  const { winner, failures } = await firstHitInPriorityOrder(entries);
+  return {
+    winner: winner ? { caller: callers[winner.index], hit: winner.hit } : null,
+    unchecked: failures.map((f) => ({ label: callers[f.index].label, message: f.message })),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Caller search — "who is this on the phone, and what orders are theirs?"
+// A CSR searching by caller name/phone/email has no single reference number
+// to look up, so this has to scan many orders at once. The naive approach —
+// one lookup per candidate order — doesn't work here (there's no candidate
+// list yet, that's the whole point), so instead this fetches the same broad
+// all-statuses row set the reference bulk-search above uses (and shares its
+// cache, via fetchPortalOrderRows/fetchAllAxisOrdersCached below) ONE time
+// per source, then filters that in memory. Searching for several different
+// callers back to back costs one real network round-trip, not one per
+// caller, as long as the searches land within the cache's 60s window.
+
+export type CallerOrderMatch = {
+  referenceNumber: string;
+  orderTrackingId: string | null;
+  customer: string;
+  callerName: string | null;
+  callerDepartment: string | null;
+  callerPhone: string | null;
+  callerEmail: string | null;
+  /** Which field(s) the search term actually matched, e.g. "phone" or "name, email" — shown in the UI so the CSR can tell why a row came back. */
+  matchedOn: string;
+  /** Which configured caller (XCELERATOR_CALLER_N_NAME, or its username) this order was found under, or "Axis API" / "mock data" for those sources. Surfaced because a CSR often doesn't know which caller an order shows under. Not related to Xcelerator's AccountNo field. */
+  foundViaCaller: string;
+};
+
+export type CallerSearchResult = {
+  matches: CallerOrderMatch[];
+  source: OrderLookupSource;
+  /** Set when some callers couldn't be checked (login failed, timed out, or circuit-broken), so a short or empty result isn't mistaken for "nobody by that name." */
+  warning?: string;
+};
+
+type CallerFields = {
+  name: string | null;
+  department: string | null;
+  phone: string | null;
+  email: string | null;
+};
+
+const CALLER_SEARCH_LOOKBACK_DAYS = BULK_SEARCH_LOOKBACK_DAYS;
+const CALLER_SEARCH_MAX_RESULTS = 25;
+
+function digitsOnly(value: string): string {
+  return value.replace(/\D+/g, "");
+}
+
+function callerFieldMatches(term: string, value: string | null | undefined): boolean {
+  if (!value) return false;
+  if (value.toLowerCase().includes(term)) return true;
+
+  // Phone-shaped search terms (7+ digits) also match against the field's
+  // digits alone, so a caller-ID number like "5035550148" finds a caller
+  // stored as "(503) 555-0148".
+  const termDigits = digitsOnly(term);
+  if (termDigits.length >= 7) {
+    const valueDigits = digitsOnly(value);
+    if (valueDigits.length >= 7 && valueDigits.includes(termDigits)) return true;
+  }
+
+  return false;
+}
+
+function callerMatchLabel(term: string, fields: CallerFields): string | null {
+  const hits: string[] = [];
+  if (callerFieldMatches(term, fields.name)) hits.push("name");
+  if (callerFieldMatches(term, fields.department)) hits.push("department");
+  if (callerFieldMatches(term, fields.phone)) hits.push("phone");
+  if (callerFieldMatches(term, fields.email)) hits.push("email");
+  return hits.length ? hits.join(", ") : null;
+}
+
+function toCallerMatchFromAxis(
+  order: TrackOrderV4Response,
+  term: string,
+  foundViaCaller: string,
+): CallerOrderMatch | null {
+  const fields: CallerFields = {
+    name: order.Caller || null,
+    department: order.Department || null,
+    phone: order.Phone || null,
+    email: order.Email || null,
+  };
+  const matchedOn = callerMatchLabel(term, fields);
+  if (!matchedOn) return null;
+
+  const trackingId = formatOrderTrackingId(order.OrderTrackingId);
+  return {
+    referenceNumber: order.ClientRefNo || trackingId || "Unknown",
+    orderTrackingId: trackingId,
+    customer: order.PCoName || order.DCoName || "Unknown",
+    callerName: fields.name,
+    callerDepartment: fields.department,
+    callerPhone: fields.phone,
+    callerEmail: fields.email,
+    matchedOn,
+    foundViaCaller,
+  };
+}
+
+function toCallerMatchFromPortalRow(
+  row: PortalOrderListRow,
+  term: string,
+  foundViaCaller: string,
+): CallerOrderMatch | null {
+  const fields: CallerFields = {
+    name: row.Caller || null,
+    department: row.Department || null,
+    phone: row.Phone || null,
+    email: row.Email || null,
+  };
+  const matchedOn = callerMatchLabel(term, fields);
+  if (!matchedOn) return null;
+
+  const trackingId = formatOrderTrackingId(row.OrderTrackingID);
+  return {
+    referenceNumber: row.ClientRefNo || trackingId || "Unknown",
+    orderTrackingId: trackingId,
+    customer: row.PCoName || row.DCoName || row.CompanyName || "Unknown",
+    callerName: fields.name,
+    callerDepartment: fields.department,
+    callerPhone: fields.phone,
+    callerEmail: fields.email,
+    matchedOn,
+    foundViaCaller,
+  };
+}
+
+function toCallerMatchFromInquiry(order: OrderInquiry, term: string): CallerOrderMatch | null {
+  const matchedOn = callerMatchLabel(term, order.caller);
+  if (!matchedOn) return null;
+
+  return {
+    referenceNumber: order.referenceNumber,
+    orderTrackingId: null,
+    customer: order.customer,
+    callerName: order.caller.name,
+    callerDepartment: order.caller.department,
+    callerPhone: order.caller.phone,
+    callerEmail: order.caller.email,
+    matchedOn,
+    foundViaCaller: "mock data",
+  };
+}
+
+// Mirrors fetchPortalOrderRows' cache (see its header comment): the Axis
+// GetAllOrders response for a given date window is cached for 60s and
+// in-flight requests are de-duped, so back-to-back caller searches (and any
+// future feature that wants "all orders in a window") share one fetch
+// instead of each paying for their own.
+const AXIS_ALL_ORDERS_CACHE_TTL_MS = 60_000;
+const axisAllOrdersCache = new Map<string, { orders: TrackOrderV4Response[]; expiresAt: number }>();
+const axisAllOrdersInFlight = new Map<string, Promise<TrackOrderV4Response[]>>();
+
+// Both caches above are keyed by a day-rounded date window, so a new key is
+// minted every day for every caller, and nothing ever removed the expired
+// ones: a server left running for weeks would keep a full order list per
+// day per caller in memory. Dropped whenever a fresh entry is stored.
+function purgeExpired<V extends { expiresAt: number }>(cache: Map<string, V>): void {
+  const now = Date.now();
+  for (const [key, entry] of cache) {
+    if (entry.expiresAt <= now) cache.delete(key);
+  }
+}
+
+export type CacheEntryInfo = { key: string; count: number; ageSec: number; expiresInSec: number };
+
+/** Read-only view of the lookup caches, for the /debug page. */
+export function debugCacheStats(): {
+  ttlSeconds: number;
+  portalRows: CacheEntryInfo[];
+  portalRowsInFlight: number;
+  axisAllOrders: CacheEntryInfo[];
+  axisAllOrdersInFlight: number;
+} {
+  const now = Date.now();
+  const describe = (key: string, count: number, expiresAt: number, ttlMs: number): CacheEntryInfo => ({
+    key,
+    count,
+    ageSec: Math.max(0, Math.round((now - (expiresAt - ttlMs)) / 1000)),
+    expiresInSec: Math.round((expiresAt - now) / 1000),
+  });
+
+  return {
+    ttlSeconds: PORTAL_ROWS_CACHE_TTL_MS / 1000,
+    portalRows: [...portalRowsCache].map(([key, v]) =>
+      describe(key, v.rows.length, v.expiresAt, PORTAL_ROWS_CACHE_TTL_MS),
+    ),
+    portalRowsInFlight: portalRowsInFlight.size,
+    axisAllOrders: [...axisAllOrdersCache].map(([key, v]) =>
+      describe(key, v.orders.length, v.expiresAt, AXIS_ALL_ORDERS_CACHE_TTL_MS),
+    ),
+    axisAllOrdersInFlight: axisAllOrdersInFlight.size,
+  };
+}
+
+/** Empties both lookup caches so the next search re-fetches (in-flight requests are left alone). */
+export function clearLookupCaches(): void {
+  portalRowsCache.clear();
+  axisAllOrdersCache.clear();
+}
+
+function axisAllOrdersCacheKey(start: Date, end: Date): string {
+  const day = (d: Date) => d.toISOString().slice(0, 10);
+  return `${day(start)}|${day(end)}`;
+}
+
+async function fetchAllAxisOrdersCached(start: Date, end: Date): Promise<TrackOrderV4Response[]> {
+  const key = axisAllOrdersCacheKey(start, end);
+  const cached = axisAllOrdersCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) return cached.orders;
+
+  const inFlight = axisAllOrdersInFlight.get(key);
+  if (inFlight) return inFlight;
+
+  const promise = getAllOrdersFromAxisRaw(start, end)
+    .then((orders) => {
+      axisAllOrdersCache.set(key, { orders, expiresAt: Date.now() + AXIS_ALL_ORDERS_CACHE_TTL_MS });
+      purgeExpired(axisAllOrdersCache);
+      return orders;
+    })
+    .finally(() => {
+      axisAllOrdersInFlight.delete(key);
+    });
+
+  axisAllOrdersInFlight.set(key, promise);
+  return promise;
+}
+
+/**
+ * Finds orders whose caller name, department, phone, or email contains
+ * `search` (case-insensitive; phone numbers also match on digits alone).
+ * Same Axis-first, ClientPortal-fallback, mock-last pattern as
+ * getOrderByReferenceNumberDetailed above, but — unlike that function — both
+ * live paths here go through a 60s cache (fetchAllAxisOrdersCached /
+ * fetchPortalOrderRows) shared with every other bulk read in this file, so
+ * this function alone never costs more than one real network round-trip per
+ * source per minute, no matter how many different callers get searched for
+ * in that window.
+ */
+export async function searchOrdersByCaller(search: string): Promise<CallerSearchResult> {
+  const term = search.trim().toLowerCase();
+  if (!term) return { matches: [], source: "mock" };
+
+  const end = new Date();
+  const start = addDays(end, -CALLER_SEARCH_LOOKBACK_DAYS);
+
+  if (isAxisApiConfigured() && !shouldSkipLogin("axis")) {
+    const axisStartedAt = Date.now();
+    try {
+      const orders = await fetchAllAxisOrdersCached(start, end);
+      recordLoginAttempt("axis", Date.now() - axisStartedAt, true);
+      const matches: CallerOrderMatch[] = [];
+      for (const order of orders) {
+        const match = toCallerMatchFromAxis(order, term, "Axis API");
+        if (match) matches.push(match);
+        if (matches.length >= CALLER_SEARCH_MAX_RESULTS) break;
+      }
+      return { matches, source: "axis" };
+    } catch (err) {
+      recordLoginAttempt("axis", Date.now() - axisStartedAt, false);
+      console.warn(
+        "Axis caller search failed, falling back to ClientPortal:",
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
+
+  const callers = xceleratorCallersFromEnv();
+  if (callers.length > 0) {
+    // Check every configured caller: a CSR searching by caller often doesn't
+    // know which one an order shows under. Each needs its own login+fetch,
+    // and a fresh login to this portal measured 15-90s in practice, so they
+    // run concurrently (waiting on the slowest one, not the sum of all)
+    // instead of one after another. Every caller's row set is still
+    // independently cached (see fetchPortalOrderRows), so repeat searches
+    // stay cheap regardless.
+    //
+    // Adaptive layer (login-performance.ts): a caller that has failed
+    // repeatedly gets skipped outright for a cooldown instead of eating a
+    // full attempt, and each waits only as long as its own recent history
+    // suggests, not one fixed guess for all of them.
+    const settled = await Promise.allSettled(
+      callers.map((caller) => {
+        const loginKey = caller.cfg.username ?? caller.label;
+        if (shouldSkipLogin(loginKey)) {
+          return Promise.reject(new Error("skipped, it has failed repeatedly recently (circuit open)"));
+        }
+        return withTimeout(
+          fetchPortalOrderRows(TRACKING_ALL_STATUSES_FILTER, start, end, caller.cfg),
+          getAdaptiveTimeoutMs(loginKey),
+          caller.label,
+        );
+      }),
+    );
+
+    const matches: CallerOrderMatch[] = [];
+    const unchecked: string[] = [];
+    settled.forEach((result, i) => {
+      const caller = callers[i];
+      if (result.status === "rejected") {
+        const message = result.reason instanceof Error ? result.reason.message : String(result.reason);
+        console.warn(`Caller search via Xcelerator caller "${caller.label}" failed, skipping it:`, message);
+        unchecked.push(`Caller "${caller.label}" could not be checked (${message}).`);
+        return;
+      }
+      for (const row of result.value) {
+        if (matches.length >= CALLER_SEARCH_MAX_RESULTS) break;
+        const match = toCallerMatchFromPortalRow(row, term, caller.label);
+        if (match) matches.push(match);
+      }
+    });
+    return {
+      matches: matches.slice(0, CALLER_SEARCH_MAX_RESULTS),
+      source: "portal",
+      warning: unchecked.length > 0 ? unchecked.join(" ") : undefined,
+    };
+  }
+
+  await new Promise((resolve) => setTimeout(resolve, MOCK_LATENCY_MS));
+  const matches: CallerOrderMatch[] = [];
+  for (const order of Object.values(MOCK_ORDERS)) {
+    const match = toCallerMatchFromInquiry(order, term);
+    if (match) matches.push(match);
+    if (matches.length >= CALLER_SEARCH_MAX_RESULTS) break;
+  }
+  return { matches, source: "mock" };
 }
 
 export function listSampleReferenceNumbers(): string[] {

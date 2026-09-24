@@ -137,3 +137,24 @@ export async function draftReplyForOrder(referenceNumber: string): Promise<strin
   if (!reply) throw new Error("Model returned no reply.");
   return reply;
 }
+
+/**
+ * Drafts the reply from an order the caller already has in hand (the web
+ * agent page, which reads the order off the portal UI), so no lookup API is
+ * called. Same compact projection and prompt budget as draftReplyForOrder.
+ */
+export async function draftReplyFromOrder(order: OrderInquiry): Promise<string> {
+  if (!isOpenAIConfigured()) return buildSuggestedReply(order);
+
+  const res = await chatCompletion({
+    messages: [
+      { role: "system", content: SYSTEM_PROMPT.replace(/Call get_order_by_reference_number to get the facts before writing anything/, "Use only the order facts provided") },
+      {
+        role: "user",
+        content: `Draft a reply for order ${order.referenceNumber}. Order facts: ${JSON.stringify(toToolResult(order))}`,
+      },
+    ],
+    maxTokens: 220,
+  });
+  return res.choices[0]?.message.content || buildSuggestedReply(order);
+}

@@ -39,9 +39,11 @@ export function isOpenAIConfigured(): boolean {
 export async function chatCompletion(params: {
   messages: ChatMessage[];
   tools?: ToolDefinition[];
-  toolChoice?: "auto" | "none" | { type: "function"; function: { name: string } };
+  toolChoice?: "auto" | "none" | "required" | { type: "function"; function: { name: string } };
   maxTokens?: number;
   temperature?: number;
+  /** Overrides OPENAI_MODEL for this one call. */
+  model?: string;
 }): Promise<ChatCompletionResponse> {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
@@ -55,7 +57,7 @@ export async function chatCompletion(params: {
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      model: process.env.OPENAI_MODEL || DEFAULT_MODEL,
+      model: params.model || process.env.OPENAI_MODEL || DEFAULT_MODEL,
       messages: params.messages,
       tools: params.tools,
       tool_choice: params.toolChoice,

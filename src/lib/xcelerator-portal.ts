@@ -25,22 +25,96 @@ function envValue(name: string): string | undefined {
   return value || undefined;
 }
 
-export function xceleratorConfigFromEnv(): XceleratorPortalConfig {
+function portalBaseUrlFromEnv(): string {
+  return (envValue("XCELERATOR_PORTAL_BASE_URL") || DEFAULT_PORTAL_BASE_URL).replace(/\/+$/, "");
+}
+
+export type NamedXceleratorCaller = {
+  /** Human label for UI/logs: XCELERATOR_CALLER_N_NAME if set, else the raw username. */
+  label: string;
+  cfg: XceleratorPortalConfig;
+};
+
+const MAX_CALLER_SLOTS = 20;
+
+/**
+ * Every Xcelerator ClientPortal caller configured in the environment, in
+ * priority order: XCELERATOR_CALLER_1_USERNAME/PASSWORD, _2_, _3_, ... up to
+ * 20. A username in Xcelerator is a caller, and they're all peers: no one of
+ * them is "the" account and the rest extras. Order only matters as a
+ * tie-break when the same reference number shows up under more than one
+ * caller (earlier wins); nothing is special about slot 1 otherwise.
+ * XCELERATOR_CALLER_N_NAME is an optional display label (e.g. a company
+ * name) shown instead of the raw username.
+ *
+ * Not to be confused with Xcelerator's AccountNo, a different field on every
+ * order (see AXIS_ACCOUNT_NO). What's confirmed live (2026-09-23) is only
+ * that each caller authenticates its own independent session; whether they
+ * see different order data from each other is NOT confirmed, since every
+ * caller tried returned zero orders and there was nothing to compare.
+ *
+ * Backward compatible: if no XCELERATOR_CALLER_N_* variables are set, falls
+ * back to the old single-caller XCELERATOR_LOOKUP_USERNAME/PASSWORD, or
+ * XCELERATOR_USERNAME/PASSWORD, as a list of one.
+ */
+export function xceleratorCallersFromEnv(): NamedXceleratorCaller[] {
+  const portalBaseUrl = portalBaseUrlFromEnv();
+  const callers: NamedXceleratorCaller[] = [];
+
+  for (let n = 1; n <= MAX_CALLER_SLOTS; n++) {
+    const username = envValue(`XCELERATOR_CALLER_${n}_USERNAME`);
+    const password = envValue(`XCELERATOR_CALLER_${n}_PASSWORD`);
+    if (!username || !password) continue;
+
+    callers.push({
+      label: envValue(`XCELERATOR_CALLER_${n}_NAME`) || username,
+      cfg: {
+        portalBaseUrl,
+        username,
+        password,
+        credentialLabel: `XCELERATOR_CALLER_${n}_USERNAME and XCELERATOR_CALLER_${n}_PASSWORD`,
+      },
+    });
+  }
+  if (callers.length > 0) return callers;
+
   const lookupUsername = envValue("XCELERATOR_LOOKUP_USERNAME");
   const lookupPassword = envValue("XCELERATOR_LOOKUP_PASSWORD");
-  const hasLookupCredentials = Boolean(lookupUsername && lookupPassword);
-  const credentialLabel = hasLookupCredentials
-    ? "XCELERATOR_LOOKUP_USERNAME and XCELERATOR_LOOKUP_PASSWORD"
-    : "XCELERATOR_USERNAME and XCELERATOR_PASSWORD";
+  const useLookup = Boolean(lookupUsername && lookupPassword);
+  const username = useLookup ? lookupUsername : envValue("XCELERATOR_USERNAME");
+  const password = useLookup ? lookupPassword : envValue("XCELERATOR_PASSWORD");
+  if (!username || !password) return [];
+
+  return [
+    {
+      label: username,
+      cfg: {
+        portalBaseUrl,
+        username,
+        password,
+        credentialLabel: useLookup
+          ? "XCELERATOR_LOOKUP_USERNAME and XCELERATOR_LOOKUP_PASSWORD"
+          : "XCELERATOR_USERNAME and XCELERATOR_PASSWORD",
+      },
+    },
+  ];
+}
+
+/**
+ * The first configured caller, for the code paths that talk to exactly one
+ * caller (completed-orders period queries, the raw all-orders debug route).
+ * Those haven't been widened to span every caller; lookups and caller search
+ * use xceleratorCallersFromEnv() and check all of them.
+ */
+export function xceleratorConfigFromEnv(): XceleratorPortalConfig {
+  const [first] = xceleratorCallersFromEnv();
+  if (first) return first.cfg;
 
   return {
-    portalBaseUrl: (envValue("XCELERATOR_PORTAL_BASE_URL") || DEFAULT_PORTAL_BASE_URL).replace(
-      /\/+$/,
-      "",
-    ),
-    username: hasLookupCredentials ? lookupUsername : envValue("XCELERATOR_USERNAME"),
-    password: hasLookupCredentials ? lookupPassword : envValue("XCELERATOR_PASSWORD"),
-    credentialLabel,
+    portalBaseUrl: portalBaseUrlFromEnv(),
+    username: undefined,
+    password: undefined,
+    credentialLabel: "XCELERATOR_CALLER_1_USERNAME and XCELERATOR_CALLER_1_PASSWORD",
   };
 }
 
