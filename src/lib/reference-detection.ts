@@ -54,14 +54,26 @@ const KNOWN_FORMAT_RULES: PatternRule[] = [
     confidence: 0.92,
     reason: "Matches numeric order-tracking ID format (#.######)",
   },
+  {
+    // Skyline job / client reference numbers as they appear in real Missive
+    // subjects, e.g. "Job# 214210851W", "214490211WP", "3853523C": 7-10
+    // digits followed by one or two letters. Also what Quick Track finds as
+    // ClientRefNo (e.g. 214511213W). The letter suffix keeps plain phone
+    // numbers and amounts from matching.
+    pattern: /\b\d{7,10}[A-Z]{1,2}\b/gi,
+    confidence: 0.9,
+    reason: "Matches job number format (digits + letter, e.g. 214210851W)",
+  },
 ];
 
 // Stage 2 — a label the CSR's customer wrote next to their own ID, e.g.
-// "Order #: 48213", "Reference number - ABC-991", "Tracking# 12345".
+// "Order #: 48213", "Reference number - ABC-991", "Tracking# 12345",
+// "Job# 214210851W". The separator run allows combinations like "#:" or
+// "No.:" that real emails use.
 // Broad on purpose (real-world emails are inconsistent), so every candidate
 // pulled this way is validated by looksLikeId() below before being kept.
 const LABELED_ID_PATTERN =
-  /\b(?:order|reference|ref|tracking|invoice|shipment|pro|awb|client\s*ref(?:erence)?)\b(?:\s*(?:number|no\.?|id))?\s*[:#-]?\s*([A-Za-z0-9][A-Za-z0-9./-]{2,24})/gi;
+  /\b(?:order|job|reference|ref|tracking|invoice|shipment|pro|awb|client\s*ref(?:erence)?)\b(?:\s*(?:number|no\.?|id))?[\s:#-]*([A-Za-z0-9][A-Za-z0-9./-]{2,24})/gi;
 const LABELED_ID_CONFIDENCE = 0.72;
 const LABELED_ID_REASON = "Follows an order/reference/tracking label";
 
