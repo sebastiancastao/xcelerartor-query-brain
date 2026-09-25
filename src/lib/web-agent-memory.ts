@@ -25,6 +25,12 @@
 //  - Upstash Redis over its REST API, when UPSTASH_REDIS_REST_URL/_TOKEN (or
 //    the KV_REST_API_URL/_TOKEN names Vercel's marketplace integration sets)
 //    are present. Needed on Vercel, whose functions have no lasting disk.
+//  - Supabase, when WEB_AGENT_SUPABASE_URL, WEB_AGENT_SUPABASE_KEY (the
+//    project's publishable key) and WEB_AGENT_MEMORY_SECRET are set. The
+//    stats live in one row of public.web_agent_memory, a locked table reached
+//    only through the web_agent_memory_get/_set database functions, which
+//    refuse any caller without the secret (only its SHA-256 is stored in the
+//    database). This is what production on Vercel uses.
 //  - Otherwise a JSON file (default .data/web-agent-memory.json, gitignored),
 //    fine for a long-running server on one machine.
 
@@ -82,8 +88,33 @@ function redisConfig(): { url: string; token: string } | null {
   return url && token ? { url: url.replace(/\/+$/, ""), token } : null;
 }
 
-export function memoryBackend(): "redis" | "file" {
-  return redisConfig() ? "redis" : "file";
+function supabaseConfig(): { url: string; key: string; secret: string } | null {
+  const url = process.env.WEB_AGENT_SUPABASE_URL?.trim();
+  const key = process.env.WEB_AGENT_SUPABASE_KEY?.trim();
+  const secret = process.env.WEB_AGENT_MEMORY_SECRET?.trim();
+  return url && key && secret ? { url: url.replace(/\/+$/, ""), key, secret } : null;
+}
+
+export function memoryBackend(): "redis" | "supabase" | "file" {
+  if (redisConfig()) return "redis";
+  return supabaseConfig() ? "supabase" : "file";
+}
+
+/** Calls one of the web_agent_memory_* database functions through Supabase's REST API. */
+async function supabaseRpc(
+  cfg: { url: string; key: string; secret: string },
+  fn: "web_agent_memory_get" | "web_agent_memory_set",
+  args: Record<string, unknown>,
+): Promise<unknown> {
+  const res = await fetch(`${cfg.url}/rest/v1/rpc/${fn}`, {
+    method: "POST",
+    headers: { apikey: cfg.key, "Content-Type": "application/json" },
+    body: JSON.stringify({ p_secret: cfg.secret, p_key: REDIS_KEY, ...args }),
+    cache: "no-store",
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`Supabase ${fn} failed (HTTP ${res.status}): ${text.slice(0, 200)}`);
+  return text ? JSON.parse(text) : null;
 }
 
 async function redisCommand(cfg: { url: string; token: string }, command: string[]): Promise<unknown> {
@@ -126,6 +157,17 @@ export async function loadMemory(): Promise<WebAgentMemory> {
     }
   }
 
+  const supabase = supabaseConfig();
+  if (supabase) {
+    try {
+      const value = await supabaseRpc(supabase, "web_agent_memory_get", {});
+      return parseMemory(value === null ? null : JSON.stringify(value));
+    } catch (err) {
+      console.warn("[web-agent-memory] could not load:", err instanceof Error ? err.message : err);
+      return emptyMemory();
+    }
+  }
+
   if (fileCache) return fileCache;
   try {
     fileCache = parseMemory(await fs.readFile(/*turbopackIgnore: true*/ memoryFile(), "utf8"));
@@ -144,6 +186,11 @@ function persist(memory: WebAgentMemory): Promise<void> {
       const redis = redisConfig();
       if (redis) {
         await redisCommand(redis, ["SET", REDIS_KEY, JSON.stringify(memory)]);
+        return;
+      }
+      const supabase = supabaseConfig();
+      if (supabase) {
+        await supabaseRpc(supabase, "web_agent_memory_set", { p_value: memory });
         return;
       }
       const file = memoryFile();
