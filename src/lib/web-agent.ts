@@ -8,9 +8,9 @@
 // Searches run in code; the model is only used to read the order off the
 // screen once a search hits.
 //
-// Flow per caller (XCELERATOR_CALLER_N_*, same list the API path uses; all
-// callers run in parallel, and when several have the order, the caller
-// ranked first for this type of reference wins):
+// Flow per caller (XCELERATOR_CALLER_N_*, same list the API path uses;
+// callers run in parallel, a few at a time on Vercel, and when several have
+// the order, the caller ranked first for this type of reference wins):
 //  1. Launch headless Chromium (playwright-core): the installed Chrome/Edge
 //     locally, a bundled serverless Chromium on Vercel, or a hosted browser
 //     (see launchBrowser).
@@ -29,7 +29,7 @@
 //
 // Server-only: reads credentials from the environment and launches a browser.
 
-import { chromium, type Browser, type Page } from "playwright-core";
+import { chromium, type Browser, type BrowserContext, type Page } from "playwright-core";
 import { chatCompletion, isOpenAIConfigured, type ToolDefinition } from "./openai";
 import { xceleratorCallersFromEnv, type NamedXceleratorCaller } from "./xcelerator-portal";
 import type { OrderInquiry, OrderStatus } from "./xcelerator";
@@ -93,6 +93,9 @@ function isServerless(): boolean {
   return Boolean(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
 }
 
+/** The serverless Chromium's unpacked binary, shared by every launch on this instance. */
+let serverlessExecutable: Promise<string> | null = null;
+
 /**
  * Where the browser comes from, first match wins:
  *  1. WEB_AGENT_BROWSER_WS_ENDPOINT: a hosted browser (Browserless,
@@ -119,9 +122,16 @@ async function launchBrowser(): Promise<Browser> {
       // Loaded only here: its binary is Linux-only and useless on a dev PC.
       const { default: serverlessChromium } = await import("@sparticuz/chromium");
       serverlessChromium.setGraphicsMode = false; // no GPU in a function; skips unpacking SwiftShader
+      // Unpacked once and shared. The package treats the binary as unpacked
+      // as soon as its file exists, which is the moment unpacking starts, so
+      // two callers launching together would otherwise run a half-written file.
+      serverlessExecutable ??= serverlessChromium.executablePath().catch((err: unknown) => {
+        serverlessExecutable = null;
+        throw err;
+      });
       return await chromium.launch({
         args: serverlessChromium.args,
-        executablePath: await serverlessChromium.executablePath(),
+        executablePath: await serverlessExecutable,
         headless: true,
       });
     } catch (err) {
@@ -151,6 +161,100 @@ async function launchBrowser(): Promise<Browser> {
       `Install Chrome or set WEB_AGENT_BROWSER_PATH. ${lastError instanceof Error ? lastError.message.split("\n")[0] : ""}`,
     500,
   );
+}
+
+/**
+ * Whether each caller gets a browser of its own. The serverless Chromium runs
+ * in single-process mode (--single-process in @sparticuz/chromium's args), so
+ * all pages in one browser share one process and one page going down closes
+ * every page. When four callers shared one browser on Vercel, every lookup
+ * failed with "Target page, context or browser has been closed" for all four
+ * callers at once (2026-09-28). Installed Chrome and hosted browsers give each
+ * page its own process, so there the callers share one browser.
+ */
+function browserPerCaller(): boolean {
+  return isServerless() && !process.env.WEB_AGENT_BROWSER_WS_ENDPOINT?.trim();
+}
+
+/**
+ * How many callers this server searches at once, across every lookup in
+ * flight. On Vercel each running caller is a whole Chromium on a small
+ * instance (2 GB), and fluid compute can run several lookups on one instance,
+ * so the other callers wait their turn, likeliest caller first.
+ */
+const MAX_PARALLEL_CALLERS =
+  Number(process.env.WEB_AGENT_MAX_PARALLEL) || (isServerless() ? 2 : Number.POSITIVE_INFINITY);
+
+/** A counting lock: at most `size` holders at once, the rest wait in arrival order. */
+class Slots {
+  private free: number;
+  private readonly waiting: (() => void)[] = [];
+
+  constructor(size: number) {
+    this.free = size;
+  }
+
+  /** Resolves once a slot is free, with the function that gives it back. */
+  async acquire(): Promise<() => void> {
+    if (this.free > 0) this.free--;
+    else await new Promise<void>((resolve) => this.waiting.push(resolve));
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const next = this.waiting.shift();
+      if (next) next();
+      else this.free++;
+    };
+  }
+}
+
+const callerSlots = new Slots(MAX_PARALLEL_CALLERS);
+
+/**
+ * Skip what the searches never look at, to save memory on Vercel: images,
+ * fonts and media are dropped (the POD check reads the signature img's src
+ * attribute, not the picture), and Google Maps, which the login and Main
+ * pages load with a blocking script tag for address lookups, is swapped for
+ * a stand-in that accepts any call and does nothing.
+ */
+const LIGHT_PAGES = process.env.WEB_AGENT_LIGHT_PAGES
+  ? process.env.WEB_AGENT_LIGHT_PAGES === "true"
+  : isServerless();
+
+const GOOGLE_MAPS_STAND_IN = `(() => {
+  const stub = new Proxy(function () {}, {
+    get(_target, key) {
+      if (key === Symbol.toPrimitive || key === "toString" || key === "valueOf") return () => "";
+      if (key === "then") return undefined;
+      if (key === Symbol.iterator) return function* () {};
+      return stub;
+    },
+    set() { return true; },
+    apply() { return stub; },
+    construct() { return stub; },
+  });
+  window.google = window.google || {};
+  window.google.maps = stub;
+  const script = document.currentScript;
+  const callback = script && script.src ? new URL(script.src).searchParams.get("callback") : null;
+  if (callback && typeof window[callback] === "function") setTimeout(() => window[callback]());
+})();`;
+
+async function lightenPages(context: BrowserContext): Promise<void> {
+  await context.route("**/*", async (route) => {
+    try {
+      const request = route.request();
+      const type = request.resourceType();
+      if (type === "image" || type === "font" || type === "media") return await route.abort();
+      if (/^https:\/\/maps\.googleapis\.com\/maps\/api\/js(?:[?/]|$)/.test(request.url())) {
+        return await route.fulfill({ status: 200, contentType: "application/javascript", body: GOOGLE_MAPS_STAND_IN });
+      }
+      await route.continue();
+    } catch {
+      // The page or its browser closed mid-request; nothing left to answer.
+    }
+  });
 }
 
 // --- Portal pages ----------------------------------------------------------------
@@ -967,6 +1071,7 @@ async function searchCaller(
     if (!stop.value) steps.push({ caller: caller.label, action, detail });
   };
   const context = await browser.newContext({ viewport: { width: 1366, height: 900 } });
+  if (LIGHT_PAGES) await lightenPages(context);
   const page = await context.newPage();
   page.setDefaultTimeout(ACTION_TIMEOUT_MS);
 
@@ -1071,20 +1176,53 @@ export async function findOrderWithWebAgent(referenceNumber: string): Promise<We
   const plans = callers.map((c) => planSearches(memory, context, TRACK_BY_OPTIONS, MAX_SEARCHES, c.label, () => roll));
   steps.push({ caller: "planner", action: "plan", detail: describePlan(context, memory, ranked, plans) });
 
-  // Every caller searches at the same time. A hit is accepted once every
-  // caller ranked above it has answered, so the likeliest caller's hit comes
-  // back without waiting on the others.
+  // Callers start in ranked order, as many at once as this server allows
+  // (all of them locally, MAX_PARALLEL_CALLERS on Vercel). A hit is accepted
+  // once every caller ranked above it has answered, so the likeliest
+  // caller's hit comes back without waiting on the others, and a caller still
+  // waiting for its turn when a higher-ranked caller hits is never started.
   const outcomes: CallerAnswer[] = callers.map((c) => ({ caller: c.label, found: null, attempts: [] }));
   const errors: unknown[] = callers.map(() => null);
   let settled: CallerAnswer[] = outcomes;
-  const browser = await launchBrowser();
   const stop = { value: false };
+  const ownBrowsers = browserPerCaller();
+  const shared = ownBrowsers ? null : await launchBrowser();
+  const openBrowsers = new Set<Browser>();
+  let bestHitRank = Number.POSITIVE_INFINITY;
+
+  const runCaller = async (caller: NamedXceleratorCaller, rank: number): Promise<CallerHit | null | "skipped"> => {
+    const queuedAt = Date.now();
+    const release = await callerSlots.acquire();
+    let own: Browser | null = null;
+    try {
+      if (stop.value || rank > bestHitRank) return "skipped";
+      const waited = Date.now() - queuedAt;
+      if (waited > 500) steps.push({ caller: caller.label, action: "waited", detail: `${waited} ms for a free browser` });
+      if (ownBrowsers) {
+        own = await launchBrowser();
+        openBrowsers.add(own);
+        if (stop.value) return "skipped";
+      }
+      const hit = await searchCaller((own ?? shared)!, caller, referenceNumber, plans[rank].plan, steps, stop);
+      if (hit) bestHitRank = Math.min(bestHitRank, rank);
+      return hit;
+    } finally {
+      if (own) {
+        openBrowsers.delete(own);
+        await own.close().catch(() => {});
+      }
+      release();
+    }
+  };
+
   let result;
   try {
     result = await firstHitInPriorityOrder(
       callers.map((caller, i) =>
-        searchCaller(browser, caller, referenceNumber, plans[i].plan, steps, stop).then(
+        runCaller(caller, i).then(
           (hit) => {
+            // Never searched, because a higher-ranked caller already hit: not a miss.
+            if (hit === "skipped") return null;
             outcomes[i] = { caller: caller.label, found: hit !== null, attempts: hit?.attempts ?? [] };
             return hit;
           },
@@ -1101,7 +1239,8 @@ export async function findOrderWithWebAgent(referenceNumber: string): Promise<We
     settled = outcomes.map((o) => ({ ...o }));
   } finally {
     stop.value = true;
-    await browser.close().catch(() => {});
+    await Promise.all([...openBrowsers].map((b) => b.close().catch(() => {})));
+    await shared?.close().catch(() => {});
   }
 
   const failures = result.failures.map((f) => `${callers[f.index].label}: ${f.message.split("\n")[0]}`);
