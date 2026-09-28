@@ -1,25 +1,43 @@
 // Learning memory for the web agent: a small multi-armed bandit (the
 // simplest form of reinforcement learning) over Quick Track's "track by"
-// fields.
+// fields, plus a learned order for the callers.
 //
-// Each lookup is an episode. The "arms" are the track-by fields
-// (ClientRefNo, OrderTrackingID, ...). The context is the *shape* of the
-// reference number (e.g. "1088033" -> "9x7", "REF-1003" -> "Ax3-9x4",
-// "105.081826" -> "9x3.9x6"), since references with the same shape tend to
-// live in the same field. The reward is 1 when a field finds the order and
-// 0 when it was tried first and missed.
+// Each lookup is an episode. The context is the *type* of the reference
+// number, at two levels:
+//  - its shape, digits and letters only counted: "1088033" -> "9x7",
+//    "214210851W" -> "9x9Ax1", "105.081826" -> "9x3.9x6";
+//  - its taxonomy, which also keeps short letter codes, since those are what
+//    tell one numbering scheme from another: "214210851W" -> "9x9W",
+//    "212620423M" -> "9x9M", "3853523C" -> "9x7C", "PO-123456" -> "PO-9x6".
+//    Without it, every "9 digits plus one letter" reference looked alike,
+//    whoever it belonged to.
+//
+// Two things are learned per type:
+//  - which caller has references of this taxonomy (typeCallers). Callers are
+//    searched in parallel, but a hit is only accepted once every caller
+//    ranked above it has answered, and the top caller wins when several have
+//    the order. So the caller that usually has this type goes first. This
+//    is keyed by taxonomy alone: the letter code is what tells callers apart,
+//    so a find for "9x9M" says nothing about who has "9x9W". A code never
+//    seen before falls back to each caller's overall record.
+//  - which track-by field each caller keeps it in (callerFields, with the
+//    all-callers stats in shapes/global as the fallback). The "arms" are the
+//    fields (ClientRefNo, OrderTrackingID, ...); the reward is 1 when a field
+//    finds the order and 0 when it was tried first and missed.
 //
 // Credit assignment: stats are only updated when some caller actually found
 // the order. If nobody finds it, it may simply not exist, so the misses tell
-// us nothing about which field would have been right, and nothing is learned.
+// us nothing, and nothing is learned. A caller that was stopped before it
+// finished (because a higher-ranked caller already won) counts as unknown,
+// not as a miss; otherwise the top caller would keep "winning" every type.
 //
 // Policy: UCB1 (upper confidence bound). Each field's score is its observed
-// hit rate for this shape (blended with a hand-set prior and the all-shapes
-// rate) plus an exploration bonus that shrinks as the field gets tried. So
-// fields that keep finding orders move to the front. Each lookup searches
-// only the top few fields; the last slot sometimes explores a lower-ranked
-// field instead, more often after a run of lookups that found nothing (see
-// planSearches).
+// hit rate for this caller and type, backed off to the type, the shape and
+// all references in turn (see blendRate), plus an exploration bonus that
+// shrinks as the field gets tried. So fields that keep finding orders move
+// to the front. Each lookup searches only the top few fields; the last slot
+// sometimes explores a lower-ranked field instead, more often after a run of
+// lookups that found nothing (see planSearches).
 //
 // Persistence, first match wins:
 //  - Upstash Redis over its REST API, when UPSTASH_REDIS_REST_URL/_TOKEN (or
@@ -42,6 +60,8 @@ export type Arm = { tries: number; hits: number; totalMs: number };
 export type Episode = {
   at: string;
   shape: string;
+  /** Missing on episodes recorded before taxonomies existed. */
+  taxonomy?: string;
   caller: string;
   trackBy: string;
   hit: boolean;
@@ -50,16 +70,24 @@ export type Episode = {
 
 export type WebAgentMemory = {
   version: 1;
-  /** shape -> trackBy -> stats */
+  /** reference type (shape or taxonomy) -> trackBy -> stats, all callers together */
   shapes: Record<string, Record<string, Arm>>;
-  /** trackBy -> stats across every shape */
+  /** trackBy -> stats across every reference type */
   global: Record<string, Arm>;
-  /** caller label -> how often the order turned up under that caller */
+  /**
+   * caller label -> how often that caller had the order, across every type.
+   * Counts from before taxonomies existed also scored callers that were only
+   * cut off as misses, so they lean toward whichever caller was listed first.
+   */
   callers: Record<string, Arm>;
+  /** taxonomy -> caller label -> how often that caller had the order */
+  typeCallers?: Record<string, Record<string, Arm>>;
+  /** caller label -> taxonomy -> trackBy -> stats: where that caller keeps this type of reference */
+  callerFields?: Record<string, Record<string, Record<string, Arm>>>;
   /** Most recent searches, newest last, capped. */
   episodes: Episode[];
   /**
-   * Per shape: how many lookups in a row found nothing, and how often each
+   * Per taxonomy: how many lookups in a row found nothing, and how often each
    * field has been used as the exploration pick. Drives the exploration slot.
    */
   exploration?: Record<string, { streak: number; tried: Record<string, number> }>;
@@ -67,7 +95,11 @@ export type WebAgentMemory = {
 
 const MAX_EPISODES = 500;
 const PRIOR_WEIGHT = 2; // pseudo-tries the prior is worth
-const GLOBAL_WEIGHT = 3; // max pseudo-tries borrowed from the all-shapes stats
+// Max pseudo-tries a broader type lends to a narrower one: one find in a
+// different field doesn't overturn what similar references taught, two do.
+const PARENT_WEIGHT = 2;
+/** Starting belief that a caller has a reference of a type it has never been seen with. */
+const CALLER_PRIOR = 0.5;
 const EXPLORATION = Number(process.env.WEB_AGENT_EXPLORATION) || 0.35;
 
 function memoryFile(): string {
@@ -75,7 +107,7 @@ function memoryFile(): string {
 }
 
 function emptyMemory(): WebAgentMemory {
-  return { version: 1, shapes: {}, global: {}, callers: {}, episodes: [] };
+  return { version: 1, shapes: {}, global: {}, callers: {}, typeCallers: {}, callerFields: {}, episodes: [] };
 }
 
 // --- Storage backends ------------------------------------------------------------
@@ -207,23 +239,73 @@ function persist(memory: WebAgentMemory): Promise<void> {
   return writeChain;
 }
 
-/** "1088033" -> "9x7", "REF-1003" -> "Ax3-9x4", "105.081826" -> "9x3.9x6". */
-export function referenceShape(ref: string): string {
-  const classes = ref
-    .trim()
-    .toUpperCase()
-    .split("")
-    .map((ch) => (/[0-9]/.test(ch) ? "9" : /[A-Z]/.test(ch) ? "A" : ch));
-  let out = "";
-  for (let i = 0; i < classes.length; ) {
+// --- Reference types -------------------------------------------------------------
+
+function charClass(ch: string): string {
+  return /[0-9]/.test(ch) ? "9" : /[A-Z]/.test(ch) ? "A" : ch;
+}
+
+/** Splits an upper-cased reference into runs of the same character class. */
+function runs(ref: string): { cls: string; text: string }[] {
+  const s = ref.trim().toUpperCase();
+  const out: { cls: string; text: string }[] = [];
+  for (let i = 0; i < s.length; ) {
+    const cls = charClass(s[i]);
     let j = i;
-    while (j < classes.length && classes[j] === classes[i]) j++;
-    const run = j - i;
-    out += /[9A]/.test(classes[i]) ? `${classes[i]}x${run}` : classes[i].repeat(run);
+    while (j < s.length && charClass(s[j]) === cls) j++;
+    out.push({ cls, text: s.slice(i, j) });
     i = j;
   }
+  return out;
+}
+
+/** "1088033" -> "9x7", "REF-1003" -> "Ax3-9x4", "105.081826" -> "9x3.9x6". */
+export function referenceShape(ref: string): string {
+  const out = runs(ref)
+    .map((r) => (r.cls === "9" || r.cls === "A" ? `${r.cls}x${r.text.length}` : r.text))
+    .join("");
   return out || "empty";
 }
+
+/** Letter runs up to this long are kept as literal codes in the taxonomy. */
+const MAX_CODE_LETTERS = 4;
+
+/**
+ * The reference's shape with its short letter codes kept, since those are
+ * what tell numbering schemes (and so callers) apart: "214210851W" ->
+ * "9x9W", "212620423M" -> "9x9M", "3853523C" -> "9x7C", "PO-123456" ->
+ * "PO-9x6". Longer letter runs stay generic ("Ax7"), since they are more
+ * likely words than codes. With no short code it equals the shape.
+ *
+ * Taxonomy keys never collide with a different shape key: a shape only ever
+ * has an "A" when it is followed by a lower-case "x", and a literal code in a
+ * taxonomy never is.
+ */
+export function referenceTaxonomy(ref: string): string {
+  const out = runs(ref)
+    .map((r) => {
+      if (r.cls === "9") return `9x${r.text.length}`;
+      if (r.cls === "A") return r.text.length <= MAX_CODE_LETTERS ? r.text : `Ax${r.text.length}`;
+      return r.text;
+    })
+    .join("");
+  return out || "empty";
+}
+
+export type ReferenceContext = {
+  shape: string;
+  taxonomy: string;
+  /** The types this reference is learned under, broadest first, without repeats. */
+  keys: string[];
+};
+
+export function referenceContext(ref: string): ReferenceContext {
+  const shape = referenceShape(ref);
+  const taxonomy = referenceTaxonomy(ref);
+  return { shape, taxonomy, keys: taxonomy === shape ? [shape] : [shape, taxonomy] };
+}
+
+// --- Ranking ---------------------------------------------------------------------
 
 /** Hand-set starting belief, before any lookups have been observed. */
 function priorRate(trackBy: string, shape: string): number {
@@ -233,23 +315,60 @@ function priorRate(trackBy: string, shape: string): number {
   return 0.1;
 }
 
+/**
+ * Hit rate for the narrowest level of `chain`. The chain runs broadest to
+ * narrowest (e.g. every reference, the shape, the taxonomy, one caller's
+ * taxonomy) and each level's counts include the next one's. Starting from
+ * the prior, each level's own data (minus the next level's, so nothing is
+ * counted twice) pulls the estimate toward what it saw. A broader level
+ * lends at most PARENT_WEIGHT pseudo-tries to the next, so a handful of
+ * finds for this exact kind of reference outweighs hundreds for other kinds,
+ * while a kind never seen before still starts from what similar ones taught.
+ */
+function blendRate(prior: number, chain: (Arm | undefined)[]): number {
+  let rate = prior;
+  let weight = PRIOR_WEIGHT;
+  for (let i = 0; i < chain.length; i++) {
+    const own = chain[i];
+    const inner = chain[i + 1];
+    const tries = Math.max(0, (own?.tries ?? 0) - (inner?.tries ?? 0));
+    if (tries === 0) continue;
+    const hits = Math.min(tries, Math.max(0, (own?.hits ?? 0) - (inner?.hits ?? 0)));
+    const lent = Math.min(weight, PARENT_WEIGHT);
+    rate = (hits + rate * lent) / (tries + lent);
+    weight = tries + lent;
+  }
+  return rate;
+}
+
 export type RankedArm = { trackBy: string; score: number; rate: number; tries: number; hits: number };
 
-/** Orders the track-by fields best-first for this reference shape (UCB1). */
-export function rankTrackBy(memory: WebAgentMemory, shape: string, options: readonly string[]): RankedArm[] {
-  const shapeArms = memory.shapes[shape] ?? {};
-  const totalTries = Object.values(shapeArms).reduce((sum, a) => sum + a.tries, 0);
+/**
+ * Orders the track-by fields best-first for this reference type (UCB1).
+ * With a caller, uses where that caller keeps this type first and falls back
+ * to all callers; `tries`/`hits` are then that caller's own counts.
+ */
+export function rankTrackBy(
+  memory: WebAgentMemory,
+  context: ReferenceContext,
+  options: readonly string[],
+  caller?: string,
+): RankedArm[] {
+  const levels: Record<string, Arm>[] = [
+    memory.global,
+    ...context.keys.map((key) => memory.shapes[key] ?? {}),
+    ...(caller ? [memory.callerFields?.[caller]?.[context.taxonomy] ?? {}] : []),
+  ];
+  const narrowest = levels[levels.length - 1];
+  const totalTries = Object.values(narrowest).reduce((sum, a) => sum + a.tries, 0);
 
   return options
     .map((trackBy, order) => {
-      const arm = shapeArms[trackBy] ?? { tries: 0, hits: 0, totalMs: 0 };
-      const g = memory.global[trackBy];
-      const gWeight = g ? Math.min(g.tries, GLOBAL_WEIGHT) : 0;
-      const gRate = g && g.tries > 0 ? g.hits / g.tries : 0;
-      const prior = priorRate(trackBy, shape);
-
-      const rate =
-        (arm.hits + prior * PRIOR_WEIGHT + gRate * gWeight) / (arm.tries + PRIOR_WEIGHT + gWeight);
+      const arm = narrowest[trackBy] ?? { tries: 0, hits: 0, totalMs: 0 };
+      const rate = blendRate(
+        priorRate(trackBy, context.shape),
+        levels.map((level) => level[trackBy]),
+      );
       const bonus = EXPLORATION * Math.sqrt(Math.log(totalTries + 2) / (arm.tries + 1));
       // Tiny tie-breaker keeps the portal's own order when scores are equal.
       return { trackBy, score: rate + bonus - order * 1e-6, rate, tries: arm.tries, hits: arm.hits };
@@ -257,35 +376,70 @@ export function rankTrackBy(memory: WebAgentMemory, shape: string, options: read
     .sort((a, b) => b.score - a.score);
 }
 
+export type RankedCaller = {
+  caller: string;
+  /** Position in the configured caller list. */
+  index: number;
+  /** Estimated chance this caller has a reference of this type. */
+  rate: number;
+  /** How often this caller was checked for / had this exact taxonomy. */
+  tries: number;
+  hits: number;
+};
+
+/**
+ * Orders the callers by how likely each is to have this type of reference,
+ * from which callers had its taxonomy before, else each caller's overall
+ * record. Callers with nothing to tell them apart keep the configured list
+ * order, so list order is only ever a tie-break.
+ */
+export function rankCallers(
+  memory: WebAgentMemory,
+  context: ReferenceContext,
+  callers: readonly string[],
+): RankedCaller[] {
+  return callers
+    .map((caller, index) => {
+      const chain = [memory.callers[caller], memory.typeCallers?.[context.taxonomy]?.[caller]];
+      const own = chain[chain.length - 1];
+      return { caller, index, rate: blendRate(CALLER_PRIOR, chain), tries: own?.tries ?? 0, hits: own?.hits ?? 0 };
+    })
+    .sort((a, b) => b.rate - a.rate || a.index - b.index);
+}
+
 const EXPLORE_RATE = Number(process.env.WEB_AGENT_EXPLORE_RATE ?? 0.2);
-/** Extra exploration chance added per consecutive not-found lookup for a shape. */
+/** Extra exploration chance added per consecutive not-found lookup for a type. */
 const STREAK_BOOST = 0.25;
 
 /**
- * The fields to actually search, best-first, capped at `k`. The first k-1
- * are the top-ranked fields. The last slot is usually the next-ranked one,
- * but sometimes it explores a field from outside the top instead. Without
- * that slot, an order living in a low-ranked field would never be found, and
- * since only finds are learned from, the ranking could never fix itself.
+ * The fields one caller should actually search, best-first, capped at `k`.
+ * The first k-1 are the top-ranked fields. The last slot is usually the
+ * next-ranked one, but sometimes it explores a field from outside the top
+ * instead. Without that slot, an order living in a low-ranked field would
+ * never be found, and since only finds are learned from, the ranking could
+ * never fix itself.
  *
  * The exploration chance starts at EXPLORE_RATE and grows with every lookup
- * in a row that found nothing for this shape (a hint the ranking is wrong).
- * The explored field is the least-explored one so far, so repeated misses
- * cycle through every field instead of re-picking at random. Exploring never
- * adds searches: it only changes which field fills the last slot.
+ * in a row that found nothing for this taxonomy (a hint the ranking is
+ * wrong). The explored field is the least-explored one so far, so repeated
+ * misses cycle through every field instead of re-picking at random.
+ * Exploring never adds searches: it only changes which field fills the last
+ * slot. Pass the same `random` to every caller of one lookup so they all
+ * explore on the same lookups.
  */
 export function planSearches(
   memory: WebAgentMemory,
-  shape: string,
+  context: ReferenceContext,
   options: readonly string[],
   k: number,
+  caller?: string,
   random: () => number = Math.random,
 ): { plan: string[]; explored: string | null } {
-  const ranked = rankTrackBy(memory, shape, options).map((r) => r.trackBy);
+  const ranked = rankTrackBy(memory, context, options, caller).map((r) => r.trackBy);
   if (k >= ranked.length) return { plan: ranked, explored: null };
   const plan = ranked.slice(0, k - 1);
   const rest = ranked.slice(k - 1);
-  const state = memory.exploration?.[shape];
+  const state = memory.exploration?.[context.taxonomy];
   const chance = Math.min(1, EXPLORE_RATE + STREAK_BOOST * (state?.streak ?? 0));
 
   if (rest.length > 1 && random() < chance) {
@@ -298,6 +452,8 @@ export function planSearches(
   return { plan: [...plan, rest[0]], explored: null };
 }
 
+// --- Recording -------------------------------------------------------------------
+
 function bump(arm: Arm | undefined, hit: boolean, ms: number): Arm {
   const next = arm ?? { tries: 0, hits: 0, totalMs: 0 };
   return { tries: next.tries + 1, hits: next.hits + (hit ? 1 : 0), totalMs: next.totalMs + ms };
@@ -305,41 +461,63 @@ function bump(arm: Arm | undefined, hit: boolean, ms: number): Arm {
 
 export type SearchAttempt = { trackBy: string; hit: boolean; ms: number };
 
+export type CallerOutcome = {
+  caller: string;
+  /**
+   * true: this caller had the order. false: it finished its searches without
+   * finding it. null: unknown, because it failed or was stopped early once a
+   * higher-ranked caller had already won.
+   */
+  found: boolean | null;
+  /** Every search it made, in order (misses first, the hit last). Only needed when found. */
+  attempts: SearchAttempt[];
+};
+
 /**
- * Records one finished lookup. `winner` is the caller whose searches found
- * the order, with every search it made in order (misses first, the hit
- * last). Pass null when no caller found it: the episode is logged, but no
- * field is rewarded or penalized.
+ * Records one finished lookup. `outcomes` is what each caller had answered
+ * by the time the winner was settled. When nobody found the order, the
+ * episode is logged but nothing is rewarded or penalized.
  */
 export async function recordEpisode(params: {
-  shape: string;
-  winner: { caller: string; attempts: SearchAttempt[] } | null;
-  searchedCallers: string[];
-  /** The field planSearches picked for its exploration slot, if any. */
-  explored?: string | null;
+  context: ReferenceContext;
+  /** Label of the caller whose result was used, or null when nobody found the order. */
+  winner: string | null;
+  outcomes: CallerOutcome[];
+  /** Fields planSearches picked for exploration slots in this lookup. */
+  explored?: string[];
 }): Promise<void> {
   const memory = await loadMemory();
   const at = new Date().toISOString();
+  const { shape, taxonomy, keys } = params.context;
 
   const exploration = (memory.exploration ??= {});
-  const state = (exploration[params.shape] ??= { streak: 0, tried: {} });
-  if (params.explored) state.tried[params.explored] = (state.tried[params.explored] ?? 0) + 1;
+  const state = (exploration[taxonomy] ??= { streak: 0, tried: {} });
+  for (const field of new Set(params.explored ?? [])) state.tried[field] = (state.tried[field] ?? 0) + 1;
   state.streak = params.winner ? 0 : state.streak + 1;
 
   if (params.winner) {
-    const arms = (memory.shapes[params.shape] ??= {});
-    for (const attempt of params.winner.attempts) {
-      arms[attempt.trackBy] = bump(arms[attempt.trackBy], attempt.hit, attempt.ms);
-      memory.global[attempt.trackBy] = bump(memory.global[attempt.trackBy], attempt.hit, attempt.ms);
-      memory.episodes.push({ at, shape: params.shape, caller: params.winner.caller, ...attempt });
+    const typeCallers = (memory.typeCallers ??= {});
+    const callerFields = (memory.callerFields ??= {});
+    for (const outcome of params.outcomes) {
+      if (outcome.found === null) continue; // stopped early or failed: unknown, not a miss
+      memory.callers[outcome.caller] = bump(memory.callers[outcome.caller], outcome.found, 0);
+      const row = (typeCallers[taxonomy] ??= {});
+      row[outcome.caller] = bump(row[outcome.caller], outcome.found, 0);
+      // Only a caller that had the order says anything about which field it is in.
+      if (!outcome.found) continue;
+      const own = ((callerFields[outcome.caller] ??= {})[taxonomy] ??= {});
+      for (const attempt of outcome.attempts) {
+        memory.global[attempt.trackBy] = bump(memory.global[attempt.trackBy], attempt.hit, attempt.ms);
+        for (const key of keys) {
+          const arms = (memory.shapes[key] ??= {});
+          arms[attempt.trackBy] = bump(arms[attempt.trackBy], attempt.hit, attempt.ms);
+        }
+        own[attempt.trackBy] = bump(own[attempt.trackBy], attempt.hit, attempt.ms);
+        memory.episodes.push({ at, shape, taxonomy, caller: outcome.caller, ...attempt });
+      }
     }
   } else {
-    memory.episodes.push({ at, shape: params.shape, caller: "(none)", trackBy: "-", hit: false, ms: 0 });
-  }
-
-  for (const caller of params.searchedCallers) {
-    const hit = params.winner?.caller === caller;
-    memory.callers[caller] = bump(memory.callers[caller], hit, 0);
+    memory.episodes.push({ at, shape, taxonomy, caller: "(none)", trackBy: "-", hit: false, ms: 0 });
   }
 
   if (memory.episodes.length > MAX_EPISODES) {

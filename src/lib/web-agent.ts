@@ -2,13 +2,15 @@
 // through the Xcelerator ClientPortal UI, instead of calling the Axis REST
 // API or the ClientPortal's JSON endpoints (see xcelerator.ts for those).
 //
-// Learning: which Quick Track field to search first is learned from past
-// lookups (see web-agent-memory.ts, a multi-armed bandit keyed by the
-// reference number's shape). Searches run in code; the model is only used
-// to read the order off the screen once a search hits.
+// Learning: which caller is likely to have the order, and which Quick Track
+// field each caller keeps it in, are learned from past lookups by the type
+// of reference number (see web-agent-memory.ts, a multi-armed bandit).
+// Searches run in code; the model is only used to read the order off the
+// screen once a search hits.
 //
 // Flow per caller (XCELERATOR_CALLER_N_*, same list the API path uses; all
-// callers run in parallel and the earliest caller in the list wins ties):
+// callers run in parallel, and when several have the order, the caller
+// ranked first for this type of reference wins):
 //  1. Launch headless Chromium (playwright-core): the installed Chrome/Edge
 //     locally, a bundled serverless Chromium on Vercel, or a hosted browser
 //     (see launchBrowser).
@@ -32,7 +34,18 @@ import { chatCompletion, isOpenAIConfigured, type ToolDefinition } from "./opena
 import { xceleratorCallersFromEnv, type NamedXceleratorCaller } from "./xcelerator-portal";
 import type { OrderInquiry, OrderStatus } from "./xcelerator";
 import { firstHitInPriorityOrder } from "./ordered-first-match";
-import { loadMemory, planSearches, recordEpisode, referenceShape, type SearchAttempt } from "./web-agent-memory";
+import {
+  loadMemory,
+  planSearches,
+  rankCallers,
+  recordEpisode,
+  referenceContext,
+  type CallerOutcome as CallerAnswer,
+  type RankedCaller,
+  type ReferenceContext,
+  type SearchAttempt,
+  type WebAgentMemory,
+} from "./web-agent-memory";
 
 export type WebAgentStep = {
   caller: string;
@@ -71,6 +84,8 @@ const MAX_ELEMENTS = 90;
 const MAX_TEXT_CHARS = 7000;
 const ACTION_TIMEOUT_MS = 10_000;
 const NAV_TIMEOUT_MS = 30_000;
+/** Tries per portal page load; a stalled load usually goes through on the next try. */
+const NAV_ATTEMPTS = 2;
 
 // --- Browser -----------------------------------------------------------------
 
@@ -138,11 +153,38 @@ async function launchBrowser(): Promise<Browser> {
   );
 }
 
+// --- Portal pages ----------------------------------------------------------------
+
+/** A portal page that would not load, as opposed to a problem with one caller. */
+class PortalTimeoutError extends Error {
+  constructor(what: string) {
+    super(`the portal's ${what} did not load within ${NAV_TIMEOUT_MS / 1000} s (tried ${NAV_ATTEMPTS} times)`);
+    this.name = "PortalTimeoutError";
+  }
+}
+
+/**
+ * Opens a portal page, trying again when a load stalls. Each load waits for
+ * the page's own scripts, which is what the login and Quick Track steps need.
+ */
+async function openPortalPage(page: Page, url: string, what: string): Promise<void> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
+      return;
+    } catch (err) {
+      const timedOut = err instanceof Error && err.name === "TimeoutError";
+      if (!timedOut) throw err;
+      if (attempt >= NAV_ATTEMPTS) throw new PortalTimeoutError(what);
+    }
+  }
+}
+
 async function loginViaUi(page: Page, caller: NamedXceleratorCaller): Promise<void> {
   const { portalBaseUrl, username, password } = caller.cfg;
   if (!username || !password) throw new Error(`Caller ${caller.label} has no credentials.`);
 
-  await page.goto(`${portalBaseUrl}/ClientPortal`, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
+  await openPortalPage(page, `${portalBaseUrl}/ClientPortal`, "login page");
   await page.fill('input[name="loginModel.UserName"]', username);
   await page.fill('input[name="loginModel.Password"]', password);
   await Promise.all([
@@ -192,12 +234,7 @@ async function quickTrack(
   value: string,
   onFreshMain: boolean,
 ): Promise<{ found: boolean }> {
-  if (!onFreshMain) {
-    await page.goto(`${portalBaseUrl}/ClientPortal/ClientPortal/Main`, {
-      waitUntil: "domcontentloaded",
-      timeout: NAV_TIMEOUT_MS,
-    });
-  }
+  if (!onFreshMain) await openPortalPage(page, `${portalBaseUrl}/ClientPortal/ClientPortal/Main`, "main page");
   const search = page.locator("#_quickTrackModel__Search");
   await page.locator("text=Quick Track >> visible=true").first().click();
   await search.waitFor({ state: "visible" });
@@ -992,36 +1029,76 @@ export function isWebAgentConfigured(): boolean {
   return xceleratorCallersFromEnv().length > 0;
 }
 
+/** One line for the steps list saying what the learning decided for this lookup. */
+function describePlan(
+  context: ReferenceContext,
+  memory: WebAgentMemory,
+  ranked: RankedCaller[],
+  plans: { plan: string[]; explored: string | null }[],
+): string {
+  const type = context.taxonomy === context.shape ? context.shape : `${context.taxonomy} (shape ${context.shape})`;
+  const order = ranked.map((r) => (r.tries ? `${r.caller} (had it ${r.hits} of ${r.tries})` : r.caller)).join(", ");
+  const fields = plans.map((p) => p.plan.join(", "));
+  const searching = fields.every((f) => f === fields[0])
+    ? fields[0]
+    : ranked.map((r, i) => `${r.caller}: ${fields[i]}`).join("; ");
+  const explored = [...new Set(plans.flatMap((p) => (p.explored ? [p.explored] : [])))];
+  const finds = Object.values(memory.typeCallers?.[context.taxonomy] ?? {}).reduce((sum, a) => sum + a.hits, 0);
+  return (
+    `Reference type ${type}. Caller order: ${order}. Searching ${searching}` +
+    (explored.length ? ` (exploring ${explored.join(", ")})` : "") +
+    (finds
+      ? `. Learned from ${finds} past ${finds === 1 ? "find" : "finds"} of this type.`
+      : ". No finds of this type yet, so using similar references.")
+  );
+}
+
 export async function findOrderWithWebAgent(referenceNumber: string): Promise<WebAgentResult> {
   const steps: WebAgentStep[] = [];
-  const callers = xceleratorCallersFromEnv();
-  if (callers.length === 0) {
+  const configured = xceleratorCallersFromEnv();
+  if (configured.length === 0) {
     throw new WebAgentError("No Xcelerator caller is configured. Set XCELERATOR_CALLER_1_USERNAME and _PASSWORD.", 503);
   }
 
-  // Learned plan: which track-by fields to try, best-first, for this shape.
-  const shape = referenceShape(referenceNumber);
+  // Learned plan. The reference's type (its shape plus any short letter code,
+  // like the M in 212620423M) decides which caller most likely has it, so that
+  // caller goes first, and each caller gets its own field order for that type.
+  const context = referenceContext(referenceNumber);
   const memory = await loadMemory();
-  const { plan, explored } = planSearches(memory, shape, TRACK_BY_OPTIONS, MAX_SEARCHES);
-  const learnedFrom = Object.values(memory.shapes[shape] ?? {}).reduce((sum, a) => sum + a.hits, 0);
-  steps.push({
-    caller: "planner",
-    action: "plan",
-    detail:
-      `Reference shape ${shape}: trying ${plan.join(", ")}` +
-      (explored ? ` (exploring ${explored})` : "") +
-      (learnedFrom ? ` (learned from ${learnedFrom} past finds)` : " (no finds for this shape yet, using defaults)"),
-  });
+  const ranked = rankCallers(memory, context, configured.map((c) => c.label));
+  const callers = ranked.map((r) => configured[r.index]);
+  const roll = Math.random(); // one exploration draw per lookup, shared by every caller
+  const plans = callers.map((c) => planSearches(memory, context, TRACK_BY_OPTIONS, MAX_SEARCHES, c.label, () => roll));
+  steps.push({ caller: "planner", action: "plan", detail: describePlan(context, memory, ranked, plans) });
 
-  // Every caller searches at the same time; if more than one finds it, the
-  // earlier caller in the list wins, same rule as the API lookup.
+  // Every caller searches at the same time. A hit is accepted once every
+  // caller ranked above it has answered, so the likeliest caller's hit comes
+  // back without waiting on the others.
+  const outcomes: CallerAnswer[] = callers.map((c) => ({ caller: c.label, found: null, attempts: [] }));
+  const errors: unknown[] = callers.map(() => null);
+  let settled: CallerAnswer[] = outcomes;
   const browser = await launchBrowser();
   const stop = { value: false };
   let result;
   try {
     result = await firstHitInPriorityOrder(
-      callers.map((caller) => searchCaller(browser, caller, referenceNumber, plan, steps, stop)),
+      callers.map((caller, i) =>
+        searchCaller(browser, caller, referenceNumber, plans[i].plan, steps, stop).then(
+          (hit) => {
+            outcomes[i] = { caller: caller.label, found: hit !== null, attempts: hit?.attempts ?? [] };
+            return hit;
+          },
+          (err: unknown) => {
+            errors[i] = err;
+            throw err;
+          },
+        ),
+      ),
     );
+    // Copy what each caller had answered before the others are stopped: a
+    // caller cut off after this point returns "nothing" without having
+    // finished, which is not a real miss.
+    settled = outcomes.map((o) => ({ ...o }));
   } finally {
     stop.value = true;
     await browser.close().catch(() => {});
@@ -1031,12 +1108,10 @@ export async function findOrderWithWebAgent(referenceNumber: string): Promise<We
   const winner = result.winner ? { caller: callers[result.winner.index].label, hit: result.winner.hit } : null;
 
   await recordEpisode({
-    shape,
-    winner: winner ? { caller: winner.caller, attempts: winner.hit.attempts } : null,
-    explored,
-    searchedCallers: callers
-      .map((c) => c.label)
-      .filter((label) => !failures.some((f) => f.startsWith(`${label}:`))),
+    context,
+    winner: winner?.caller ?? null,
+    outcomes: settled,
+    explored: plans.flatMap((p) => (p.explored ? [p.explored] : [])),
   });
 
   if (winner) {
@@ -1049,6 +1124,15 @@ export async function findOrderWithWebAgent(referenceNumber: string): Promise<We
     };
   }
   if (failures.length === callers.length) {
+    if (errors.every((e) => e instanceof PortalTimeoutError)) {
+      throw new WebAgentError(
+        `The Xcelerator portal did not respond: its pages did not load within ${NAV_TIMEOUT_MS / 1000} seconds ` +
+          `for any caller, even after a retry. The portal may be slow right now, or this computer may be short ` +
+          `on memory. Try again in a minute.`,
+        504,
+        steps,
+      );
+    }
     throw new WebAgentError(`The web agent could not search any caller. ${failures.join("; ")}`, 502, steps);
   }
   return {
