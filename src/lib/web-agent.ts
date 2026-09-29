@@ -305,11 +305,11 @@ async function loginViaUi(page: Page, caller: NamedXceleratorCaller): Promise<vo
 // --- Quick Track ---------------------------------------------------------------
 
 // "Track by" options exactly as the portal's Quick Track dropdown labels them.
+// ClientRefNo2 and ClientRefNo3 are left out on purpose: Skyline doesn't
+// normally use them, so searching them only slows lookups down.
 export const TRACK_BY_OPTIONS = [
   "ClientRefNo",
   "OrderTrackingID",
-  "ClientRefNo2",
-  "ClientRefNo3",
   "ClientRefNo4",
   "PackageRefNo",
   "PackageRefNo2",
