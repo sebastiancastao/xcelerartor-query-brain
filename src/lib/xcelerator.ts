@@ -631,7 +631,7 @@ type PortalOrderLookupField = (typeof ORDER_LOOKUP_FIELDS)[number];
 // them. A large block of AutoNotify_*/*_On*/SMS_*/Push_* notification-
 // preference booleans also comes back on every row and is deliberately
 // left untyped here — irrelevant to order status or shipment content.
-type PortalOrderListRow = {
+export type PortalOrderListRow = {
   OrderTrackingID: number | string | null;
   Status: number | null;
   OrderType: string | null;
@@ -965,7 +965,7 @@ function buildOrderInquiryFromPortal(n: NormalizedPortalOrder): OrderInquiry {
 // comment above). Only itemized per-charge detail is reliably absent here
 // in practice (ChargeDetailItems came back null on all 58 real orders
 // checked against this deployment).
-function mapPortalOrderListRowToInquiryFallback(row: PortalOrderListRow): OrderInquiry {
+export function mapPortalOrderListRowToInquiryFallback(row: PortalOrderListRow): OrderInquiry {
   const trackingId = formatOrderTrackingId(row.OrderTrackingID);
 
   return buildOrderInquiryFromPortal({

@@ -10,18 +10,31 @@
 //
 // Flow per caller (XCELERATOR_CALLER_N_*, same list the API path uses;
 // callers run in parallel, a few at a time on Vercel, and when several have
-// the order, the caller ranked first for this type of reference wins):
+// the order, the caller ranked first for this type of reference wins; a
+// reference found before goes straight to the caller that had it):
 //  1. Launch headless Chromium (playwright-core): the installed Chrome/Edge
 //     locally, a bundled serverless Chromium on Vercel, or a hosted browser
 //     (see launchBrowser).
-//  2. Log in through the real login form. This step is deterministic code,
-//     never the model, so credentials never reach OpenAI.
-//  3. Hand the page to an OpenAI tool-calling loop. Each step the model sees
-//     a compact snapshot (URL, numbered clickable/typeable elements, visible
-//     text) and picks one action: quick_track, click, click_text, type, select_option,
-//     wait, report_order or give_up. Navigation is fenced to the portal's own origin.
-//  4. report_order's arguments are mapped into the same OrderInquiry shape the
-//     main page renders.
+//  2. Open the portal's Main page with a session this server already logged
+//     in with, or log in through the real login form when there is none or
+//     it expired. Logging in is deterministic code, never the model, so
+//     credentials never reach OpenAI.
+//  3. Search the portal's order list (the Tracking page's search, with "All
+//     Accounts") for the reference. A login can see several accounts (Seb2
+//     sees seven), but Quick Track only searches the one currently selected,
+//     so this is what finds, e.g., DHL Same Day orders under Seb2. On a hit,
+//     open the order window the way clicking the order in that list does
+//     (openOrderProperties with the row's key) and read it with code.
+//  4. When the list has nothing, fall back to the learned Quick Track plan
+//     for the other fields (ClientRefNo4, package refs), resetting the Quick
+//     Track window between searches instead of reloading the page.
+//  5. Only if a hit can't be read that way, hand the page to an OpenAI
+//     tool-calling loop. Each step the model sees a compact snapshot (URL,
+//     numbered clickable/typeable elements, visible text) and picks one
+//     action: quick_track, click, click_text, type, select_option, wait,
+//     report_order or give_up. Navigation is fenced to the portal's own
+//     origin. report_order's arguments are mapped into the same OrderInquiry
+//     shape the main page renders.
 //
 // Token choices: only the latest snapshot is ever sent (older ones are
 // replaced by a one-line action log), visible text is capped, and the
@@ -29,10 +42,16 @@
 //
 // Server-only: reads credentials from the environment and launches a browser.
 
+import os from "node:os";
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright-core";
 import { chatCompletion, isOpenAIConfigured, type ToolDefinition } from "./openai";
 import { xceleratorCallersFromEnv, type NamedXceleratorCaller } from "./xcelerator-portal";
-import type { OrderInquiry, OrderStatus } from "./xcelerator";
+import {
+  mapPortalOrderListRowToInquiryFallback,
+  type OrderInquiry,
+  type OrderStatus,
+  type PortalOrderListRow,
+} from "./xcelerator";
 import { firstHitInPriorityOrder } from "./ordered-first-match";
 import {
   loadMemory,
@@ -40,7 +59,9 @@ import {
   rankCallers,
   recordEpisode,
   referenceContext,
+  rememberedPlace,
   type CallerOutcome as CallerAnswer,
+  type Place,
   type RankedCaller,
   type ReferenceContext,
   type SearchAttempt,
@@ -56,6 +77,8 @@ export type WebAgentStep = {
 export type WebAgentResult = {
   order: OrderInquiry | null;
   foundViaCaller: string | null;
+  /** The Xcelerator account the order is in (e.g. "DHLIN"), when the order list said so. */
+  account: string | null;
   /** Xcelerator's own id for the order (e.g. "11.092426"), when found. */
   orderTrackingId: string | null;
   steps: WebAgentStep[];
@@ -176,14 +199,22 @@ function browserPerCaller(): boolean {
   return isServerless() && !process.env.WEB_AGENT_BROWSER_WS_ENDPOINT?.trim();
 }
 
+/** Memory this function instance has, in MB (Vercel runs on AWS Lambda, which says so directly). */
+function instanceMemoryMb(): number {
+  return Number(process.env.AWS_LAMBDA_FUNCTION_MEMORY_SIZE) || Math.round(os.totalmem() / 2 ** 20);
+}
+
 /**
  * How many callers this server searches at once, across every lookup in
- * flight. On Vercel each running caller is a whole Chromium on a small
- * instance (2 GB), and fluid compute can run several lookups on one instance,
- * so the other callers wait their turn, likeliest caller first.
+ * flight. On Vercel each running caller is a whole Chromium, and fluid
+ * compute can run several lookups on one instance, so the other callers wait
+ * their turn, likeliest caller first. The lookup route gets a 3 GB instance
+ * (vercel.json), room for four; on the standard 2 GB one, two at a time kept
+ * it from running out of memory (2026-09-28).
  */
 const MAX_PARALLEL_CALLERS =
-  Number(process.env.WEB_AGENT_MAX_PARALLEL) || (isServerless() ? 2 : Number.POSITIVE_INFINITY);
+  Number(process.env.WEB_AGENT_MAX_PARALLEL) ||
+  (isServerless() ? (instanceMemoryMb() >= 2900 ? 4 : 2) : Number.POSITIVE_INFINITY);
 
 /** A counting lock: at most `size` holders at once, the rest wait in arrival order. */
 class Slots {
@@ -241,20 +272,101 @@ const GOOGLE_MAPS_STAND_IN = `(() => {
   if (callback && typeof window[callback] === "function") setTimeout(() => window[callback]());
 })();`;
 
-async function lightenPages(context: BrowserContext): Promise<void> {
+/**
+ * The portal's scripts and stylesheets, kept in this process's memory across
+ * lookups. Main loads about 11 MB of them (Kendo alone is 3.9 MB), and every
+ * lookup opens a fresh browser context with an empty cache, so each caller
+ * used to download them all again: Main took about 4 s instead of 1.2 s
+ * (measured locally 2026-09-29). Only files stamped with the portal's
+ * ?ver= release number are kept, so a new portal release is fetched fresh.
+ */
+const CACHE_PORTAL_FILES = process.env.WEB_AGENT_CACHE_PORTAL_FILES !== "false";
+const MAX_CACHED_BYTES = 64 * 2 ** 20;
+const portalFiles = new Map<string, { status: number; headers: Record<string, string>; body: Buffer }>();
+let cachedBytes = 0;
+
+function rememberPortalFile(url: string, status: number, headers: Record<string, string>, body: Buffer): void {
+  if (status !== 200 || portalFiles.has(url)) return;
+  if (cachedBytes + body.length > MAX_CACHED_BYTES) {
+    portalFiles.clear(); // simplest way to drop files from old portal releases
+    cachedBytes = 0;
+  }
+  // The body is stored decoded, so its original encoding and length no longer apply.
+  const kept = Object.fromEntries(
+    Object.entries(headers).filter(([k]) => !/^(content-encoding|content-length|transfer-encoding)$/i.test(k)),
+  );
+  portalFiles.set(url, { status, headers: kept, body });
+  cachedBytes += body.length;
+}
+
+/** Applies LIGHT_PAGES and the portal file cache to every request of a context. */
+async function prepareContext(context: BrowserContext): Promise<void> {
+  if (!LIGHT_PAGES && !CACHE_PORTAL_FILES) return;
   await context.route("**/*", async (route) => {
     try {
       const request = route.request();
       const type = request.resourceType();
-      if (type === "image" || type === "font" || type === "media") return await route.abort();
-      if (/^https:\/\/maps\.googleapis\.com\/maps\/api\/js(?:[?/]|$)/.test(request.url())) {
-        return await route.fulfill({ status: 200, contentType: "application/javascript", body: GOOGLE_MAPS_STAND_IN });
+      if (LIGHT_PAGES) {
+        if (type === "image" || type === "font" || type === "media") return await route.abort();
+        if (/^https:\/\/maps\.googleapis\.com\/maps\/api\/js(?:[?/]|$)/.test(request.url())) {
+          return await route.fulfill({ status: 200, contentType: "application/javascript", body: GOOGLE_MAPS_STAND_IN });
+        }
+      }
+      const versioned =
+        CACHE_PORTAL_FILES &&
+        request.method() === "GET" &&
+        (type === "script" || type === "stylesheet") &&
+        /[?&]ver=/i.test(request.url());
+      if (versioned) {
+        const cached = portalFiles.get(request.url());
+        if (cached) return await route.fulfill({ status: cached.status, headers: cached.headers, body: cached.body });
+        const response = await route.fetch();
+        const body = await response.body();
+        rememberPortalFile(request.url(), response.status(), response.headers(), body);
+        return await route.fulfill({ response, body });
       }
       await route.continue();
     } catch {
-      // The page or its browser closed mid-request; nothing left to answer.
+      // Usually the page or its browser closed mid-request, with nothing left
+      // to answer. If the fetch itself failed, let the browser try normally.
+      await route.continue().catch(() => {});
     }
   });
+}
+
+// --- Saved sessions --------------------------------------------------------------
+
+type SessionState = Awaited<ReturnType<BrowserContext["storageState"]>>;
+
+/** How long a saved portal session is reused after it was last used. */
+const SESSION_IDLE_MS = Number(process.env.WEB_AGENT_SESSION_IDLE_MS) || 15 * 60_000;
+/** Saved sessions kept per caller: about one per lookup that ran at the same time. */
+const MAX_SAVED_SESSIONS = 4;
+
+/**
+ * Portal sessions this server has logged in with, kept between lookups so a
+ * lookup skips the ~6 s login. Only the cookies are kept, in this process's
+ * memory (never stored anywhere), not an open browser. A lookup takes one
+ * out for itself and puts it back when done, so two lookups never share a
+ * session: the portal keeps each session's selected account on its side.
+ */
+const savedSessions = new Map<string, { state: SessionState; savedAt: number }[]>();
+
+function takeSavedSession(caller: string): SessionState | null {
+  const list = savedSessions.get(caller) ?? [];
+  const now = Date.now();
+  while (list.length) {
+    const saved = list.pop()!; // newest first; once one is too old, so are the rest
+    if (now - saved.savedAt < SESSION_IDLE_MS) return saved.state;
+  }
+  return null;
+}
+
+function keepSession(caller: string, state: SessionState): void {
+  const list = savedSessions.get(caller) ?? [];
+  list.push({ state, savedAt: Date.now() });
+  if (list.length > MAX_SAVED_SESSIONS) list.splice(0, list.length - MAX_SAVED_SESSIONS);
+  savedSessions.set(caller, list);
 }
 
 // --- Portal pages ----------------------------------------------------------------
@@ -302,6 +414,39 @@ async function loginViaUi(page: Page, caller: NamedXceleratorCaller): Promise<vo
   }
 }
 
+function mainPageUrl(portalBaseUrl: string): string {
+  return `${portalBaseUrl}/ClientPortal/ClientPortal/Main`;
+}
+
+/**
+ * Leaves the page on the portal's Main page, logged in as this caller. With
+ * a saved session (its cookies already in the page's context) that is one
+ * page load; if the portal sent it back to the login form, the session had
+ * expired and this logs in again. Loading Main (no ?id=) also puts the
+ * session back on the caller's default account.
+ */
+async function openSession(
+  page: Page,
+  caller: NamedXceleratorCaller,
+  saved: boolean,
+  log: (action: string, detail?: string) => void,
+): Promise<void> {
+  const started = Date.now();
+  if (saved) {
+    await openPortalPage(page, mainPageUrl(caller.cfg.portalBaseUrl), "main page");
+    const backAtLogin =
+      /\/ClientPortal\/?$/i.test(new URL(page.url()).pathname) || (await page.locator("#loginForm").count()) > 0;
+    if (!backAtLogin) {
+      log("reused session", `${Date.now() - started} ms`);
+      return;
+    }
+    log("session expired", "logging in again");
+  }
+  const loginStarted = Date.now();
+  await loginViaUi(page, caller);
+  log("logged in", `${Date.now() - loginStarted} ms`);
+}
+
 // --- Quick Track ---------------------------------------------------------------
 
 // "Track by" options exactly as the portal's Quick Track dropdown labels them.
@@ -327,18 +472,26 @@ function isTrackBy(value: string): value is (typeof TRACK_BY_OPTIONS)[number] {
  * the value, press Track. Done in code because the dropdown's repeated
  * labels and the page's many identical "divBtnAdd" buttons trip the model.
  *
- * `onFreshMain` skips reloading Main when the page was just loaded (right
- * after login). After a search the window shows the result instead of the
- * form, so later searches start from a reloaded Main page.
+ * After a search the window shows the result instead of the form. Rather
+ * than reload Main before the next search (about 2 s each on Vercel), this
+ * closes the previous result with the portal's own close functions, which
+ * also empty the result fields the hit check reads. It reloads Main only
+ * when the page is somewhere else or those functions aren't there.
  */
-async function quickTrack(
-  page: Page,
-  portalBaseUrl: string,
-  trackBy: string,
-  value: string,
-  onFreshMain: boolean,
-): Promise<{ found: boolean }> {
-  if (!onFreshMain) await openPortalPage(page, `${portalBaseUrl}/ClientPortal/ClientPortal/Main`, "main page");
+async function quickTrack(page: Page, portalBaseUrl: string, trackBy: string, value: string): Promise<{ found: boolean }> {
+  const onMain = /\/ClientPortal\/ClientPortal\/Main$/i.test(new URL(page.url()).pathname);
+  const reset =
+    onMain &&
+    (await page
+      .evaluate(() => {
+        const w = window as unknown as Record<string, unknown>;
+        if (typeof w.closeOrderProperties !== "function" || typeof w.closeQTResults !== "function") return false;
+        (w.closeOrderProperties as () => void)();
+        (w.closeQTResults as () => void)();
+        return true;
+      })
+      .catch(() => false));
+  if (!reset) await openPortalPage(page, mainPageUrl(portalBaseUrl), "main page");
   const search = page.locator("#_quickTrackModel__Search");
   await page.locator("text=Quick Track >> visible=true").first().click();
   await search.waitFor({ state: "visible" });
@@ -530,6 +683,177 @@ function orderFromWindow(w: OrderWindowFields, referenceNumber: string): OrderIn
     },
     documents: [],
   };
+}
+
+// --- Order list ------------------------------------------------------------------
+
+/** A row of the portal's order list, plus the key its "open order" link passes along. */
+type OrderListRow = PortalOrderListRow & { Key?: string | null };
+
+/** Xcelerator's own order ids look like 105.031826: a sequence number, then the date as MMDDYY. */
+const TRACKING_ID = /^\d+\.\d{6}$/;
+
+/** Learning label for the order-list search, kept next to the Quick Track fields' stats. */
+const ORDER_LIST = "OrderList";
+
+function trackingIdText(value: number | string | null | undefined): string | null {
+  if (typeof value === "number") return value.toFixed(6);
+  return value?.toString().trim() || null;
+}
+
+/**
+ * Searches the portal's order list the way its Tracking page does with
+ * "All Accounts" picked: one request, run inside the logged-in page so it
+ * goes out with this caller's session. It covers every account the caller
+ * can see, while Quick Track only covers the selected one (2026-09-29:
+ * Seb2's Quick Track missed every DHL Same Day order this finds in about a
+ * quarter of a second). It matches the whole value, not a prefix, and the
+ * blank dates mean every date.
+ */
+async function searchOrderList(
+  page: Page,
+  portalBaseUrl: string,
+  filter: { ClientRefNo?: string; OrderTrackingID?: string },
+): Promise<OrderListRow[]> {
+  const params = new URLSearchParams({
+    ServiceIDs: "0",
+    VehicleIDs: "0",
+    PackageIDs: "0",
+    ClientIDs: "0", // "All Accounts"; -1 would be only the selected account
+    Status: "-1", // every status
+    OrderTrackingID: filter.OrderTrackingID ?? "",
+    ClientRefNo: filter.ClientRefNo ?? "",
+    ClientRefNo2: "",
+    Caller: "",
+    PickupCompany: "",
+    DeliveryCompany: "",
+    oDate_From: "",
+    oDate_To: "",
+    PickupTargetDateStart: "",
+    PickupTargetDateEnd: "",
+    DeliveryTargetDateStart: "",
+    DeliveryTargetDateEnd: "",
+    WildCardField: "",
+    WildCardValue: "",
+  });
+  const url = `${portalBaseUrl}/ClientPortal/ClientPortal/api/trackingOnline/getorders?${params}`;
+  const res = await page.evaluate(
+    async ({ url, timeoutMs }) => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const r = await fetch(url, {
+          headers: { Accept: "application/json" },
+          credentials: "same-origin",
+          signal: controller.signal,
+        });
+        return { status: r.status, text: await r.text() };
+      } catch (err) {
+        return { status: 0, text: String(err) };
+      } finally {
+        clearTimeout(timer);
+      }
+    },
+    { url, timeoutMs: 20_000 },
+  );
+  if (res.status !== 200) {
+    throw new Error(`the order list search failed (${res.status ? `HTTP ${res.status}` : res.text.slice(0, 120)})`);
+  }
+  let body: { Data?: OrderListRow[] | null; Error?: string | null };
+  try {
+    body = JSON.parse(res.text);
+  } catch {
+    throw new Error("the order list search did not return data; the portal session may have ended");
+  }
+  if (body.Error) throw new Error(`the order list search failed: ${body.Error}`);
+  return body.Data ?? [];
+}
+
+/**
+ * The row for this reference. A reference can be reused (a daily "3am Mail
+ * Run", say), so an exact match wins and, among several, the newest pickup.
+ */
+function pickListRow(rows: OrderListRow[], referenceNumber: string): OrderListRow | null {
+  const want = referenceNumber.trim().toUpperCase();
+  const exact = rows.filter(
+    (r) => (r.ClientRefNo ?? "").trim().toUpperCase() === want || trackingIdText(r.OrderTrackingID) === want,
+  );
+  const pool = exact.length ? exact : rows;
+  return [...pool].sort((a, b) => (b.PickupTargetFrom ?? "").localeCompare(a.PickupTargetFrom ?? ""))[0] ?? null;
+}
+
+/**
+ * Opens an order's window the way clicking it in the portal's order list
+ * does: openOrderProperties(tracking id, the row's key). That works from the
+ * caller's default account for an order in any account it can see
+ * (confirmed for DHL Same Day, Sterling and Quick International orders under
+ * Seb2), with no account switch. Returns null when the portal refuses (seen
+ * for newly scheduled "NCR Prefill" DHL orders) or the window doesn't fill
+ * in time.
+ */
+async function openOrderWindow(page: Page, row: OrderListRow): Promise<OrderWindowFields | null> {
+  const id = trackingIdText(row.OrderTrackingID);
+  if (!id) return null;
+  const started = await page
+    .evaluate(
+      ({ id, key }) => {
+        const w = window as unknown as Record<string, unknown>;
+        if (typeof w.openOrderProperties !== "function") return false;
+        if (typeof w.closeQTResults === "function") (w.closeQTResults as () => void)();
+        // A window left open would still show the previous order's fields.
+        const popup = document.querySelector<HTMLElement>("#orderdetailspopup");
+        if (popup && getComputedStyle(popup).display !== "none" && typeof w.closeOrderProperties === "function") {
+          (w.closeOrderProperties as () => void)();
+        }
+        (w.openOrderProperties as (id: string, key: string) => void)(id, key);
+        return true;
+      },
+      { id, key: row.Key ?? "" },
+    )
+    .catch(() => false);
+  if (!started) return null;
+  const outcome = await page
+    .waitForFunction(
+      () => {
+        const popup = document.querySelector<HTMLElement>("#orderdetailspopup");
+        if (!popup || getComputedStyle(popup).display === "none") return null;
+        if ((document.querySelector("#op_OrderTrackingID2")?.textContent ?? "").trim()) return "open";
+        if (/cannot be found/i.test(document.querySelector("#op_OrderTrackingID")?.textContent ?? "")) return "refused";
+        return null;
+      },
+      undefined,
+      { timeout: 15_000 },
+    )
+    .then((handle) => handle.jsonValue())
+    .catch(() => null);
+  return outcome === "open" ? readOrderWindowFields(page) : null;
+}
+
+type ListHit = { order: OrderInquiry; orderTrackingId: string | null; account: string | null };
+
+/** Reads an order the list search found: its window when the portal opens it, else the list row. */
+async function readListHit(
+  page: Page,
+  row: OrderListRow,
+  referenceNumber: string,
+  log: (action: string, detail?: string) => void,
+): Promise<ListHit> {
+  const started = Date.now();
+  const orderTrackingId = trackingIdText(row.OrderTrackingID);
+  const account = row.AccountNo?.trim() || null;
+  const window = await openOrderWindow(page, row);
+  if (window) {
+    const order = orderFromWindow(window, referenceNumber);
+    log("read order", `${orderTrackingId}: ${order.status.replace("_", " ")} (${Date.now() - started} ms)`);
+    return { order, orderTrackingId: window.fields.OrderTrackingID2 || orderTrackingId, account };
+  }
+  const order = mapPortalOrderListRowToInquiryFallback(row);
+  log(
+    "read order",
+    `${orderTrackingId}: ${order.status.replace("_", " ")}, from the order list, because the portal would not open ` +
+      `this order's window (so no itemized charges)`,
+  );
+  return { order, orderTrackingId, account };
 }
 
 // --- Page snapshot -------------------------------------------------------------
@@ -971,7 +1295,7 @@ async function agentLoop(
           const requested = String(args.trackBy ?? "");
           const trackBy = isTrackBy(requested) ? requested : "ClientRefNo";
           const value = String(args.value ?? referenceNumber);
-          const result = await quickTrack(page, caller.cfg.portalBaseUrl, trackBy, value, false);
+          const result = await quickTrack(page, caller.cfg.portalBaseUrl, trackBy, value);
           history.push(`quick_track ${trackBy} = "${value}" -> ${result.found ? "result shown" : "[Not Found]"}`);
           log("quick track", `${trackBy} = "${value}" (${result.found ? "hit" : "miss"})`);
           break;
@@ -1052,12 +1376,17 @@ async function agentLoop(
 
 // --- Per-caller search ------------------------------------------------------------
 
-type CallerHit = { order: OrderInquiry; orderTrackingId: string | null; attempts: SearchAttempt[] };
+type CallerHit = ListHit & { attempts: SearchAttempt[] };
 
 /**
- * One caller's search: log in, run the learned Quick Track plan in code
- * (no model calls, so a miss costs about a second), and only when a search
- * hits, let the model read the order off the result screen.
+ * One caller's search, all in code (no model calls):
+ *  1. Main page on a saved session, or a fresh login.
+ *  2. The order list, across every account this caller can see. A hit is
+ *     opened and read like clicking it in the portal's order list.
+ *  3. Otherwise the learned Quick Track plan for the other fields, with no
+ *     page reload between searches. A Quick Track hit that only shows the
+ *     small result box is opened in full by its tracking id.
+ * Only a hit that can't be read either way goes to the model.
  */
 async function searchCaller(
   browser: Browser,
@@ -1070,21 +1399,43 @@ async function searchCaller(
   const log = (action: string, detail?: string) => {
     if (!stop.value) steps.push({ caller: caller.label, action, detail });
   };
-  const context = await browser.newContext({ viewport: { width: 1366, height: 900 } });
-  if (LIGHT_PAGES) await lightenPages(context);
+  const saved = takeSavedSession(caller.label);
+  const context = await browser.newContext({
+    viewport: { width: 1366, height: 900 },
+    ...(saved ? { storageState: saved } : {}),
+  });
+  await prepareContext(context);
   const page = await context.newPage();
   page.setDefaultTimeout(ACTION_TIMEOUT_MS);
+  // The session is put back for the next lookup only once it has proven to
+  // work. Captured early too, since the browser may already be closing by
+  // the time this caller finishes (a higher-ranked caller won).
+  let workingSession: SessionState | null = null;
 
   try {
-    const loginStarted = Date.now();
-    await loginViaUi(page, caller);
-    log("logged in", `${Date.now() - loginStarted} ms`);
-
+    await openSession(page, caller, saved !== null, log);
+    const base = caller.cfg.portalBaseUrl;
+    const ref = referenceNumber.trim();
     const attempts: SearchAttempt[] = [];
-    for (const [i, trackBy] of plan.entries()) {
+
+    if (stop.value) return null;
+    const listStarted = Date.now();
+    const rows = await searchOrderList(page, base, TRACKING_ID.test(ref) ? { OrderTrackingID: ref } : { ClientRefNo: ref });
+    const listMs = Date.now() - listStarted;
+    workingSession = await context.storageState().catch(() => null);
+    const row = pickListRow(rows, ref);
+    attempts.push({ trackBy: ORDER_LIST, hit: row !== null, ms: listMs });
+    if (row) {
+      const shared = rows.length > 1 ? `; ${rows.length} orders use this reference, reading the newest` : "";
+      log("order list", `found in account ${row.AccountNo?.trim() || "?"} (${listMs} ms${shared})`);
+      return { ...(await readListHit(page, row, referenceNumber, log)), attempts };
+    }
+    log("order list", `not in any account ${caller.label} can see (${listMs} ms)`);
+
+    for (const trackBy of plan) {
       if (stop.value) return null;
       const started = Date.now();
-      const result = await quickTrack(page, caller.cfg.portalBaseUrl, trackBy, referenceNumber, i === 0);
+      const result = await quickTrack(page, base, trackBy, referenceNumber);
       const ms = Date.now() - started;
       attempts.push({ trackBy, hit: result.found, ms });
       log("quick track", `${trackBy} = "${referenceNumber}" ${result.found ? "HIT" : "miss"} (${ms} ms)`);
@@ -1096,7 +1447,14 @@ async function searchCaller(
         const order = orderFromWindow(window, referenceNumber);
         const orderTrackingId = window.fields.OrderTrackingID2 || window.fields.OrderTrackingID || null;
         log("read order", `${orderTrackingId ?? order.referenceNumber}: ${order.status.replace("_", " ")}`);
-        return { order, orderTrackingId, attempts };
+        return { order, orderTrackingId, account: null, attempts };
+      }
+
+      // Only the small result box showed: open the full order by the tracking id it shows.
+      const shownId = ((await page.locator("#QT_OrderTrackingID").textContent().catch(() => null)) ?? "").trim();
+      if (TRACKING_ID.test(shownId)) {
+        const byId = pickListRow(await searchOrderList(page, base, { OrderTrackingID: shownId }), shownId);
+        if (byId) return { ...(await readListHit(page, byId, referenceNumber, log)), attempts };
       }
 
       // Otherwise let the model look around the result screen.
@@ -1109,7 +1467,9 @@ async function searchCaller(
         history: [`quick_track ${trackBy} = "${referenceNumber}" -> result shown`],
         maxSteps: READ_MAX_STEPS,
       });
-      if (read.kind === "found") return { order: read.order, orderTrackingId: read.orderTrackingId, attempts };
+      if (read.kind === "found") {
+        return { order: read.order, orderTrackingId: read.orderTrackingId, account: null, attempts };
+      }
       throw new Error(`Quick Track found the order but it could not be read: ${read.reason}`);
     }
 
@@ -1117,17 +1477,32 @@ async function searchCaller(
       log("free browse", "Learned searches missed; letting the model explore");
       const outcome = await agentLoop(page, caller, referenceNumber, log, {
         goal: "Find this order in the portal and read its pickup, delivery, POD and charges details.",
-        history: plan.map((t) => `quick_track ${t} = "${referenceNumber}" -> [Not Found]`),
+        history: [
+          `order list search (all accounts) for "${referenceNumber}" -> nothing`,
+          ...plan.map((t) => `quick_track ${t} = "${referenceNumber}" -> [Not Found]`),
+        ],
         maxSteps: MAX_STEPS,
       });
       if (outcome.kind === "found") {
-        return { order: outcome.order, orderTrackingId: outcome.orderTrackingId, attempts };
+        return { order: outcome.order, orderTrackingId: outcome.orderTrackingId, account: null, attempts };
       }
     }
     return null;
   } finally {
+    if (workingSession) keepSession(caller.label, (await context.storageState().catch(() => null)) ?? workingSession);
     await context.close().catch(() => {});
   }
+}
+
+/**
+ * The Quick Track fields worth trying for a reference. Quick Track only runs
+ * after the order list missed, so it skips the field the list already
+ * searched in every account at once: the tracking id for references shaped
+ * like one (105.031826), ClientRefNo for everything else.
+ */
+export function quickTrackFieldsFor(referenceNumber: string): string[] {
+  const listed = TRACKING_ID.test(referenceNumber.trim()) ? "OrderTrackingID" : "ClientRefNo";
+  return TRACK_BY_OPTIONS.filter((f) => f !== listed);
 }
 
 export function isWebAgentConfigured(): boolean {
@@ -1140,6 +1515,7 @@ function describePlan(
   memory: WebAgentMemory,
   ranked: RankedCaller[],
   plans: { plan: string[]; explored: string | null }[],
+  place: Place | null,
 ): string {
   const type = context.taxonomy === context.shape ? context.shape : `${context.taxonomy} (shape ${context.shape})`;
   const order = ranked.map((r) => (r.tries ? `${r.caller} (had it ${r.hits} of ${r.tries})` : r.caller)).join(", ");
@@ -1149,8 +1525,13 @@ function describePlan(
     : ranked.map((r, i) => `${r.caller}: ${fields[i]}`).join("; ");
   const explored = [...new Set(plans.flatMap((p) => (p.explored ? [p.explored] : [])))];
   const finds = Object.values(memory.typeCallers?.[context.taxonomy] ?? {}).reduce((sum, a) => sum + a.hits, 0);
+  const before = place
+    ? `Found under ${place.caller}${place.account ? ` (account ${place.account})` : ""} before, so ${place.caller} ` +
+      `goes first and the others wait for it. `
+    : "";
   return (
-    `Reference type ${type}. Caller order: ${order}. Searching ${searching}` +
+    `${before}Reference type ${type}. Caller order: ${order}. Each caller searches the order list across all its ` +
+    `accounts, then Quick Track ${searching}` +
     (explored.length ? ` (exploring ${explored.join(", ")})` : "") +
     (finds
       ? `. Learned from ${finds} past ${finds === 1 ? "find" : "finds"} of this type.`
@@ -1168,13 +1549,22 @@ export async function findOrderWithWebAgent(referenceNumber: string): Promise<We
   // Learned plan. The reference's type (its shape plus any short letter code,
   // like the M in 212620423M) decides which caller most likely has it, so that
   // caller goes first, and each caller gets its own field order for that type.
+  // A reference found before goes to the caller that had it, ahead of the
+  // learned order, and the other callers only start if that one misses.
   const context = referenceContext(referenceNumber);
   const memory = await loadMemory();
-  const ranked = rankCallers(memory, context, configured.map((c) => c.label));
+  const learned = rankCallers(memory, context, configured.map((c) => c.label));
+  const known = rememberedPlace(memory, referenceNumber);
+  const knownRank = known ? learned.findIndex((r) => r.caller === known.caller) : -1;
+  const ranked = knownRank > 0 ? [learned[knownRank], ...learned.filter((_, i) => i !== knownRank)] : learned;
+  const place = knownRank >= 0 ? known : null;
   const callers = ranked.map((r) => configured[r.index]);
+  const quickTrackFields = quickTrackFieldsFor(referenceNumber);
   const roll = Math.random(); // one exploration draw per lookup, shared by every caller
-  const plans = callers.map((c) => planSearches(memory, context, TRACK_BY_OPTIONS, MAX_SEARCHES, c.label, () => roll));
-  steps.push({ caller: "planner", action: "plan", detail: describePlan(context, memory, ranked, plans) });
+  const plans = callers.map((c) => planSearches(memory, context, quickTrackFields, MAX_SEARCHES, c.label, () => roll));
+  steps.push({ caller: "planner", action: "plan", detail: describePlan(context, memory, ranked, plans, place) });
+  let firstCallerDone: () => void = () => {};
+  const knownCallerAnswered = place ? new Promise<void>((resolve) => (firstCallerDone = resolve)) : null;
 
   // Callers start in ranked order, as many at once as this server allows
   // (all of them locally, MAX_PARALLEL_CALLERS on Vercel). A hit is accepted
@@ -1191,6 +1581,7 @@ export async function findOrderWithWebAgent(referenceNumber: string): Promise<We
   let bestHitRank = Number.POSITIVE_INFINITY;
 
   const runCaller = async (caller: NamedXceleratorCaller, rank: number): Promise<CallerHit | null | "skipped"> => {
+    if (rank > 0 && knownCallerAnswered) await knownCallerAnswered;
     const queuedAt = Date.now();
     const release = await callerSlots.acquire();
     let own: Browser | null = null;
@@ -1212,6 +1603,7 @@ export async function findOrderWithWebAgent(referenceNumber: string): Promise<We
         await own.close().catch(() => {});
       }
       release();
+      if (rank === 0) firstCallerDone();
     }
   };
 
@@ -1251,12 +1643,14 @@ export async function findOrderWithWebAgent(referenceNumber: string): Promise<We
     winner: winner?.caller ?? null,
     outcomes: settled,
     explored: plans.flatMap((p) => (p.explored ? [p.explored] : [])),
+    found: winner ? { ref: referenceNumber, caller: winner.caller, account: winner.hit.account } : undefined,
   });
 
   if (winner) {
     return {
       order: winner.hit.order,
       foundViaCaller: winner.caller,
+      account: winner.hit.account,
       orderTrackingId: winner.hit.orderTrackingId,
       steps,
       warning: failures.length ? `Other callers had problems: ${failures.join("; ")}` : undefined,
@@ -1277,6 +1671,7 @@ export async function findOrderWithWebAgent(referenceNumber: string): Promise<We
   return {
     order: null,
     foundViaCaller: null,
+    account: null,
     orderTrackingId: null,
     steps,
     warning: failures.length ? `Some callers could not be searched: ${failures.join("; ")}` : undefined,

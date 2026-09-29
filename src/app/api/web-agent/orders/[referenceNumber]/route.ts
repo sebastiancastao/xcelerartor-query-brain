@@ -34,6 +34,7 @@ export async function GET(
       order: result.order,
       source: "web-agent",
       foundViaCaller: result.foundViaCaller,
+      account: result.account,
       orderTrackingId: result.orderTrackingId,
       warning: result.warning,
       steps: result.steps,

@@ -18,6 +18,8 @@ type LookupState =
       order: OrderInquiry;
       /** Caller (portal login) the agent found the order under. */
       foundViaCaller: string | null;
+      /** Xcelerator account the order is in (e.g. "DHLIN"), when known. */
+      account: string | null;
       /** Xcelerator's own id for the order, read off the order window. */
       orderTrackingId: string | null;
       /** e.g. "found under the QUKIN account instead of the default one" or "the default Xcelerator login is currently failing" — surfaced so a CSR knows to flag it rather than the app silently papering over it. */
@@ -253,6 +255,7 @@ export default function WebAgentHome() {
       const body: {
         order: OrderInquiry;
         foundViaCaller: string | null;
+        account?: string | null;
         orderTrackingId: string | null;
         warning?: string;
         steps: WebAgentStep[];
@@ -262,6 +265,7 @@ export default function WebAgentHome() {
         status: "success",
         order: body.order,
         foundViaCaller: body.foundViaCaller,
+        account: body.account ?? null,
         orderTrackingId: body.orderTrackingId ?? null,
         warning: body.warning,
       });
@@ -367,6 +371,7 @@ export default function WebAgentHome() {
 
   const order = state.status === "success" ? state.order : null;
   const foundViaCaller = state.status === "success" ? state.foundViaCaller : null;
+  const orderAccount = state.status === "success" ? state.account : null;
   const orderTrackingId = state.status === "success" ? state.orderTrackingId : null;
   const lookupWarning = state.status === "success" ? state.warning : null;
 
@@ -578,6 +583,7 @@ export default function WebAgentHome() {
                   <Badge tone="indigo">
                     Source: Web agent{foundViaCaller ? ` (${foundViaCaller})` : ""}
                   </Badge>
+                  {orderAccount && <Badge tone="zinc">Account {orderAccount}</Badge>}
                   {orderTrackingId && <Badge tone="zinc">Tracking ID {orderTrackingId}</Badge>}
                 </div>
                 <span className="text-xs text-zinc-500 dark:text-zinc-400">Carrier: {order.carrier}</span>

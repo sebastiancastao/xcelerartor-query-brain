@@ -25,6 +25,14 @@
 //    fields (ClientRefNo, OrderTrackingID, ...); the reward is 1 when a field
 //    finds the order and 0 when it was tried first and missed.
 //
+// Separately, each found reference's exact place (caller and Xcelerator
+// account) is remembered in `places`, so looking the same reference up again
+// goes straight to the caller that had it.
+//
+// Since 2026-09-29 each caller first searches the portal's order list across
+// all its accounts; that search is logged as the "OrderList" arm next to the
+// Quick Track fields, and the fields are only searched when it misses.
+//
 // Credit assignment: stats are only updated when some caller actually found
 // the order. If nobody finds it, it may simply not exist, so the misses tell
 // us nothing, and nothing is learned. A caller that was stopped before it
@@ -91,9 +99,19 @@ export type WebAgentMemory = {
    * field has been used as the exploration pick. Drives the exploration slot.
    */
   exploration?: Record<string, { streak: number; tried: Record<string, number> }>;
+  /**
+   * Where each recently found reference was found, keyed by the reference
+   * upper-cased: which caller had it and in which Xcelerator account. A
+   * repeat lookup (the same email opened again, a reply drafted later) goes
+   * straight to that caller. Capped at MAX_PLACES, oldest dropped first.
+   */
+  places?: Record<string, Place>;
 };
 
+export type Place = { caller: string; account: string | null; at: string };
+
 const MAX_EPISODES = 500;
+const MAX_PLACES = 1000; // about ten days of Skyline's volume; the whole store is read on every lookup
 const PRIOR_WEIGHT = 2; // pseudo-tries the prior is worth
 // Max pseudo-tries a broader type lends to a narrower one: one find in a
 // different field doesn't overturn what similar references taught, two do.
@@ -452,6 +470,15 @@ export function planSearches(
   return { plan: [...plan, rest[0]], explored: null };
 }
 
+function placeKey(ref: string): string {
+  return ref.trim().toUpperCase();
+}
+
+/** Where this exact reference was found last time, if it was found before. */
+export function rememberedPlace(memory: WebAgentMemory, ref: string): Place | null {
+  return memory.places?.[placeKey(ref)] ?? null;
+}
+
 // --- Recording -------------------------------------------------------------------
 
 function bump(arm: Arm | undefined, hit: boolean, ms: number): Arm {
@@ -485,6 +512,8 @@ export async function recordEpisode(params: {
   outcomes: CallerOutcome[];
   /** Fields planSearches picked for exploration slots in this lookup. */
   explored?: string[];
+  /** The reference that was found and where, remembered for repeat lookups. */
+  found?: { ref: string; caller: string; account: string | null };
 }): Promise<void> {
   const memory = await loadMemory();
   const at = new Date().toISOString();
@@ -522,6 +551,20 @@ export async function recordEpisode(params: {
 
   if (memory.episodes.length > MAX_EPISODES) {
     memory.episodes.splice(0, memory.episodes.length - MAX_EPISODES);
+  }
+
+  if (params.found) {
+    const places = (memory.places ??= {});
+    places[placeKey(params.found.ref)] = { caller: params.found.caller, account: params.found.account, at };
+    // Oldest dropped by date: most references are plain numbers, and objects
+    // list number-like keys in numeric order, not the order they were added.
+    const excess = Object.keys(places).length - MAX_PLACES;
+    if (excess > 0) {
+      const oldest = Object.entries(places)
+        .sort((a, b) => a[1].at.localeCompare(b[1].at))
+        .slice(0, excess);
+      for (const [key] of oldest) delete places[key];
+    }
   }
   await persist(memory);
 }

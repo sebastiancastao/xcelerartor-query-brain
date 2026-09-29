@@ -5,13 +5,14 @@ import {
   rankCallers,
   rankTrackBy,
   referenceContext,
+  rememberedPlace,
   resetMemory,
 } from "@/lib/web-agent-memory";
-import { TRACK_BY_OPTIONS } from "@/lib/web-agent";
+import { quickTrackFieldsFor } from "@/lib/web-agent";
 import { xceleratorCallersFromEnv } from "@/lib/xcelerator-portal";
 
 // GET  /api/web-agent/memory               -> what the web agent has learned
-// GET  /api/web-agent/memory?ref=212620423M -> plus the caller order and fields it would use for that reference
+// GET  /api/web-agent/memory?ref=212620423M -> plus the caller order, the Quick Track fields it would try and where it was found before
 // DELETE /api/web-agent/memory             -> forget everything and start over
 export async function GET(request: Request) {
   const ref = new URL(request.url).searchParams.get("ref");
@@ -28,15 +29,17 @@ export async function GET(request: Request) {
     callerFields: memory.callerFields ?? {},
     exploration: memory.exploration ?? {},
     recentEpisodes: memory.episodes.slice(-25),
+    rememberedReferences: Object.keys(memory.places ?? {}).length,
     ...(context
       ? {
           ref,
           shape: context.shape,
           taxonomy: context.taxonomy,
+          foundBefore: rememberedPlace(memory, ref ?? ""),
           callerOrder: rankCallers(memory, context, callers),
-          plan: rankTrackBy(memory, context, TRACK_BY_OPTIONS),
+          plan: rankTrackBy(memory, context, quickTrackFieldsFor(ref ?? "")),
           callerPlans: Object.fromEntries(
-            callers.map((c) => [c, rankTrackBy(memory, context, TRACK_BY_OPTIONS, c).map((r) => r.trackBy)]),
+            callers.map((c) => [c, rankTrackBy(memory, context, quickTrackFieldsFor(ref ?? ""), c).map((r) => r.trackBy)]),
           ),
         }
       : {}),
