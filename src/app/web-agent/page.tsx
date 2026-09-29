@@ -207,9 +207,11 @@ export default function WebAgentHome() {
 
   // Order/reference detection: the primary source is MissiveEmailSense
   // below, which senses whichever email the CSR currently has open in
-  // Missive. "Paste an email instead" is a manual fallback for when this
-  // page isn't embedded in Missive (or Missive isn't configured) — either
-  // path only ever fills the search box, it never submits the lookup itself.
+  // Missive; opening an email with a reference in it starts the lookup right
+  // away, so the answer is usually there by the time the email is read.
+  // "Paste an email instead" is a manual fallback for when this page isn't
+  // embedded in Missive (or Missive isn't configured); pasted text only fills
+  // the search box, since it changes with every keystroke.
   const [showEmailPanel, setShowEmailPanel] = useState(false);
   const [emailText, setEmailText] = useState("");
   const [detectedRefs, setDetectedRefs] = useState<DetectedReference[]>([]);
@@ -219,6 +221,12 @@ export default function WebAgentHome() {
   // Auto-opens the paste fallback once, the first time we learn Missive
   // sensing isn't available — never re-opens it if the CSR then hides it.
   const autoOpenedPasteRef = useRef(false);
+  // The reference last looked up because an email was opened, so reopening
+  // or re-sensing the same email doesn't start the same lookup again.
+  const lastAutoLookedUpRef = useRef<string | null>(null);
+  // Numbers each lookup. Opening another email starts a new lookup while the
+  // previous one may still be running; only the newest one may show its result.
+  const lookupSeqRef = useRef(0);
 
   useEffect(() => {
     fetch("/api/config")
@@ -233,6 +241,8 @@ export default function WebAgentHome() {
   async function handleLookup(refOverride?: string) {
     const ref = (refOverride ?? referenceNumber).trim();
     if (!ref) return;
+    const seq = ++lookupSeqRef.current;
+    const current = () => seq === lookupSeqRef.current;
 
     setReferenceNumber(ref);
     setState({ status: "loading" });
@@ -242,8 +252,10 @@ export default function WebAgentHome() {
 
     try {
       const res = await fetch(`/api/web-agent/orders/${encodeURIComponent(ref)}`);
+      if (!current()) return;
       if (!res.ok) {
         const body = await res.json().catch(() => null);
+        if (!current()) return;
         setSteps(body?.steps ?? []);
         const baseMessage = body?.error ?? `Lookup failed (${res.status})`;
         setState({
@@ -260,6 +272,7 @@ export default function WebAgentHome() {
         warning?: string;
         steps: WebAgentStep[];
       } = await res.json();
+      if (!current()) return;
       setSteps(body.steps ?? []);
       setState({
         status: "success",
@@ -269,13 +282,14 @@ export default function WebAgentHome() {
         orderTrackingId: body.orderTrackingId ?? null,
         warning: body.warning,
       });
-      loadReplyForOrder(body.order);
+      loadReplyForOrder(body.order, current);
     } catch {
-      setState({ status: "error", message: "Network error — please try again." });
+      if (current()) setState({ status: "error", message: "Network error — please try again." });
     }
   }
 
-  async function loadReplyForOrder(order: OrderInquiry) {
+  /** `current` says whether the lookup this reply belongs to is still the one on screen. */
+  async function loadReplyForOrder(order: OrderInquiry, current: () => boolean) {
     setReply({ status: "loading" });
 
     try {
@@ -285,9 +299,9 @@ export default function WebAgentHome() {
         body: JSON.stringify({ order }),
       });
       const data = await res.json().catch(() => null);
-      setReply({ status: "ready", text: data?.reply ?? buildSuggestedReply(order) });
+      if (current()) setReply({ status: "ready", text: data?.reply ?? buildSuggestedReply(order) });
     } catch {
-      setReply({ status: "ready", text: buildSuggestedReply(order) });
+      if (current()) setReply({ status: "ready", text: buildSuggestedReply(order) });
     }
   }
 
@@ -321,10 +335,10 @@ export default function WebAgentHome() {
 
   // Shared by both detection sources (Missive-sensed text and the manual
   // paste fallback): scans the text and, when a new top candidate shows up,
-  // drops it into the search box — but only ever sets state, never calls
-  // handleLookup. The search box stays a normal controlled input, so the
-  // CSR can freely retype or correct it afterward.
-  function applyDetectedText(text: string) {
+  // drops it into the search box. It only sets state and returns the top
+  // candidate; starting a lookup is up to the caller. The search box stays a
+  // normal controlled input, so the CSR can freely retype or correct it.
+  function applyDetectedText(text: string): string | null {
     const detected = detectOrderReferences(text);
     setDetectedRefs(detected);
 
@@ -333,6 +347,7 @@ export default function WebAgentHome() {
       lastAutoFilledRef.current = top.value;
       setReferenceNumber(top.value);
     }
+    return top?.value ?? null;
   }
 
   function handleEmailTextChange(value: string) {
@@ -343,10 +358,15 @@ export default function WebAgentHome() {
   // Called by MissiveEmailSense whenever the CSR opens a different email in
   // Missive. Mirrors the pasted text into the same textarea (so expanding
   // the fallback panel shows exactly what was scanned, and can be
-  // hand-corrected) and runs the same detection path.
+  // hand-corrected), runs the same detection path, and looks the top
+  // reference up straight away.
   function handleMissiveEmailText(text: string) {
     setEmailText(text);
-    applyDetectedText(text);
+    const top = applyDetectedText(text);
+    if (top && top !== lastAutoLookedUpRef.current) {
+      lastAutoLookedUpRef.current = top;
+      void handleLookup(top);
+    }
   }
 
   function handleMissiveStatusChange(status: MissiveSenseStatus) {

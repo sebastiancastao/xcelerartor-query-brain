@@ -1,4 +1,4 @@
-import { NextResponse } from "next/server";
+import { after, NextResponse } from "next/server";
 import { logDebugEvent } from "@/lib/debug-log";
 import { findOrderWithWebAgent, WebAgentError } from "@/lib/web-agent";
 
@@ -14,6 +14,9 @@ export async function GET(
 
   try {
     const result = await findOrderWithWebAgent(referenceNumber);
+    // Callers still finishing a step hand their open portal page back for the
+    // next lookup; keep the function alive for that after answering.
+    if (result.background) after(() => result.background);
     const ms = Date.now() - startedAt;
     logDebugEvent({
       kind: "lookup",

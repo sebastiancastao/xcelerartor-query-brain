@@ -2,17 +2,18 @@ import { NextResponse } from "next/server";
 import {
   loadMemory,
   memoryBackend,
+  planCallerCoverage,
   rankCallers,
   rankTrackBy,
   referenceContext,
   rememberedPlace,
   resetMemory,
 } from "@/lib/web-agent-memory";
-import { quickTrackFieldsFor } from "@/lib/web-agent";
+import { listFieldsFor } from "@/lib/web-agent";
 import { xceleratorCallersFromEnv } from "@/lib/xcelerator-portal";
 
 // GET  /api/web-agent/memory               -> what the web agent has learned
-// GET  /api/web-agent/memory?ref=212620423M -> plus the caller order, the Quick Track fields it would try and where it was found before
+// GET  /api/web-agent/memory?ref=212620423M -> plus the caller order, which callers it would search, the order-list fields in order and where it was found before
 // DELETE /api/web-agent/memory             -> forget everything and start over
 export async function GET(request: Request) {
   const ref = new URL(request.url).searchParams.get("ref");
@@ -30,6 +31,7 @@ export async function GET(request: Request) {
     exploration: memory.exploration ?? {},
     recentEpisodes: memory.episodes.slice(-25),
     rememberedReferences: Object.keys(memory.places ?? {}).length,
+    callerAccounts: memory.callerAccounts ?? {},
     ...(context
       ? {
           ref,
@@ -37,9 +39,13 @@ export async function GET(request: Request) {
           taxonomy: context.taxonomy,
           foundBefore: rememberedPlace(memory, ref ?? ""),
           callerOrder: rankCallers(memory, context, callers),
-          plan: rankTrackBy(memory, context, quickTrackFieldsFor(ref ?? "")),
+          coverage: planCallerCoverage(
+            memory,
+            rankCallers(memory, context, callers).map((r) => r.caller),
+          ),
+          plan: rankTrackBy(memory, context, listFieldsFor(ref ?? "")),
           callerPlans: Object.fromEntries(
-            callers.map((c) => [c, rankTrackBy(memory, context, quickTrackFieldsFor(ref ?? ""), c).map((r) => r.trackBy)]),
+            callers.map((c) => [c, rankTrackBy(memory, context, listFieldsFor(ref ?? ""), c).map((r) => r.trackBy)]),
           ),
         }
       : {}),

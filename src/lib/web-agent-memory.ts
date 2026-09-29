@@ -29,9 +29,13 @@
 // account) is remembered in `places`, so looking the same reference up again
 // goes straight to the caller that had it.
 //
-// Since 2026-09-29 each caller first searches the portal's order list across
-// all its accounts; that search is logged as the "OrderList" arm next to the
-// Quick Track fields, and the fields are only searched when it misses.
+// Since 2026-09-29 the fields are searched in the portal's order list across
+// all of a caller's accounts instead of through Quick Track, all of them in
+// the learned order until one hits, so the ranking decides speed, not
+// whether an order is found. (An "OrderList" arm in older stats is from a
+// short-lived version that searched the list by ClientRefNo first.) Each
+// caller's account list is kept too (callerAccounts), so callers whose
+// accounts another caller already covers aren't searched.
 //
 // Credit assignment: stats are only updated when some caller actually found
 // the order. If nobody finds it, it may simply not exist, so the misses tell
@@ -106,6 +110,13 @@ export type WebAgentMemory = {
    * straight to that caller. Capped at MAX_PLACES, oldest dropped first.
    */
   places?: Record<string, Place>;
+  /**
+   * The Xcelerator accounts each caller's login can see (codes like
+   * "DHLIN"), read from the portal now and then. Seb2 sees seven accounts,
+   * including the one each of STRLN and QUKIN sees, so those two only need
+   * searching when Seb2 can't be (see planCallerCoverage).
+   */
+  callerAccounts?: Record<string, { accounts: string[]; at: string }>;
 };
 
 export type Place = { caller: string; account: string | null; at: string };
@@ -479,6 +490,52 @@ export function rememberedPlace(memory: WebAgentMemory, ref: string): Place | nu
   return memory.places?.[placeKey(ref)] ?? null;
 }
 
+// --- Which callers to search ------------------------------------------------------
+
+/** How long a caller's account list is trusted before it is read again. */
+const ACCOUNT_LIST_MAX_AGE_MS = 24 * 60 * 60_000;
+
+/** Whether this caller's account list is missing or old enough to read again. */
+export function accountListIsStale(memory: WebAgentMemory, caller: string): boolean {
+  const known = memory.callerAccounts?.[caller];
+  return !known?.accounts.length || Date.now() - Date.parse(known.at) > ACCOUNT_LIST_MAX_AGE_MS;
+}
+
+/**
+ * Splits the callers into the ones to search and backups. Each caller's
+ * order-list search covers every account it can see, so a caller whose
+ * accounts are all seen by the callers already picked adds nothing. Picks
+ * the caller that adds the most unseen accounts, then the next, and so on
+ * (ties go to the higher-ranked caller); the rest are backups, searched
+ * only if a picked caller fails. A caller whose account list is unknown or
+ * stale is always picked, so its list gets read. Both lists keep `ranked`'s
+ * order.
+ */
+export function planCallerCoverage(
+  memory: WebAgentMemory,
+  ranked: readonly string[],
+): { search: string[]; backup: string[] } {
+  const picked = new Set(ranked.filter((c) => accountListIsStale(memory, c)));
+  const seen = new Set<string>();
+  let candidates = ranked.filter((c) => !picked.has(c));
+  for (;;) {
+    let best: string | null = null;
+    let bestGain = 0;
+    for (const c of candidates) {
+      const gain = (memory.callerAccounts?.[c]?.accounts ?? []).filter((a) => !seen.has(a)).length;
+      if (gain > bestGain) {
+        best = c;
+        bestGain = gain;
+      }
+    }
+    if (!best) break;
+    picked.add(best);
+    for (const a of memory.callerAccounts?.[best]?.accounts ?? []) seen.add(a);
+    candidates = candidates.filter((c) => c !== best);
+  }
+  return { search: ranked.filter((c) => picked.has(c)), backup: ranked.filter((c) => !picked.has(c)) };
+}
+
 // --- Recording -------------------------------------------------------------------
 
 function bump(arm: Arm | undefined, hit: boolean, ms: number): Arm {
@@ -514,6 +571,8 @@ export async function recordEpisode(params: {
   explored?: string[];
   /** The reference that was found and where, remembered for repeat lookups. */
   found?: { ref: string; caller: string; account: string | null };
+  /** Account lists read from the portal during this lookup, by caller. */
+  accounts?: Record<string, string[]>;
 }): Promise<void> {
   const memory = await loadMemory();
   const at = new Date().toISOString();
@@ -551,6 +610,10 @@ export async function recordEpisode(params: {
 
   if (memory.episodes.length > MAX_EPISODES) {
     memory.episodes.splice(0, memory.episodes.length - MAX_EPISODES);
+  }
+
+  for (const [caller, accounts] of Object.entries(params.accounts ?? {})) {
+    (memory.callerAccounts ??= {})[caller] = { accounts, at };
   }
 
   if (params.found) {

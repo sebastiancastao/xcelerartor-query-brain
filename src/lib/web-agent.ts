@@ -2,39 +2,42 @@
 // through the Xcelerator ClientPortal UI, instead of calling the Axis REST
 // API or the ClientPortal's JSON endpoints (see xcelerator.ts for those).
 //
-// Learning: which caller is likely to have the order, and which Quick Track
-// field each caller keeps it in, are learned from past lookups by the type
-// of reference number (see web-agent-memory.ts, a multi-armed bandit).
-// Searches run in code; the model is only used to read the order off the
-// screen once a search hits.
+// Learning: which caller is likely to have the order, which field each
+// caller keeps it in, which accounts each caller can see, and where each
+// reference was found are learned from past lookups (see
+// web-agent-memory.ts; the field order is a multi-armed bandit over the
+// reference's type). Searching and reading run in code, not the model.
 //
-// Flow per caller (XCELERATOR_CALLER_N_*, same list the API path uses;
-// callers run in parallel, a few at a time on Vercel, and when several have
-// the order, the caller ranked first for this type of reference wins; a
-// reference found before goes straight to the caller that had it):
-//  1. Launch headless Chromium (playwright-core): the installed Chrome/Edge
-//     locally, a bundled serverless Chromium on Vercel, or a hosted browser
-//     (see launchBrowser).
-//  2. Open the portal's Main page with a session this server already logged
-//     in with, or log in through the real login form when there is none or
-//     it expired. Logging in is deterministic code, never the model, so
-//     credentials never reach OpenAI.
-//  3. Search the portal's order list (the Tracking page's search, with "All
-//     Accounts") for the reference. A login can see several accounts (Seb2
-//     sees seven), but Quick Track only searches the one currently selected,
-//     so this is what finds, e.g., DHL Same Day orders under Seb2. On a hit,
-//     open the order window the way clicking the order in that list does
-//     (openOrderProperties with the row's key) and read it with code.
-//  4. When the list has nothing, fall back to the learned Quick Track plan
-//     for the other fields (ClientRefNo4, package refs), resetting the Quick
-//     Track window between searches instead of reloading the page.
-//  5. Only if a hit can't be read that way, hand the page to an OpenAI
-//     tool-calling loop. Each step the model sees a compact snapshot (URL,
-//     numbered clickable/typeable elements, visible text) and picks one
-//     action: quick_track, click, click_text, type, select_option, wait,
-//     report_order or give_up. Navigation is fenced to the portal's own
-//     origin. report_order's arguments are mapped into the same OrderInquiry
-//     shape the main page renders.
+// Which callers (XCELERATOR_CALLER_N_*, same list the API path uses): only
+// the ones that see an account no other picked caller sees (today Seb2 and
+// AIT; Seb2 also sees STRLN's and QUKIN's accounts, so those are backups,
+// searched only if a picked caller fails). They run in parallel, a few at a
+// time on Vercel; when several have the order, the caller ranked first for
+// this type of reference wins, and a reference found before goes to the
+// caller that had it, alone, first.
+//
+// Flow per caller:
+//  1. A page on the portal's Main page, logged in. Usually the caller's page
+//     left open by an earlier lookup on this server; otherwise a new one in
+//     headless Chromium (playwright-core: the installed Chrome/Edge locally,
+//     a bundled serverless Chromium on Vercel, or a hosted browser, see
+//     launchBrowser), on a saved session or through the real login form.
+//     Logging in is deterministic code, never the model, so credentials
+//     never reach OpenAI.
+//  2. Search the portal's order list (the Tracking page's search, with "All
+//     Accounts") for the reference, one field at a time in the learned
+//     order. A login can see several accounts (Seb2 sees seven), but Quick
+//     Track only searches the one currently selected, so this is what finds,
+//     e.g., DHL Same Day orders under Seb2. On a hit, open the order window
+//     the way clicking the order in that list does (openOrderProperties with
+//     the row's key) and read it with code.
+//  3. Only with WEB_AGENT_FREE_BROWSE, when every field missed, hand the page
+//     to an OpenAI tool-calling loop. Each step the model sees a compact
+//     snapshot (URL, numbered clickable/typeable elements, visible text) and
+//     picks one action: quick_track, click, click_text, type, select_option,
+//     wait, report_order or give_up. Navigation is fenced to the portal's
+//     own origin. report_order's arguments are mapped into the same
+//     OrderInquiry shape the main page renders.
 //
 // Token choices: only the latest snapshot is ever sent (older ones are
 // replaced by a one-line action log), visible text is capped, and the
@@ -54,7 +57,9 @@ import {
 } from "./xcelerator";
 import { firstHitInPriorityOrder } from "./ordered-first-match";
 import {
+  accountListIsStale,
   loadMemory,
+  planCallerCoverage,
   planSearches,
   rankCallers,
   recordEpisode,
@@ -62,7 +67,6 @@ import {
   rememberedPlace,
   type CallerOutcome as CallerAnswer,
   type Place,
-  type RankedCaller,
   type ReferenceContext,
   type SearchAttempt,
   type WebAgentMemory,
@@ -83,6 +87,12 @@ export type WebAgentResult = {
   orderTrackingId: string | null;
   steps: WebAgentStep[];
   warning?: string;
+  /**
+   * Callers still finishing their current step after the answer was settled.
+   * The route keeps the function alive for it (next/server's after), so
+   * their pages are handed back open for the next lookup.
+   */
+  background?: Promise<void>;
 };
 
 export class WebAgentError extends Error {
@@ -97,10 +107,6 @@ export class WebAgentError extends Error {
 }
 
 const MAX_STEPS = Number(process.env.WEB_AGENT_MAX_STEPS) || 15;
-/** Model steps allowed to read an order once a search has found it. */
-const READ_MAX_STEPS = 6;
-/** How many learned track-by fields each caller tries before giving up. */
-const MAX_SEARCHES = Number(process.env.WEB_AGENT_MAX_SEARCHES) || 3;
 /** Let the model browse freely when every learned search misses (slow). */
 const FREE_BROWSE_FALLBACK = process.env.WEB_AGENT_FREE_BROWSE === "true";
 const MAX_ELEMENTS = 90;
@@ -208,9 +214,10 @@ function instanceMemoryMb(): number {
  * How many callers this server searches at once, across every lookup in
  * flight. On Vercel each running caller is a whole Chromium, and fluid
  * compute can run several lookups on one instance, so the other callers wait
- * their turn, likeliest caller first. The lookup route gets a 3 GB instance
- * (vercel.json), room for four; on the standard 2 GB one, two at a time kept
- * it from running out of memory (2026-09-28).
+ * their turn, likeliest caller first. On the standard 2 GB instance, two at
+ * a time kept it from running out of memory (2026-09-28); the project's
+ * "Function CPU" setting decides the size (a `memory` value in vercel.json
+ * is ignored under Active CPU billing, per the build log 2026-09-29).
  */
 const MAX_PARALLEL_CALLERS =
   Number(process.env.WEB_AGENT_MAX_PARALLEL) ||
@@ -340,15 +347,15 @@ type SessionState = Awaited<ReturnType<BrowserContext["storageState"]>>;
 
 /** How long a saved portal session is reused after it was last used. */
 const SESSION_IDLE_MS = Number(process.env.WEB_AGENT_SESSION_IDLE_MS) || 15 * 60_000;
-/** Saved sessions kept per caller: about one per lookup that ran at the same time. */
+/** Saved sessions kept per caller. */
 const MAX_SAVED_SESSIONS = 4;
 
 /**
- * Portal sessions this server has logged in with, kept between lookups so a
- * lookup skips the ~6 s login. Only the cookies are kept, in this process's
- * memory (never stored anywhere), not an open browser. A lookup takes one
- * out for itself and puts it back when done, so two lookups never share a
- * session: the portal keeps each session's selected account on its side.
+ * Cookies of portal sessions this server logged in with, for when an open
+ * page (below) isn't available: a new page with them skips the ~5 s login.
+ * Kept in this process's memory only, never stored anywhere. A page's
+ * cookies go here when the page is closed, not while it is open, so two
+ * lookups never share a session at the same time.
  */
 const savedSessions = new Map<string, { state: SessionState; savedAt: number }[]>();
 
@@ -362,11 +369,153 @@ function takeSavedSession(caller: string): SessionState | null {
   return null;
 }
 
-function keepSession(caller: string, state: SessionState): void {
+function keepSession(caller: string, state: SessionState, lastUsed: number): void {
   const list = savedSessions.get(caller) ?? [];
-  list.push({ state, savedAt: Date.now() });
+  list.push({ state, savedAt: lastUsed });
+  list.sort((a, b) => a.savedAt - b.savedAt);
   if (list.length > MAX_SAVED_SESSIONS) list.splice(0, list.length - MAX_SAVED_SESSIONS);
   savedSessions.set(caller, list);
+}
+
+// --- Open pages kept between lookups ---------------------------------------------
+
+/**
+ * One caller's logged-in portal page, left open on Main between lookups so
+ * the next lookup skips starting a browser and loading the portal (about
+ * 1.5 s on Vercel). On Vercel each page has its own browser (see
+ * browserPerCaller); elsewhere pages share one browser.
+ */
+type Workspace = {
+  caller: string;
+  browser: Browser;
+  /** True when this page launched its own browser, which closes with it. */
+  ownsBrowser: boolean;
+  context: BrowserContext;
+  page: Page;
+  lastUsed: number;
+};
+
+/** Open pages idle longer than this are closed (their cookies are kept a while longer). */
+const PAGE_IDLE_MS = Number(process.env.WEB_AGENT_PAGE_IDLE_MS) || 10 * 60_000;
+/** Open pages waiting per caller; lookups running at the same time may open more, which close afterwards. */
+const MAX_IDLE_PAGES_PER_CALLER = 1;
+/**
+ * Most pages (in use or waiting) at once. On Vercel each is a whole
+ * Chromium on a 2 GB instance, where more than two browsers at a time ran
+ * out of memory (2026-09-28): at most MAX_PARALLEL_CALLERS are in use, plus
+ * one waiting.
+ */
+const MAX_OPEN_PAGES =
+  Number(process.env.WEB_AGENT_MAX_OPEN_PAGES) || (browserPerCaller() ? MAX_PARALLEL_CALLERS + 1 : 8);
+
+const idlePages: Workspace[] = [];
+let openPages = 0;
+let sweeper: ReturnType<typeof setInterval> | null = null;
+
+/** The browser pages share when they don't each get their own (locally, or a hosted browser). */
+let sharedBrowser: Promise<Browser> | null = null;
+
+function getSharedBrowser(): Promise<Browser> {
+  sharedBrowser ??= launchBrowser().then(
+    (browser) => {
+      browser.on("disconnected", () => {
+        sharedBrowser = null;
+      });
+      return browser;
+    },
+    (err: unknown) => {
+      sharedBrowser = null;
+      throw err;
+    },
+  );
+  return sharedBrowser;
+}
+
+function isAlive(ws: Workspace): boolean {
+  return ws.browser.isConnected() && !ws.page.isClosed();
+}
+
+/** Closes a page. `keepCookies` saves its session for a later page when it was working. */
+async function closeWorkspace(ws: Workspace, keepCookies: boolean): Promise<void> {
+  openPages--;
+  if (keepCookies && isAlive(ws)) {
+    const state = await ws.context.storageState().catch(() => null);
+    if (state) keepSession(ws.caller, state, ws.lastUsed);
+  }
+  await ws.context.close().catch(() => {});
+  if (ws.ownsBrowser) await ws.browser.close().catch(() => {});
+}
+
+function removeIdle(ws: Workspace): void {
+  const i = idlePages.indexOf(ws);
+  if (i >= 0) idlePages.splice(i, 1);
+}
+
+/** This caller's waiting page, if it is still usable. */
+function takeIdlePage(caller: string): Workspace | null {
+  for (let i = idlePages.length - 1; i >= 0; i--) {
+    const ws = idlePages[i];
+    if (ws.caller !== caller) continue;
+    idlePages.splice(i, 1);
+    if (isAlive(ws) && Date.now() - ws.lastUsed < PAGE_IDLE_MS) return ws;
+    void closeWorkspace(ws, false);
+  }
+  return null;
+}
+
+/**
+ * A new page for this caller, not yet on the portal. Closes the longest-idle
+ * waiting page first when the limit is reached. `savedSession` says whether
+ * it starts with a saved session's cookies.
+ */
+async function openWorkspace(caller: string): Promise<{ ws: Workspace; savedSession: boolean }> {
+  while (openPages >= MAX_OPEN_PAGES && idlePages.length) {
+    const oldest = idlePages.reduce((a, b) => (a.lastUsed <= b.lastUsed ? a : b));
+    removeIdle(oldest);
+    await closeWorkspace(oldest, true);
+  }
+  openPages++;
+  let browser: Browser | null = null;
+  const ownsBrowser = browserPerCaller();
+  try {
+    browser = ownsBrowser ? await launchBrowser() : await getSharedBrowser();
+    const saved = takeSavedSession(caller);
+    const context = await browser.newContext({
+      viewport: { width: 1366, height: 900 },
+      ...(saved ? { storageState: saved } : {}),
+    });
+    await prepareContext(context);
+    const page = await context.newPage();
+    page.setDefaultTimeout(ACTION_TIMEOUT_MS);
+    return { ws: { caller, browser, ownsBrowser, context, page, lastUsed: Date.now() }, savedSession: saved !== null };
+  } catch (err) {
+    openPages--;
+    if (ownsBrowser) await browser?.close().catch(() => {});
+    throw err;
+  }
+}
+
+/** Hands a page back after a lookup: kept open for the next one when it worked, else closed. */
+async function releaseWorkspace(ws: Workspace, working: boolean): Promise<void> {
+  if (!working || !isAlive(ws)) {
+    await closeWorkspace(ws, false);
+    return;
+  }
+  ws.lastUsed = Date.now();
+  idlePages.push(ws);
+  const waiting = idlePages.filter((w) => w.caller === ws.caller);
+  for (const extra of waiting.slice(0, Math.max(0, waiting.length - MAX_IDLE_PAGES_PER_CALLER))) {
+    removeIdle(extra);
+    await closeWorkspace(extra, true);
+  }
+  sweeper ??= setInterval(() => {
+    for (const idle of [...idlePages]) {
+      if (Date.now() - idle.lastUsed < PAGE_IDLE_MS && isAlive(idle)) continue;
+      removeIdle(idle);
+      void closeWorkspace(idle, true);
+    }
+  }, 60_000);
+  sweeper.unref?.();
 }
 
 // --- Portal pages ----------------------------------------------------------------
@@ -693,50 +842,32 @@ type OrderListRow = PortalOrderListRow & { Key?: string | null };
 /** Xcelerator's own order ids look like 105.031826: a sequence number, then the date as MMDDYY. */
 const TRACKING_ID = /^\d+\.\d{6}$/;
 
-/** Learning label for the order-list search, kept next to the Quick Track fields' stats. */
-const ORDER_LIST = "OrderList";
+/**
+ * How each field is searched in the order list: ClientRefNo and the tracking
+ * id have filter boxes of their own; the rest go through the Tracking
+ * page's "wildcard" field picker, which matches the whole value unless it
+ * contains a % (confirmed for ClientRefNo4 2026-09-29).
+ */
+const LIST_FILTERS: Record<(typeof TRACK_BY_OPTIONS)[number], { box: "ClientRefNo" | "OrderTrackingID" } | { wildcard: string }> = {
+  ClientRefNo: { box: "ClientRefNo" },
+  OrderTrackingID: { box: "OrderTrackingID" },
+  ClientRefNo4: { wildcard: "o.ClientRefNo4" },
+  PackageRefNo: { wildcard: "opi.RefNo" },
+  PackageRefNo2: { wildcard: "opi.RefNo2" },
+  PackageRefNo3: { wildcard: "opi.RefNo3" },
+  PackageRefNo4: { wildcard: "opi.RefNo4" },
+};
 
-function trackingIdText(value: number | string | null | undefined): string | null {
-  if (typeof value === "number") return value.toFixed(6);
-  return value?.toString().trim() || null;
+/** The portal answered a logged-in request with its login page: this page's session ended. */
+class SessionEndedError extends Error {
+  constructor() {
+    super("the portal session ended");
+    this.name = "SessionEndedError";
+  }
 }
 
-/**
- * Searches the portal's order list the way its Tracking page does with
- * "All Accounts" picked: one request, run inside the logged-in page so it
- * goes out with this caller's session. It covers every account the caller
- * can see, while Quick Track only covers the selected one (2026-09-29:
- * Seb2's Quick Track missed every DHL Same Day order this finds in about a
- * quarter of a second). It matches the whole value, not a prefix, and the
- * blank dates mean every date.
- */
-async function searchOrderList(
-  page: Page,
-  portalBaseUrl: string,
-  filter: { ClientRefNo?: string; OrderTrackingID?: string },
-): Promise<OrderListRow[]> {
-  const params = new URLSearchParams({
-    ServiceIDs: "0",
-    VehicleIDs: "0",
-    PackageIDs: "0",
-    ClientIDs: "0", // "All Accounts"; -1 would be only the selected account
-    Status: "-1", // every status
-    OrderTrackingID: filter.OrderTrackingID ?? "",
-    ClientRefNo: filter.ClientRefNo ?? "",
-    ClientRefNo2: "",
-    Caller: "",
-    PickupCompany: "",
-    DeliveryCompany: "",
-    oDate_From: "",
-    oDate_To: "",
-    PickupTargetDateStart: "",
-    PickupTargetDateEnd: "",
-    DeliveryTargetDateStart: "",
-    DeliveryTargetDateEnd: "",
-    WildCardField: "",
-    WildCardValue: "",
-  });
-  const url = `${portalBaseUrl}/ClientPortal/ClientPortal/api/trackingOnline/getorders?${params}`;
+/** A GET to the portal's JSON API from inside the logged-in page, so it carries that page's session. */
+async function portalGet<T>(page: Page, url: string, what: string): Promise<T> {
   const res = await page.evaluate(
     async ({ url, timeoutMs }) => {
       const controller = new AbortController();
@@ -756,28 +887,112 @@ async function searchOrderList(
     },
     { url, timeoutMs: 20_000 },
   );
+  // With the session gone the portal answers its API with 401 (seen when the
+  // cookies were cleared), or with a redirect to its login page, which
+  // comes back as HTML.
+  if (res.status === 401) throw new SessionEndedError();
   if (res.status !== 200) {
-    throw new Error(`the order list search failed (${res.status ? `HTTP ${res.status}` : res.text.slice(0, 120)})`);
+    throw new Error(`the ${what} failed (${res.status ? `HTTP ${res.status}` : res.text.slice(0, 120)})`);
   }
-  let body: { Data?: OrderListRow[] | null; Error?: string | null };
   try {
-    body = JSON.parse(res.text);
+    return JSON.parse(res.text) as T;
   } catch {
-    throw new Error("the order list search did not return data; the portal session may have ended");
+    if (/loginForm/i.test(res.text)) throw new SessionEndedError();
+    throw new Error(`the ${what} did not return data`);
   }
+}
+
+/**
+ * The fields to search, best first comes later from the learning. The tracking
+ * id is only worth searching for references shaped like one (105.031826).
+ */
+export function listFieldsFor(referenceNumber: string): string[] {
+  const looksLikeTrackingId = TRACKING_ID.test(referenceNumber.trim());
+  return TRACK_BY_OPTIONS.filter((f) => f !== "OrderTrackingID" || looksLikeTrackingId);
+}
+
+/** The account codes this page's login can see, from the portal's own account list. */
+async function readAccounts(page: Page, portalBaseUrl: string): Promise<string[]> {
+  const body = await portalGet<{ Data?: { Value?: number; Text?: string }[] | null }>(
+    page,
+    `${portalBaseUrl}/ClientPortal/ClientPortal/api/onlineaccess/GetAccounts`,
+    "account list",
+  );
+  // Value -1 is "Current Acct." and 0 is "*All Accounts"; the rest are the accounts, e.g. "DHL Same Day[DHLIN]".
+  const codes = (body.Data ?? [])
+    .filter((a) => (a.Value ?? 0) > 0)
+    .map((a) => a.Text?.match(/\[([^\]]+)\]\s*$/)?.[1]?.trim().toUpperCase())
+    .filter((c): c is string => Boolean(c));
+  return [...new Set(codes)].sort();
+}
+
+function trackingIdText(value: number | string | null | undefined): string | null {
+  if (typeof value === "number") return value.toFixed(6);
+  return value?.toString().trim() || null;
+}
+
+/**
+ * Searches the portal's order list the way its Tracking page does with
+ * "All Accounts" picked: one request, run inside the logged-in page so it
+ * goes out with this caller's session. It covers every account the caller
+ * can see, while Quick Track only covers the selected one (2026-09-29:
+ * Seb2's Quick Track missed every DHL Same Day order this finds in about a
+ * quarter of a second). It matches the whole value, not a prefix, and the
+ * blank dates mean every date.
+ */
+async function searchOrderList(
+  page: Page,
+  portalBaseUrl: string,
+  field: string,
+  value: string,
+): Promise<OrderListRow[]> {
+  const filter = LIST_FILTERS[field as keyof typeof LIST_FILTERS] ?? LIST_FILTERS.ClientRefNo;
+  const params = new URLSearchParams({
+    ServiceIDs: "0",
+    VehicleIDs: "0",
+    PackageIDs: "0",
+    ClientIDs: "0", // "All Accounts"; -1 would be only the selected account
+    Status: "-1", // every status
+    OrderTrackingID: "box" in filter && filter.box === "OrderTrackingID" ? value : "",
+    ClientRefNo: "box" in filter && filter.box === "ClientRefNo" ? value : "",
+    ClientRefNo2: "",
+    Caller: "",
+    PickupCompany: "",
+    DeliveryCompany: "",
+    oDate_From: "",
+    oDate_To: "",
+    PickupTargetDateStart: "",
+    PickupTargetDateEnd: "",
+    DeliveryTargetDateStart: "",
+    DeliveryTargetDateEnd: "",
+    WildCardField: "wildcard" in filter ? filter.wildcard : "",
+    WildCardValue: "wildcard" in filter ? value : "",
+  });
+  const body = await portalGet<{ Data?: OrderListRow[] | null; Error?: string | null }>(
+    page,
+    `${portalBaseUrl}/ClientPortal/ClientPortal/api/trackingOnline/getorders?${params}`,
+    "order list search",
+  );
   if (body.Error) throw new Error(`the order list search failed: ${body.Error}`);
   return body.Data ?? [];
 }
 
 /**
- * The row for this reference. A reference can be reused (a daily "3am Mail
- * Run", say), so an exact match wins and, among several, the newest pickup.
+ * The row for this reference. A value can be shared (a daily "3am Mail Run",
+ * or a ClientRefNo4 that four DHL orders had), so an exact match on the
+ * searched field wins and, among several, the newest pickup.
  */
-function pickListRow(rows: OrderListRow[], referenceNumber: string): OrderListRow | null {
+function pickListRow(rows: OrderListRow[], field: string, referenceNumber: string): OrderListRow | null {
   const want = referenceNumber.trim().toUpperCase();
-  const exact = rows.filter(
-    (r) => (r.ClientRefNo ?? "").trim().toUpperCase() === want || trackingIdText(r.OrderTrackingID) === want,
-  );
+  const column = (r: OrderListRow): string | null =>
+    field === "OrderTrackingID"
+      ? trackingIdText(r.OrderTrackingID)
+      : field === "ClientRefNo"
+        ? r.ClientRefNo
+        : field === "ClientRefNo4"
+          ? r.ClientRefNo4
+          : null;
+  const exact = rows.filter((r) => (column(r) ?? "").trim().toUpperCase() === want);
   const pool = exact.length ? exact : rows;
   return [...pool].sort((a, b) => (b.PickupTargetFrom ?? "").localeCompare(a.PickupTargetFrom ?? ""))[0] ?? null;
 }
@@ -1376,133 +1591,136 @@ async function agentLoop(
 
 // --- Per-caller search ------------------------------------------------------------
 
-type CallerHit = ListHit & { attempts: SearchAttempt[] };
+type CallerHit = ListHit & {
+  attempts: SearchAttempt[];
+  /** Said to the CSR with the result, e.g. that several orders share this reference. */
+  note?: string;
+};
+
+/**
+ * Leaves an open page from an earlier lookup ready for a new search: on
+ * Main, with no order window or Quick Track result left open. Loads Main
+ * only if the page wandered somewhere else.
+ */
+async function resetOpenPage(page: Page, portalBaseUrl: string): Promise<void> {
+  if (!/\/ClientPortal\/ClientPortal\/Main$/i.test(new URL(page.url()).pathname)) {
+    await openPortalPage(page, mainPageUrl(portalBaseUrl), "main page");
+    return;
+  }
+  await page
+    .evaluate(() => {
+      const w = window as unknown as Record<string, unknown>;
+      const popup = document.querySelector<HTMLElement>("#orderdetailspopup");
+      if (popup && getComputedStyle(popup).display !== "none" && typeof w.closeOrderProperties === "function") {
+        (w.closeOrderProperties as () => void)();
+      }
+      if (typeof w.closeQTResults === "function") (w.closeQTResults as () => void)();
+    })
+    .catch(() => {});
+}
 
 /**
  * One caller's search, all in code (no model calls):
- *  1. Main page on a saved session, or a fresh login.
- *  2. The order list, across every account this caller can see. A hit is
- *     opened and read like clicking it in the portal's order list.
- *  3. Otherwise the learned Quick Track plan for the other fields, with no
- *     page reload between searches. A Quick Track hit that only shows the
- *     small result box is opened in full by its tracking id.
- * Only a hit that can't be read either way goes to the model.
+ *  1. A page on the portal: the caller's page left open by an earlier
+ *     lookup, else a new one on a saved session or a fresh login.
+ *  2. Its account list, when the learning doesn't know it or it is a day old.
+ *  3. The order list, every account this caller can see, one field at a
+ *     time in the learned order (about 0.1 s each), stopping at a hit. The
+ *     hit is opened and read like clicking it in the portal's order list.
+ * The model only comes in with WEB_AGENT_FREE_BROWSE, after every field missed.
  */
 async function searchCaller(
-  browser: Browser,
+  ws: Workspace,
+  /** null: a page left open by an earlier lookup; otherwise whether the new page has a saved session. */
+  savedSession: boolean | null,
   caller: NamedXceleratorCaller,
   referenceNumber: string,
-  plan: string[],
+  fields: string[],
+  readAccountList: boolean,
+  onAccounts: (accounts: string[]) => void,
   steps: WebAgentStep[],
   stop: { value: boolean },
 ): Promise<CallerHit | null> {
   const log = (action: string, detail?: string) => {
     if (!stop.value) steps.push({ caller: caller.label, action, detail });
   };
-  const saved = takeSavedSession(caller.label);
-  const context = await browser.newContext({
-    viewport: { width: 1366, height: 900 },
-    ...(saved ? { storageState: saved } : {}),
-  });
-  await prepareContext(context);
-  const page = await context.newPage();
-  page.setDefaultTimeout(ACTION_TIMEOUT_MS);
-  // The session is put back for the next lookup only once it has proven to
-  // work. Captured early too, since the browser may already be closing by
-  // the time this caller finishes (a higher-ranked caller won).
-  let workingSession: SessionState | null = null;
+  const page = ws.page;
+  const base = caller.cfg.portalBaseUrl;
+  const ref = referenceNumber.trim();
 
-  try {
-    await openSession(page, caller, saved !== null, log);
-    const base = caller.cfg.portalBaseUrl;
-    const ref = referenceNumber.trim();
-    const attempts: SearchAttempt[] = [];
-
-    if (stop.value) return null;
-    const listStarted = Date.now();
-    const rows = await searchOrderList(page, base, TRACKING_ID.test(ref) ? { OrderTrackingID: ref } : { ClientRefNo: ref });
-    const listMs = Date.now() - listStarted;
-    workingSession = await context.storageState().catch(() => null);
-    const row = pickListRow(rows, ref);
-    attempts.push({ trackBy: ORDER_LIST, hit: row !== null, ms: listMs });
-    if (row) {
-      const shared = rows.length > 1 ? `; ${rows.length} orders use this reference, reading the newest` : "";
-      log("order list", `found in account ${row.AccountNo?.trim() || "?"} (${listMs} ms${shared})`);
-      return { ...(await readListHit(page, row, referenceNumber, log)), attempts };
-    }
-    log("order list", `not in any account ${caller.label} can see (${listMs} ms)`);
-
-    for (const trackBy of plan) {
-      if (stop.value) return null;
-      const started = Date.now();
-      const result = await quickTrack(page, base, trackBy, referenceNumber);
-      const ms = Date.now() - started;
-      attempts.push({ trackBy, hit: result.found, ms });
-      log("quick track", `${trackBy} = "${referenceNumber}" ${result.found ? "HIT" : "miss"} (${ms} ms)`);
-      if (!result.found) continue;
-
-      // Usual case: the order window opened; read its labelled fields directly.
-      const window = await readOrderWindowFields(page);
-      if (window) {
-        const order = orderFromWindow(window, referenceNumber);
-        const orderTrackingId = window.fields.OrderTrackingID2 || window.fields.OrderTrackingID || null;
-        log("read order", `${orderTrackingId ?? order.referenceNumber}: ${order.status.replace("_", " ")}`);
-        return { order, orderTrackingId, account: null, attempts };
-      }
-
-      // Only the small result box showed: open the full order by the tracking id it shows.
-      const shownId = ((await page.locator("#QT_OrderTrackingID").textContent().catch(() => null)) ?? "").trim();
-      if (TRACKING_ID.test(shownId)) {
-        const byId = pickListRow(await searchOrderList(page, base, { OrderTrackingID: shownId }), shownId);
-        if (byId) return { ...(await readListHit(page, byId, referenceNumber, log)), attempts };
-      }
-
-      // Otherwise let the model look around the result screen.
-      if (!isOpenAIConfigured()) throw new Error("Found the order but the result screen was not the usual order window.");
-      const read = await agentLoop(page, caller, referenceNumber, log, {
-        goal:
-          "A Quick Track search already found this order and its result is on screen. " +
-          "Read its details and call report_order. Open the order's details only if the result lacks " +
-          "pickup/delivery/POD/charges information.",
-        history: [`quick_track ${trackBy} = "${referenceNumber}" -> result shown`],
-        maxSteps: READ_MAX_STEPS,
-      });
-      if (read.kind === "found") {
-        return { order: read.order, orderTrackingId: read.orderTrackingId, account: null, attempts };
-      }
-      throw new Error(`Quick Track found the order but it could not be read: ${read.reason}`);
-    }
-
-    if (FREE_BROWSE_FALLBACK && isOpenAIConfigured() && !stop.value) {
-      log("free browse", "Learned searches missed; letting the model explore");
-      const outcome = await agentLoop(page, caller, referenceNumber, log, {
-        goal: "Find this order in the portal and read its pickup, delivery, POD and charges details.",
-        history: [
-          `order list search (all accounts) for "${referenceNumber}" -> nothing`,
-          ...plan.map((t) => `quick_track ${t} = "${referenceNumber}" -> [Not Found]`),
-        ],
-        maxSteps: MAX_STEPS,
-      });
-      if (outcome.kind === "found") {
-        return { order: outcome.order, orderTrackingId: outcome.orderTrackingId, account: null, attempts };
-      }
-    }
-    return null;
-  } finally {
-    if (workingSession) keepSession(caller.label, (await context.storageState().catch(() => null)) ?? workingSession);
-    await context.close().catch(() => {});
+  const started = Date.now();
+  if (savedSession === null) {
+    await resetOpenPage(page, base);
+    log("reused open page", `${Date.now() - started} ms`);
+  } else {
+    await openSession(page, caller, savedSession, log);
   }
-}
 
-/**
- * The Quick Track fields worth trying for a reference. Quick Track only runs
- * after the order list missed, so it skips the field the list already
- * searched in every account at once: the tracking id for references shaped
- * like one (105.031826), ClientRefNo for everything else.
- */
-export function quickTrackFieldsFor(referenceNumber: string): string[] {
-  const listed = TRACKING_ID.test(referenceNumber.trim()) ? "OrderTrackingID" : "ClientRefNo";
-  return TRACK_BY_OPTIONS.filter((f) => f !== listed);
+  // A session can end while its page waits open; the portal then refuses
+  // its API. Log in again on the same page and retry once.
+  let reloginMs = 0;
+  const withSession = async <T>(work: () => Promise<T>): Promise<T> => {
+    try {
+      return await work();
+    } catch (err) {
+      if (!(err instanceof SessionEndedError)) throw err;
+      log("session expired", "logging in again");
+      const loginStarted = Date.now();
+      await loginViaUi(page, caller);
+      reloginMs += Date.now() - loginStarted;
+      log("logged in", `${Date.now() - loginStarted} ms`);
+      return work();
+    }
+  };
+
+  if (readAccountList && !stop.value) {
+    const accounts = await withSession(() => readAccounts(page, base)).catch(() => null);
+    if (accounts?.length) {
+      onAccounts(accounts);
+      log("accounts", accounts.join(", "));
+    }
+  }
+
+  const attempts: SearchAttempt[] = [];
+  const listStarted = Date.now();
+  for (const field of fields) {
+    if (stop.value) return null;
+    const fieldStarted = Date.now();
+    const loginBefore = reloginMs;
+    const rows = await withSession(() => searchOrderList(page, base, field, ref));
+    const row = pickListRow(rows, field, ref);
+    const ms = Date.now() - fieldStarted - (reloginMs - loginBefore);
+    attempts.push({ trackBy: field, hit: row !== null, ms });
+    if (!row) continue;
+    const shared = rows.length > 1;
+    log("order list", `found by ${field} in account ${row.AccountNo?.trim() || "?"} (${ms} ms)`);
+    const hit = await readListHit(page, row, referenceNumber, log);
+    return {
+      ...hit,
+      attempts,
+      note: shared
+        ? `${rows.length} orders have ${field} "${ref}"; this is the newest (${hit.orderTrackingId ?? "?"}).`
+        : undefined,
+    };
+  }
+  log(
+    "order list",
+    `not found by ${fields.join(", ")} in any account ${caller.label} can see ` +
+      `(${Date.now() - listStarted - reloginMs} ms)`,
+  );
+
+  if (FREE_BROWSE_FALLBACK && isOpenAIConfigured() && !stop.value) {
+    log("free browse", "The order list had nothing; letting the model explore");
+    const outcome = await agentLoop(page, caller, referenceNumber, log, {
+      goal: "Find this order in the portal and read its pickup, delivery, POD and charges details.",
+      history: [`order list search (all accounts) by ${fields.join(", ")} for "${referenceNumber}" -> nothing`],
+      maxSteps: MAX_STEPS,
+    });
+    if (outcome.kind === "found") {
+      return { order: outcome.order, orderTrackingId: outcome.orderTrackingId, account: null, attempts };
+    }
+  }
+  return null;
 }
 
 export function isWebAgentConfigured(): boolean {
@@ -1513,31 +1731,42 @@ export function isWebAgentConfigured(): boolean {
 function describePlan(
   context: ReferenceContext,
   memory: WebAgentMemory,
-  ranked: RankedCaller[],
-  plans: { plan: string[]; explored: string | null }[],
+  searching: string[],
+  backup: string[],
+  fields: Map<string, string[]>,
   place: Place | null,
 ): string {
   const type = context.taxonomy === context.shape ? context.shape : `${context.taxonomy} (shape ${context.shape})`;
-  const order = ranked.map((r) => (r.tries ? `${r.caller} (had it ${r.hits} of ${r.tries})` : r.caller)).join(", ");
-  const fields = plans.map((p) => p.plan.join(", "));
-  const searching = fields.every((f) => f === fields[0])
-    ? fields[0]
-    : ranked.map((r, i) => `${r.caller}: ${fields[i]}`).join("; ");
-  const explored = [...new Set(plans.flatMap((p) => (p.explored ? [p.explored] : [])))];
-  const finds = Object.values(memory.typeCallers?.[context.taxonomy] ?? {}).reduce((sum, a) => sum + a.hits, 0);
+  const names = (list: string[]) =>
+    list.length <= 1 ? list.join("") : `${list.slice(0, -1).join(", ")} and ${list[list.length - 1]}`;
   const before = place
     ? `Found under ${place.caller}${place.account ? ` (account ${place.account})` : ""} before, so ${place.caller} ` +
       `goes first and the others wait for it. `
     : "";
+  const who =
+    `Searching ${names(searching)}` +
+    (backup.length ? `, which between them see every account; ${names(backup)} only if one of them fails` : "");
+  const plans = searching.map((c) => (fields.get(c) ?? []).join(", "));
+  const order = plans.every((p) => p === plans[0])
+    ? plans[0]
+    : searching.map((c, i) => `${c}: ${plans[i]}`).join("; ");
+  const finds = Object.values(memory.typeCallers?.[context.taxonomy] ?? {}).reduce((sum, a) => sum + a.hits, 0);
   return (
-    `${before}Reference type ${type}. Caller order: ${order}. Each caller searches the order list across all its ` +
-    `accounts, then Quick Track ${searching}` +
-    (explored.length ? ` (exploring ${explored.join(", ")})` : "") +
+    `${before}Reference type ${type}. ${who}. Order list fields, in order: ${order}` +
     (finds
       ? `. Learned from ${finds} past ${finds === 1 ? "find" : "finds"} of this type.`
       : ". No finds of this type yet, so using similar references.")
   );
 }
+
+type PassResult = {
+  callers: NamedXceleratorCaller[];
+  winner: { caller: string; hit: CallerHit } | null;
+  failures: string[];
+  errors: unknown[];
+  /** What each caller had answered when the winner was settled. */
+  settled: CallerAnswer[];
+};
 
 export async function findOrderWithWebAgent(referenceNumber: string): Promise<WebAgentResult> {
   const steps: WebAgentStep[] = [];
@@ -1545,118 +1774,156 @@ export async function findOrderWithWebAgent(referenceNumber: string): Promise<We
   if (configured.length === 0) {
     throw new WebAgentError("No Xcelerator caller is configured. Set XCELERATOR_CALLER_1_USERNAME and _PASSWORD.", 503);
   }
+  const byLabel = new Map(configured.map((c) => [c.label, c]));
 
-  // Learned plan. The reference's type (its shape plus any short letter code,
-  // like the M in 212620423M) decides which caller most likely has it, so that
-  // caller goes first, and each caller gets its own field order for that type.
-  // A reference found before goes to the caller that had it, ahead of the
-  // learned order, and the other callers only start if that one misses.
+  // Who to search. Each caller's order-list search covers every account it
+  // can see, so only callers that see something the others don't are
+  // searched (today Seb2 and AIT: Seb2 also sees STRLN's and QUKIN's
+  // accounts); the rest are backups. The learned order for this type of
+  // reference (its shape plus any letter code, like the M in 212620423M)
+  // decides who goes first, and a reference found before goes to the caller
+  // that had it, alone, before anyone else.
   const context = referenceContext(referenceNumber);
   const memory = await loadMemory();
-  const learned = rankCallers(memory, context, configured.map((c) => c.label));
+  const ranked = rankCallers(memory, context, configured.map((c) => c.label)).map((r) => r.caller);
+  const coverage = planCallerCoverage(memory, ranked);
   const known = rememberedPlace(memory, referenceNumber);
-  const knownRank = known ? learned.findIndex((r) => r.caller === known.caller) : -1;
-  const ranked = knownRank > 0 ? [learned[knownRank], ...learned.filter((_, i) => i !== knownRank)] : learned;
-  const place = knownRank >= 0 ? known : null;
-  const callers = ranked.map((r) => configured[r.index]);
-  const quickTrackFields = quickTrackFieldsFor(referenceNumber);
-  const roll = Math.random(); // one exploration draw per lookup, shared by every caller
-  const plans = callers.map((c) => planSearches(memory, context, quickTrackFields, MAX_SEARCHES, c.label, () => roll));
-  steps.push({ caller: "planner", action: "plan", detail: describePlan(context, memory, ranked, plans, place) });
-  let firstCallerDone: () => void = () => {};
-  const knownCallerAnswered = place ? new Promise<void>((resolve) => (firstCallerDone = resolve)) : null;
+  const place = known && byLabel.has(known.caller) ? known : null;
+  const firstPass = place ? [place.caller, ...coverage.search.filter((c) => c !== place.caller)] : coverage.search;
+  const backups = coverage.backup.filter((c) => !firstPass.includes(c));
 
-  // Callers start in ranked order, as many at once as this server allows
-  // (all of them locally, MAX_PARALLEL_CALLERS on Vercel). A hit is accepted
-  // once every caller ranked above it has answered, so the likeliest
-  // caller's hit comes back without waiting on the others, and a caller still
-  // waiting for its turn when a higher-ranked caller hits is never started.
-  const outcomes: CallerAnswer[] = callers.map((c) => ({ caller: c.label, found: null, attempts: [] }));
-  const errors: unknown[] = callers.map(() => null);
-  let settled: CallerAnswer[] = outcomes;
+  // Every field is searched (they cost about 0.1 s each), best first for this caller and type.
+  const fieldOptions = listFieldsFor(referenceNumber);
+  const fields = new Map(
+    configured.map((c) => [c.label, planSearches(memory, context, fieldOptions, fieldOptions.length, c.label).plan]),
+  );
+  steps.push({
+    caller: "planner",
+    action: "plan",
+    detail: describePlan(context, memory, firstPass, backups, fields, place),
+  });
+
   const stop = { value: false };
-  const ownBrowsers = browserPerCaller();
-  const shared = ownBrowsers ? null : await launchBrowser();
-  const openBrowsers = new Set<Browser>();
-  let bestHitRank = Number.POSITIVE_INFINITY;
+  const accountsRead: Record<string, string[]> = {};
+  const running: Promise<unknown>[] = [];
 
-  const runCaller = async (caller: NamedXceleratorCaller, rank: number): Promise<CallerHit | null | "skipped"> => {
-    if (rank > 0 && knownCallerAnswered) await knownCallerAnswered;
-    const queuedAt = Date.now();
-    const release = await callerSlots.acquire();
-    let own: Browser | null = null;
-    try {
-      if (stop.value || rank > bestHitRank) return "skipped";
-      const waited = Date.now() - queuedAt;
-      if (waited > 500) steps.push({ caller: caller.label, action: "waited", detail: `${waited} ms for a free browser` });
-      if (ownBrowsers) {
-        own = await launchBrowser();
-        openBrowsers.add(own);
-        if (stop.value) return "skipped";
-      }
-      const hit = await searchCaller((own ?? shared)!, caller, referenceNumber, plans[rank].plan, steps, stop);
-      if (hit) bestHitRank = Math.min(bestHitRank, rank);
-      return hit;
-    } finally {
-      if (own) {
-        openBrowsers.delete(own);
-        await own.close().catch(() => {});
-      }
-      release();
-      if (rank === 0) firstCallerDone();
-    }
-  };
+  // Callers start in the given order, as many at once as this server allows
+  // (MAX_PARALLEL_CALLERS). A hit is accepted once every caller before it has
+  // answered, and a caller still waiting for its turn when an earlier one
+  // hits is never started. Callers still busy when the answer is settled
+  // finish their current step in the background (see `background`) and hand
+  // their page back for the next lookup.
+  const runPass = async (labels: string[], firstGoesAlone: boolean): Promise<PassResult> => {
+    const callers = labels.map((l) => byLabel.get(l)!);
+    const outcomes: CallerAnswer[] = callers.map((c) => ({ caller: c.label, found: null, attempts: [] }));
+    const errors: unknown[] = callers.map(() => null);
+    let bestHitRank = Number.POSITIVE_INFINITY;
+    let firstDone: () => void = () => {};
+    const firstAnswered = firstGoesAlone ? new Promise<void>((resolve) => (firstDone = resolve)) : null;
 
-  let result;
-  try {
-    result = await firstHitInPriorityOrder(
-      callers.map((caller, i) =>
-        runCaller(caller, i).then(
-          (hit) => {
-            // Never searched, because a higher-ranked caller already hit: not a miss.
-            if (hit === "skipped") return null;
-            outcomes[i] = { caller: caller.label, found: hit !== null, attempts: hit?.attempts ?? [] };
-            return hit;
-          },
-          (err: unknown) => {
-            errors[i] = err;
-            throw err;
-          },
-        ),
+    const runCaller = async (caller: NamedXceleratorCaller, rank: number): Promise<CallerHit | null | "skipped"> => {
+      if (rank > 0 && firstAnswered) await firstAnswered;
+      const queuedAt = Date.now();
+      const release = await callerSlots.acquire();
+      let ws: Workspace | null = null;
+      let working = false;
+      try {
+        if (stop.value || rank > bestHitRank) return "skipped";
+        const waited = Date.now() - queuedAt;
+        if (waited > 500) steps.push({ caller: caller.label, action: "waited", detail: `${waited} ms for a free browser` });
+        let savedSession: boolean | null = null;
+        ws = takeIdlePage(caller.label);
+        if (!ws) ({ ws, savedSession } = await openWorkspace(caller.label));
+        const hit = await searchCaller(
+          ws,
+          savedSession,
+          caller,
+          referenceNumber,
+          fields.get(caller.label) ?? fieldOptions,
+          accountListIsStale(memory, caller.label),
+          (accounts) => (accountsRead[caller.label] = accounts),
+          steps,
+          stop,
+        );
+        working = true;
+        if (hit) bestHitRank = Math.min(bestHitRank, rank);
+        return hit;
+      } finally {
+        if (ws) await releaseWorkspace(ws, working);
+        release();
+        if (rank === 0) firstDone();
+      }
+    };
+
+    const promises = callers.map((caller, i) =>
+      runCaller(caller, i).then(
+        (hit) => {
+          // Never searched, because an earlier caller already hit: not a miss.
+          if (hit === "skipped") return null;
+          outcomes[i] = { caller: caller.label, found: hit !== null, attempts: hit?.attempts ?? [] };
+          return hit;
+        },
+        (err: unknown) => {
+          errors[i] = err;
+          throw err;
+        },
       ),
     );
-    // Copy what each caller had answered before the others are stopped: a
-    // caller cut off after this point returns "nothing" without having
-    // finished, which is not a real miss.
-    settled = outcomes.map((o) => ({ ...o }));
-  } finally {
-    stop.value = true;
-    await Promise.all([...openBrowsers].map((b) => b.close().catch(() => {})));
-    await shared?.close().catch(() => {});
-  }
+    running.push(Promise.allSettled(promises));
+    const result = await firstHitInPriorityOrder(promises);
+    return {
+      callers,
+      winner: result.winner ? { caller: callers[result.winner.index].label, hit: result.winner.hit } : null,
+      failures: result.failures.map((f) => `${callers[f.index].label}: ${f.message.split("\n")[0]}`),
+      errors,
+      // Copied now: a caller stopped after this point returns "nothing"
+      // without having finished, which is not a real miss.
+      settled: outcomes.map((o) => ({ ...o })),
+    };
+  };
 
-  const failures = result.failures.map((f) => `${callers[f.index].label}: ${f.message.split("\n")[0]}`);
-  const winner = result.winner ? { caller: callers[result.winner.index].label, hit: result.winner.hit } : null;
+  const passes: PassResult[] = [await runPass(firstPass, place !== null)];
+  if (!passes[0].winner && passes[0].failures.length && backups.length) {
+    steps.push({
+      caller: "planner",
+      action: "backup",
+      detail: `A caller could not be searched, so trying ${backups.join(", ")} as well`,
+    });
+    passes.push(await runPass(backups, false));
+  }
+  stop.value = true;
+  const background = Promise.allSettled(running).then(() => {});
+
+  const winnerPass = passes.find((p) => p.winner);
+  const winner = winnerPass?.winner ?? null;
+  const failures = passes.flatMap((p) => p.failures);
 
   await recordEpisode({
     context,
     winner: winner?.caller ?? null,
-    outcomes: settled,
-    explored: plans.flatMap((p) => (p.explored ? [p.explored] : [])),
+    outcomes: passes.flatMap((p) => p.settled),
     found: winner ? { ref: referenceNumber, caller: winner.caller, account: winner.hit.account } : undefined,
+    accounts: accountsRead,
   });
 
   if (winner) {
+    const notes = [
+      winner.hit.note,
+      failures.length ? `Other callers had problems: ${failures.join("; ")}` : undefined,
+    ].filter(Boolean);
     return {
       order: winner.hit.order,
       foundViaCaller: winner.caller,
       account: winner.hit.account,
       orderTrackingId: winner.hit.orderTrackingId,
       steps,
-      warning: failures.length ? `Other callers had problems: ${failures.join("; ")}` : undefined,
+      warning: notes.length ? notes.join(" ") : undefined,
+      background,
     };
   }
-  if (failures.length === callers.length) {
+  const searched = passes.flatMap((p) => p.callers);
+  const errors = passes.flatMap((p) => p.errors);
+  if (failures.length === searched.length) {
     if (errors.every((e) => e instanceof PortalTimeoutError)) {
       throw new WebAgentError(
         `The Xcelerator portal did not respond: its pages did not load within ${NAV_TIMEOUT_MS / 1000} seconds ` +
@@ -1675,5 +1942,6 @@ export async function findOrderWithWebAgent(referenceNumber: string): Promise<We
     orderTrackingId: null,
     steps,
     warning: failures.length ? `Some callers could not be searched: ${failures.join("; ")}` : undefined,
+    background,
   };
 }
