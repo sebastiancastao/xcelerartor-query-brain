@@ -25,7 +25,7 @@ type OrderToolResult = {
   status: string;
   pickup: { arrived: boolean; when: string | null; scheduled: string };
   delivery: { delivered: boolean; when: string | null; scheduled: string };
-  pod: { available: boolean; signedBy: string | null };
+  pod: { available: boolean; signedBy: string | null; signedAt: string | null };
   charges: {
     finalized: boolean;
     total: number | null;
@@ -49,7 +49,8 @@ function toToolResult(order: OrderInquiry): OrderToolResult {
       when: order.delivery.deliveredAt,
       scheduled: order.delivery.scheduledAt,
     },
-    pod: { available: order.pod.available, signedBy: order.pod.receivedBy },
+    // The POD activity log stays out: it names staff logins and internal emails.
+    pod: { available: order.pod.available, signedBy: order.pod.receivedBy, signedAt: order.pod.signedAt ?? null },
     charges: {
       finalized: order.charges.finalized,
       total: order.charges.finalized ? order.charges.total : null,

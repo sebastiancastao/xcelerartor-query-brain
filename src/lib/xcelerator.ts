@@ -69,6 +69,15 @@ export interface OrderPackageDetail {
   height: number | null;
 }
 
+/** One line of an order's activity that mentions its POD (see OrderInquiry.pod.activity). */
+export interface PodActivityEntry {
+  /** When it was logged, Eastern wall-clock time as a zone-less ISO string. */
+  at: string | null;
+  /** "Change log", "Memo", "Scan", "Status", ... */
+  kind: string;
+  text: string;
+}
+
 export interface OrderInquiry {
   referenceNumber: string;
   /** RefNo2/3/4 — additional client reference fields on the same order. */
@@ -138,8 +147,18 @@ export interface OrderInquiry {
   specialInstructions: string | null;
   pod: {
     available: boolean;
+    /** Who signed: Xcelerator's "POD Name" (sometimes a receipt number, e.g. airline cargo drops). */
     receivedBy: string | null;
     documentUrl: string | null;
+    /** Xcelerator's "POD D/T", the portal's wall-clock time as a zone-less ISO string. */
+    signedAt?: string | null;
+    /**
+     * Activity entries that mention the POD, newest first: who entered the POD
+     * name and time, POD emails sent, POD memos. From the Review Order screen's
+     * "Advanced Options and Activity" when the back office is configured, else
+     * the ClientPortal order window's status history and memos.
+     */
+    activity?: PodActivityEntry[];
   };
   charges: {
     currency: string;
@@ -872,6 +891,8 @@ type NormalizedPortalOrder = {
   packages: PortalPackageItem[] | null | undefined;
   documents: PortalDocumentItem[] | null | undefined;
   podReceivedBy: string | null;
+  /** The portal's PODcompletion ("POD D/T"), zone-less. */
+  podSignedAt?: string | null;
   podDocumentUrl: string | null;
   podAvailable: boolean;
   charges: { total: number; finalized: boolean; lineItems: { label: string; amount: number }[] };
@@ -945,6 +966,7 @@ function buildOrderInquiryFromPortal(n: NormalizedPortalOrder): OrderInquiry {
     pod: {
       available: n.podAvailable,
       receivedBy: n.podReceivedBy,
+      signedAt: n.podSignedAt ?? null,
       documentUrl: n.podDocumentUrl,
     },
     charges: {
@@ -1022,6 +1044,7 @@ export function mapPortalOrderListRowToInquiryFallback(row: PortalOrderListRow):
     packages: row.PackageItems,
     documents: row.Documents,
     podReceivedBy: row.PODname || null,
+    podSignedAt: row.PODcompletion || null,
     podDocumentUrl: null,
     podAvailable: Boolean(row.PODcompletion),
     charges: {
@@ -1099,6 +1122,7 @@ function mapPortalOrderToInquiry(props: PortalOrderProperties): OrderInquiry {
     packages: props.PackageItems,
     documents: props.Documents,
     podReceivedBy: props.PODname || null,
+    podSignedAt: props.PODcompletion || null,
     podDocumentUrl: props.PODSignature ? `data:image/jpeg;base64,${props.PODSignature}` : null,
     podAvailable: Boolean(props.PODSignature && props.PODSignature.length > 0),
     charges: {

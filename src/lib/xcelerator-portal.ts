@@ -25,7 +25,7 @@ function envValue(name: string): string | undefined {
   return value || undefined;
 }
 
-function portalBaseUrlFromEnv(): string {
+export function portalBaseUrlFromEnv(): string {
   return (envValue("XCELERATOR_PORTAL_BASE_URL") || DEFAULT_PORTAL_BASE_URL).replace(/\/+$/, "");
 }
 
@@ -129,7 +129,7 @@ export class XceleratorPortalError extends Error {
 
 // --- Cookie jar --------------------------------------------------------------
 
-class CookieJar {
+export class CookieJar {
   private values = new Map<string, string>();
 
   header(): string {

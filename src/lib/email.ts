@@ -24,7 +24,9 @@ export function buildSuggestedReply(order: OrderInquiry): string {
 
   const podIsLink = order.pod.documentUrl?.startsWith("http") ?? false;
   const podLine = order.pod.available
-    ? `POD is on file${order.pod.receivedBy ? `, signed by ${order.pod.receivedBy}` : ""}.${
+    ? `POD is on file${order.pod.receivedBy ? `, signed by ${order.pod.receivedBy}` : ""}${
+        order.pod.signedAt ? ` on ${formatDateTime(order.pod.signedAt)}` : ""
+      }.${
         podIsLink
           ? ` You can view it here: ${order.pod.documentUrl}`
           : " Let us know if you'd like a copy sent over."

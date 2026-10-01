@@ -56,6 +56,7 @@ import {
   type PortalOrderListRow,
 } from "./xcelerator";
 import { firstHitInPriorityOrder } from "./ordered-first-match";
+import { isBackOfficeConfigured, readBackOfficePod, warmBackOfficeSession } from "./xcelerator-backoffice";
 import {
   accountListIsStale,
   loadMemory,
@@ -679,25 +680,44 @@ async function quickTrack(page: Page, portalBaseUrl: string, trackBy: string, va
   return { found: result === "hit" && !failShown };
 }
 
+/** A row of the order window's status history or memo list: its time cell and its text. */
+type WindowRow = { time: string; text: string };
+
 type OrderWindowFields = {
   fields: Record<string, string>;
   charges: { label: string; amount: number }[];
   grandTotal: number | null;
-  statusLines: string[];
-  podImage: boolean;
+  /** Status history, newest first ("Shipment completed and signed by [Omar Maxwell]"). */
+  statusRows: WindowRow[];
+  /** Order memos the client can see ("QT_MEMO: POD - POD is LATE. ..."). */
+  memoRows: WindowRow[];
+  /** Which POD images the window has (PODSignature, VPOD, PODSignatureRT, VPODRT). */
+  podImages: string[];
+  /** The POD signature as a data: URL, when the window has one of a sensible size. */
+  podSignature: string | null;
 };
+
+/** Biggest signature image passed to the page as a data: URL (driver signatures are a few KB). */
+const MAX_SIGNATURE_CHARS = 200_000;
 
 /**
  * Reads the order window the way it is laid out (confirmed live on order
  * 11.092426): every value sits in a span with a stable id, op_<Field>
  * (op_ClientRefNo, op_PickupArrival, op_DeliveryArrival, op_Service, ...);
- * charges are label/amount rows under #div_chargeDetailItems; the POD
- * signature is an <img id="op_PODSignature"> whose src is empty until signed.
+ * charges are label/amount rows under #div_chargeDetailItems. POD signs
+ * (confirmed 2026-10-01 on 105.031826, 119.093026 and 4.092926): a driver's
+ * signature is a data: URL in <img id="op_PODSignature"> (empty src when
+ * the POD was typed in by dispatch), photos go in op_VPOD, round trips in
+ * op_PODSignatureRT/op_VPODRT; the window has no POD name field, but the
+ * status history says "Shipment completed [29763672]" or "Shipment
+ * completed and signed by [Omar Maxwell]". Status rows are flat cells
+ * (location, time, zone, .DetailsCell, then a clearing div); memo rows are
+ * one flex div each (category, time, zone, text).
  * Reading these directly is exact, unlike asking a model to read the text,
  * which invented an arrival time and a "delivered" status in testing.
  */
 async function readOrderWindowFields(page: Page): Promise<OrderWindowFields | null> {
-  return page.evaluate(() => {
+  return page.evaluate((maxSignatureChars) => {
     const popup = document.querySelector<HTMLElement>("#orderdetailspopup");
     if (!popup || getComputedStyle(popup).display === "none") return null;
     const fields: Record<string, string> = {};
@@ -722,14 +742,47 @@ async function readOrderWindowFields(page: Page): Promise<OrderWindowFields | nu
       else charges.push({ label, amount });
     });
 
-    const statusLines = ((popup.querySelector("#op_StatusContainer") as HTMLElement | null)?.innerText ?? "")
-      .split("\n")
-      .map((l) => l.trim())
-      .filter(Boolean);
-    const pod = popup.querySelector<HTMLImageElement>("#op_PODSignature");
-    const podImage = !!pod && !!pod.getAttribute("src");
-    return { fields, charges, grandTotal, statusLines, podImage };
-  });
+    const text = (el: Element | null) => (el?.textContent ?? "").replace(/\s+/g, " ").trim();
+    const rows = (containerId: string) => {
+      const container = popup.querySelector(`#${containerId}`);
+      if (!container) return [];
+      const details = Array.from(container.querySelectorAll(".DetailsCell"));
+      if (!details.length) {
+        // Memos: one flex row per memo with category, time, zone and text cells.
+        return Array.from(container.children)
+          .map((row) => Array.from(row.children).map(text))
+          .filter((cells) => cells.length >= 4)
+          .map((cells) => ({ time: cells[1], text: cells[cells.length - 1] }));
+      }
+      // Status history: flat cells, location, time, zone, then .DetailsCell.
+      return details.map((cell) => {
+        const before: string[] = [];
+        for (let el = cell.previousElementSibling; el && before.length < 3; el = el.previousElementSibling) {
+          if (el.classList.contains("DetailsCell") || !el.className) break;
+          before.push(text(el));
+        }
+        return { time: before[1] ?? "", text: text(cell) };
+      });
+    };
+
+    const podImages: string[] = [];
+    let podSignature: string | null = null;
+    for (const name of ["PODSignature", "VPOD", "PODSignatureRT", "VPODRT"]) {
+      const src = popup.querySelector<HTMLImageElement>(`#op_${name}`)?.getAttribute("src")?.trim() ?? "";
+      if (!src) continue;
+      podImages.push(name);
+      if (name === "PODSignature" && src.startsWith("data:image/") && src.length <= maxSignatureChars) podSignature = src;
+    }
+    return {
+      fields,
+      charges,
+      grandTotal,
+      statusRows: rows("op_StatusContainer"),
+      memoRows: rows("op_MemoContainer"),
+      podImages,
+      podSignature,
+    };
+  }, MAX_SIGNATURE_CHARS);
 }
 
 /**
@@ -738,13 +791,74 @@ async function readOrderWindowFields(page: Page): Promise<OrderWindowFields | nu
  * same wall-clock time the portal shows, whatever the server's timezone.
  */
 function portalDate(value: string | undefined): string | null {
-  const m = value?.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2})\s*(am|pm)?/i);
+  // Status history rows carry seconds: "9/29/2026 4:29:00 AM".
+  const m = value?.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2})(?::\d{2})?\s*(am|pm)?/i);
   if (!m) return null;
-  let hour = Number(m[4]) % 12;
-  if ((m[6] ?? "").toLowerCase() === "pm") hour += 12;
-  if (!m[6] && Number(m[4]) === 12) hour = 12;
+  const ampm = (m[6] ?? "").toLowerCase();
+  const hour = ampm ? (Number(m[4]) % 12) + (ampm === "pm" ? 12 : 0) : Number(m[4]);
   const pad = (n: number | string) => String(n).padStart(2, "0");
   return `${m[3]}-${pad(m[1])}-${pad(m[2])}T${pad(hour)}:${m[5]}:00`;
+}
+
+/** "Shipment completed [29763672]" / "Shipment completed and signed by [Omar Maxwell]" (not "Round Trip completed [...]"). */
+const SHIPMENT_COMPLETED = /^Shipment completed(?: and signed by)?\s*\[([^\]]+)\]/i;
+/** Status rows and memos worth showing as POD activity. */
+const POD_ROW = /\bPOD|completed(?: and signed by)?\s*\[|signed by/i;
+
+/** POD name, time, images and activity from the order window (the list row and the back office refine these later). */
+function podFromWindow(w: OrderWindowFields, delivered: boolean): OrderInquiry["pod"] {
+  const completed = w.statusRows.find((r) => SHIPMENT_COMPLETED.test(r.text));
+  const receivedBy = completed?.text.match(SHIPMENT_COMPLETED)?.[1]?.trim() || null;
+  const activity = [
+    ...w.statusRows.filter((r) => POD_ROW.test(r.text)).map((r) => ({ at: portalDate(r.time), kind: "Status", text: r.text })),
+    ...w.memoRows.filter((r) => /\bPOD/i.test(r.text)).map((r) => ({ at: portalDate(r.time), kind: "Memo", text: r.text })),
+  ].sort((a, b) => (b.at ?? "").localeCompare(a.at ?? ""));
+  return settlePod(
+    {
+      available: w.podImages.length > 0,
+      receivedBy,
+      documentUrl: w.podSignature,
+      signedAt: completed ? portalDate(completed.time) : null,
+      activity,
+    },
+    delivered,
+  );
+}
+
+/**
+ * A POD counts as on file once it has a time or an image, or a name on a
+ * delivered order. A name alone on an open order is shown but not counted
+ * (seen: "COREY NO SAMPLES" typed on an order still awaiting pickup).
+ */
+function settlePod(pod: OrderInquiry["pod"], delivered: boolean): OrderInquiry["pod"] {
+  return {
+    ...pod,
+    available: pod.available || Boolean(pod.signedAt) || Boolean(pod.documentUrl) || (Boolean(pod.receivedBy) && delivered),
+  };
+}
+
+/**
+ * Layers better POD facts over what an order already has: the order list
+ * row's PODname/PODcompletion over the window's status history, then the
+ * back office's Review Order screen over both. Blank values never erase.
+ */
+function mergePod(
+  order: OrderInquiry,
+  facts: { receivedBy?: string | null; signedAt?: string | null; activity?: OrderInquiry["pod"]["activity"] },
+): OrderInquiry {
+  const pod = order.pod;
+  return {
+    ...order,
+    pod: settlePod(
+      {
+        ...pod,
+        receivedBy: facts.receivedBy?.trim() || pod.receivedBy,
+        signedAt: facts.signedAt?.trim() || pod.signedAt || null,
+        activity: facts.activity?.length ? facts.activity : (pod.activity ?? []),
+      },
+      order.delivery.delivered,
+    ),
+  };
 }
 
 function numberOrNull(value: string | undefined): number | null {
@@ -821,9 +935,7 @@ function orderFromWindow(w: OrderWindowFields, referenceNumber: string): OrderIn
     cod: { amount: null, location: null },
     thirdPartyTrackingRefNo: null,
     specialInstructions: f("SpecialInstructions"),
-    // Not yet seen on a signed order: a signature image means POD exists;
-    // who signed is not in a labelled field, so it stays null.
-    pod: { available: w.podImage, receivedBy: null, documentUrl: null },
+    pod: podFromWindow(w, delivered),
     charges: {
       currency: "USD",
       total,
@@ -1056,13 +1168,16 @@ async function readListHit(
   const started = Date.now();
   const orderTrackingId = trackingIdText(row.OrderTrackingID);
   const account = row.AccountNo?.trim() || null;
+  // The list row has the POD name and time as fields (PODname, PODcompletion),
+  // which the window only shows inside a status line.
+  const rowPod = { receivedBy: row.PODname, signedAt: row.PODcompletion };
   const window = await openOrderWindow(page, row);
   if (window) {
-    const order = orderFromWindow(window, referenceNumber);
+    const order = mergePod(orderFromWindow(window, referenceNumber), rowPod);
     log("read order", `${orderTrackingId}: ${order.status.replace("_", " ")} (${Date.now() - started} ms)`);
     return { order, orderTrackingId: window.fields.OrderTrackingID2 || orderTrackingId, account };
   }
-  const order = mapPortalOrderListRowToInquiryFallback(row);
+  const order = mergePod(mapPortalOrderListRowToInquiryFallback(row), rowPod);
   log(
     "read order",
     `${orderTrackingId}: ${order.status.replace("_", " ")}, from the order list, because the portal would not open ` +
@@ -1260,7 +1375,8 @@ const TOOLS: ToolDefinition[] = [
           deliveryAddress: nullableString,
           deliveryScheduledAt: nullableString,
           deliveredAt: nullableString,
-          podSignedBy: nullableString,
+          podSignedBy: { ...nullableString, description: "The POD name: who signed, as the portal shows it (e.g. \"Shipment completed [NAME]\")." },
+          podSignedAt: { ...nullableString, description: "When the POD was taken (the shipment-completed time)." },
           podAvailable: { type: "boolean" },
           pieces: nullableNumber,
           weight: nullableNumber,
@@ -1334,6 +1450,7 @@ type ReportArgs = {
   deliveryScheduledAt?: string | null;
   deliveredAt?: string | null;
   podSignedBy?: string | null;
+  podSignedAt?: string | null;
   podAvailable: boolean;
   pieces?: number | null;
   weight?: number | null;
@@ -1426,7 +1543,13 @@ function mapReportToOrder(r: ReportArgs, fallbackRef: string): OrderInquiry {
     cod: { amount: null, location: null },
     thirdPartyTrackingRefNo: null,
     specialInstructions: r.specialInstructions ?? null,
-    pod: { available: r.podAvailable || Boolean(r.podSignedBy), receivedBy: r.podSignedBy ?? null, documentUrl: null },
+    pod: {
+      available: r.podAvailable || Boolean(r.podSignedBy) || Boolean(r.podSignedAt),
+      receivedBy: r.podSignedBy ?? null,
+      documentUrl: null,
+      // Kept as the portal's wall-clock time, like the other portal times.
+      signedAt: r.podSignedAt && !Number.isNaN(new Date(r.podSignedAt).getTime()) ? r.podSignedAt : null,
+    },
     charges: {
       currency: "USD",
       total,
@@ -1759,6 +1882,55 @@ function describePlan(
   );
 }
 
+/** Longest the back office may hold up a found order (login included). */
+const BACK_OFFICE_POD_TIMEOUT_MS = 12_000;
+
+/**
+ * Adds the back office's Review Order POD details to a found order: POD
+ * Name, POD D/T and the activity entries that mention the POD. Optional and
+ * best effort: without XCELERATOR_BACKOFFICE_* set, or when the back office
+ * is slow or refuses, the order keeps the ClientPortal's POD details and the
+ * steps say why.
+ */
+async function withBackOfficePod(
+  order: OrderInquiry,
+  orderTrackingId: string | null,
+  steps: WebAgentStep[],
+): Promise<OrderInquiry> {
+  if (!isBackOfficeConfigured() || !orderTrackingId) return order;
+  const started = Date.now();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const pod = await Promise.race([
+      readBackOfficePod(orderTrackingId),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`no answer within ${BACK_OFFICE_POD_TIMEOUT_MS / 1000} s`)),
+          BACK_OFFICE_POD_TIMEOUT_MS,
+        );
+      }),
+    ]);
+    const merged = mergePod(order, { receivedBy: pod.podName, signedAt: pod.podAt, activity: pod.activity });
+    const found = [
+      pod.podName ? `POD name ${pod.podName}` : "no POD name",
+      pod.podAt ? `POD D/T ${pod.podAt.replace("T", " ").slice(0, 16)}` : "no POD D/T",
+      `${pod.activity.length} POD ${pod.activity.length === 1 ? "entry" : "entries"} in the activity log`,
+    ];
+    steps.push({ caller: "Review Order", action: "read POD", detail: `${found.join(", ")} (${Date.now() - started} ms)` });
+    return merged;
+  } catch (err) {
+    const why = err instanceof Error ? err.message.split("\n")[0] : String(err);
+    steps.push({
+      caller: "Review Order",
+      action: "POD not read",
+      detail: `${why}; showing the ClientPortal's POD details (${Date.now() - started} ms)`,
+    });
+    return order;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 type PassResult = {
   callers: NamedXceleratorCaller[];
   winner: { caller: string; hit: CallerHit } | null;
@@ -1775,6 +1947,8 @@ export async function findOrderWithWebAgent(referenceNumber: string): Promise<We
     throw new WebAgentError("No Xcelerator caller is configured. Set XCELERATOR_CALLER_1_USERNAME and _PASSWORD.", 503);
   }
   const byLabel = new Map(configured.map((c) => [c.label, c]));
+  // The back-office login (for the POD details) runs while the callers search.
+  warmBackOfficeSession();
 
   // Who to search. Each caller's order-list search covers every account it
   // can see, so only callers that see something the others don't are
@@ -1898,13 +2072,16 @@ export async function findOrderWithWebAgent(referenceNumber: string): Promise<We
   const winner = winnerPass?.winner ?? null;
   const failures = passes.flatMap((p) => p.failures);
 
-  await recordEpisode({
-    context,
-    winner: winner?.caller ?? null,
-    outcomes: passes.flatMap((p) => p.settled),
-    found: winner ? { ref: referenceNumber, caller: winner.caller, account: winner.hit.account } : undefined,
-    accounts: accountsRead,
-  });
+  const [order] = await Promise.all([
+    winner ? withBackOfficePod(winner.hit.order, winner.hit.orderTrackingId, steps) : null,
+    recordEpisode({
+      context,
+      winner: winner?.caller ?? null,
+      outcomes: passes.flatMap((p) => p.settled),
+      found: winner ? { ref: referenceNumber, caller: winner.caller, account: winner.hit.account } : undefined,
+      accounts: accountsRead,
+    }),
+  ]);
 
   if (winner) {
     const notes = [
@@ -1912,7 +2089,7 @@ export async function findOrderWithWebAgent(referenceNumber: string): Promise<We
       failures.length ? `Other callers had problems: ${failures.join("; ")}` : undefined,
     ].filter(Boolean);
     return {
-      order: winner.hit.order,
+      order,
       foundViaCaller: winner.caller,
       account: winner.hit.account,
       orderTrackingId: winner.hit.orderTrackingId,

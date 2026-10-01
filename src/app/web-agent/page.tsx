@@ -642,12 +642,15 @@ export default function WebAgentHome() {
                       <ClockIcon className="h-3.5 w-3.5" />
                     )}
                   </span>
-                  <div>
+                  <div className="min-w-0 flex-1">
                     <p className="text-sm font-medium text-zinc-900 dark:text-zinc-100">POD information</p>
                     {order.pod.available ? (
                       <>
                         <p className="mt-0.5 text-sm text-zinc-600 dark:text-zinc-400">
-                          {order.pod.receivedBy ? `Signed by ${order.pod.receivedBy}` : "Signature on file"}
+                          {order.pod.receivedBy ? `POD name: ${order.pod.receivedBy}` : "POD on file, no name entered"}
+                        </p>
+                        <p className="mt-0.5 text-sm text-zinc-600 dark:text-zinc-400">
+                          POD date/time: {order.pod.signedAt ? formatMaybeDate(order.pod.signedAt) : "not entered"}
                         </p>
                         {order.pod.documentUrl?.startsWith("http") && (
                           <a
@@ -669,7 +672,27 @@ export default function WebAgentHome() {
                         )}
                       </>
                     ) : (
-                      <p className="mt-0.5 text-sm text-zinc-600 dark:text-zinc-400">Not yet available</p>
+                      <p className="mt-0.5 text-sm text-zinc-600 dark:text-zinc-400">
+                        Not yet available
+                        {order.pod.receivedBy ? ` (POD name entered: ${order.pod.receivedBy})` : ""}
+                      </p>
+                    )}
+                    {order.pod.activity && order.pod.activity.length > 0 && (
+                      <details className="mt-2 text-sm">
+                        <summary className="cursor-pointer text-zinc-500 hover:text-zinc-700 dark:text-zinc-400 dark:hover:text-zinc-200">
+                          POD activity ({order.pod.activity.length})
+                        </summary>
+                        <ul className="mt-1.5 space-y-1">
+                          {order.pod.activity.map((entry, i) => (
+                            <li key={i} className="text-zinc-600 dark:text-zinc-400">
+                              <span className="text-zinc-400 dark:text-zinc-500">
+                                {entry.at ? formatMaybeDate(entry.at) : "—"} · {entry.kind}
+                              </span>{" "}
+                              <span className="break-words">{entry.text}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      </details>
                     )}
                   </div>
                 </div>
