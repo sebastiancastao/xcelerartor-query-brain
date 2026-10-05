@@ -35,6 +35,21 @@ export function isBackOfficeConfigured(): boolean {
   return backOfficeConfigFromEnv() !== null;
 }
 
+/**
+ * Link to the order's back-office Review Order screen, e.g.
+ * https://skylinecourierlogistics.com/Xcelerator/Orders/ReviewOrder/ReviewOrder?_p_Odata=69.091626
+ * (the tracking id is the order number, a dot, and its MMDDYY date). It opens
+ * for anyone signed in to the back office in their browser, so it does not
+ * need XCELERATOR_BACKOFFICE_* here. Null when there is no tracking id.
+ */
+export function reviewOrderUrl(orderTrackingId: string | null | undefined): string | null {
+  const match = orderTrackingId?.match(/(\d+)\.(\d{1,6})(?!\d)/);
+  if (!match) return null;
+  // A number that went through a float can lose trailing zeros (69.09162).
+  const id = `${Number(match[1])}.${match[2].padEnd(6, "0")}`;
+  return `${portalBaseUrlFromEnv()}/Orders/ReviewOrder/ReviewOrder?_p_Odata=${id}`;
+}
+
 const REQUEST_TIMEOUT_MS = 8_000;
 /** A session unused this long is replaced rather than tried first. */
 const SESSION_IDLE_MS = 15 * 60_000;

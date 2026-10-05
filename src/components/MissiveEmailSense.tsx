@@ -2,6 +2,7 @@
 
 import Script from "next/script";
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { MouseEvent } from "react";
 import { extractUuids } from "@/lib/missive-id";
 
 export type MissiveSenseStatus =
@@ -27,12 +28,35 @@ type MissiveIframeApi = {
     options?: { retroactive?: boolean }
   ) => void;
   fetchConversations: (ids: string[]) => Promise<MissiveIframeConversation[]>;
+  /** Asks Missive to open a link in the user's browser. */
+  openURL: (url: string) => void;
+  /** Set once Missive has initialized this page; null when it is open outside Missive. */
+  id?: string | null;
 };
 
 declare global {
   interface Window {
     Missive?: MissiveIframeApi;
   }
+}
+
+/**
+ * onClick for links that open in a new tab. Use it instead of
+ * target="_blank": missive.js (loaded on every page that has this component)
+ * catches clicks on target="_blank" links and asks Missive to open them, so
+ * outside Missive, where nothing answers, those clicks did nothing. Without
+ * the target attribute missive.js leaves the link alone, and this opens it
+ * through Missive when Missive is hosting the page, else in a new tab.
+ */
+export function openLinkInNewTab(event: MouseEvent<HTMLAnchorElement>): void {
+  event.preventDefault();
+  const url = event.currentTarget.href;
+  const missive = window.Missive;
+  if (missive?.id && typeof missive.openURL === "function") {
+    missive.openURL(url);
+    return;
+  }
+  window.open(url, "_blank", "noopener,noreferrer");
 }
 
 type ConversationTextResponse = {

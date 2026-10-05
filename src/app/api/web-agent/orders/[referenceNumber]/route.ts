@@ -1,6 +1,7 @@
 import { after, NextResponse } from "next/server";
 import { logDebugEvent } from "@/lib/debug-log";
 import { findOrderWithWebAgent, WebAgentError } from "@/lib/web-agent";
+import { reviewOrderUrl } from "@/lib/xcelerator-backoffice";
 
 // A browser session plus several model turns per caller takes a while.
 export const maxDuration = 300;
@@ -39,6 +40,7 @@ export async function GET(
       foundViaCaller: result.foundViaCaller,
       account: result.account,
       orderTrackingId: result.orderTrackingId,
+      reviewOrderUrl: reviewOrderUrl(result.orderTrackingId),
       warning: result.warning,
       steps: result.steps,
     });

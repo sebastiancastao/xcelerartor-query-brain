@@ -7,7 +7,7 @@ import type { OrderInquiry } from "@/lib/xcelerator";
 import type { WebAgentStep } from "@/lib/web-agent";
 import { buildSuggestedReply } from "@/lib/email";
 import { detectOrderReferences, type DetectedReference } from "@/lib/reference-detection";
-import { MissiveEmailSense, type MissiveSenseStatus } from "@/components/MissiveEmailSense";
+import { MissiveEmailSense, openLinkInNewTab, type MissiveSenseStatus } from "@/components/MissiveEmailSense";
 
 type LookupState =
   | { status: "idle" }
@@ -22,6 +22,8 @@ type LookupState =
       account: string | null;
       /** Xcelerator's own id for the order, read off the order window. */
       orderTrackingId: string | null;
+      /** The order's back-office Review Order screen (…/ReviewOrder?_p_Odata=<tracking id>). */
+      reviewOrderUrl: string | null;
       /** e.g. "found under the QUKIN account instead of the default one" or "the default Xcelerator login is currently failing" — surfaced so a CSR knows to flag it rather than the app silently papering over it. */
       warning?: string;
     };
@@ -65,6 +67,14 @@ function ClockIcon({ className }: { className?: string }) {
     <svg viewBox="0 0 20 20" fill="none" className={className} aria-hidden="true">
       <circle cx="10" cy="10" r="7" stroke="currentColor" strokeWidth="1.5" />
       <path d="M10 6.2v3.8l2.4 1.8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function ChevronIcon({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 20 20" fill="none" className={className} aria-hidden="true">
+      <path d="M5.5 7.75L10 12.25l4.5-4.5" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
     </svg>
   );
 }
@@ -198,6 +208,10 @@ export default function WebAgentHome() {
   const [referenceNumber, setReferenceNumber] = useState("");
   const [state, setState] = useState<LookupState>({ status: "idle" });
   const [copied, setCopied] = useState(false);
+  const [linkCopied, setLinkCopied] = useState(false);
+  // Shipment details start collapsed so the AI reply below is visible
+  // without scrolling; each new lookup collapses them again.
+  const [showShipmentDetails, setShowShipmentDetails] = useState(false);
   const [live, setLive] = useState<boolean | null>(null);
   const [aiDrafting, setAiDrafting] = useState(false);
   const [reply, setReply] = useState<ReplyState>({ status: "idle" });
@@ -248,6 +262,7 @@ export default function WebAgentHome() {
     setState({ status: "loading" });
     setReply({ status: "idle" });
     setCopied(false);
+    setShowShipmentDetails(false);
     setSteps([]);
 
     try {
@@ -269,6 +284,7 @@ export default function WebAgentHome() {
         foundViaCaller: string | null;
         account?: string | null;
         orderTrackingId: string | null;
+        reviewOrderUrl?: string | null;
         warning?: string;
         steps: WebAgentStep[];
       } = await res.json();
@@ -280,6 +296,7 @@ export default function WebAgentHome() {
         foundViaCaller: body.foundViaCaller,
         account: body.account ?? null,
         orderTrackingId: body.orderTrackingId ?? null,
+        reviewOrderUrl: body.reviewOrderUrl ?? null,
         warning: body.warning,
       });
       loadReplyForOrder(body.order, current);
@@ -305,7 +322,7 @@ export default function WebAgentHome() {
     }
   }
 
-  async function handleCopy(text: string) {
+  async function handleCopy(text: string, onCopied: (copied: boolean) => void = setCopied) {
     // Inside an iframe the Clipboard API is often blocked unless the parent
     // grants allow="clipboard-write", so fall back to the older copy command.
     let ok = false;
@@ -328,8 +345,8 @@ export default function WebAgentHome() {
       }
     }
     if (ok) {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
+      onCopied(true);
+      setTimeout(() => onCopied(false), 1500);
     }
   }
 
@@ -393,6 +410,7 @@ export default function WebAgentHome() {
   const foundViaCaller = state.status === "success" ? state.foundViaCaller : null;
   const orderAccount = state.status === "success" ? state.account : null;
   const orderTrackingId = state.status === "success" ? state.orderTrackingId : null;
+  const reviewOrderLink = state.status === "success" ? state.reviewOrderUrl : null;
   const lookupWarning = state.status === "success" ? state.warning : null;
 
   return (
@@ -609,6 +627,28 @@ export default function WebAgentHome() {
                 <span className="text-xs text-zinc-500 dark:text-zinc-400">Carrier: {order.carrier}</span>
               </div>
               <p className="text-sm text-zinc-500 dark:text-zinc-400">{order.customer}</p>
+              {reviewOrderLink && (
+                <div className="mt-2 flex min-w-0 items-center gap-2 text-sm">
+                  <span className="shrink-0 text-zinc-500 dark:text-zinc-400">Review Order:</span>
+                  <a
+                    href={reviewOrderLink}
+                    onClick={openLinkInNewTab}
+                    rel="noopener noreferrer"
+                    title="Opens the order in the Xcelerator back office (needs a back-office login)"
+                    className="min-w-0 truncate text-indigo-600 underline decoration-indigo-300 underline-offset-2 hover:text-indigo-500 dark:text-indigo-400"
+                  >
+                    {reviewOrderLink}
+                  </a>
+                  <button
+                    type="button"
+                    onClick={() => handleCopy(reviewOrderLink, setLinkCopied)}
+                    className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-700 transition-colors hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800"
+                  >
+                    <CopyIcon className="h-3.5 w-3.5" />
+                    {linkCopied ? "Copied!" : "Copy"}
+                  </button>
+                </div>
+              )}
               <div className="mt-2 divide-y divide-zinc-100 dark:divide-zinc-800">
                 <StatusRow
                   label="Has the driver arrived at pickup?"
@@ -655,7 +695,7 @@ export default function WebAgentHome() {
                         {order.pod.documentUrl?.startsWith("http") && (
                           <a
                             href={order.pod.documentUrl}
-                            target="_blank"
+                            onClick={openLinkInNewTab}
                             rel="noopener noreferrer"
                             className="mt-1 inline-block text-sm text-indigo-600 underline decoration-indigo-300 underline-offset-2 hover:text-indigo-500 dark:text-indigo-400"
                           >
@@ -712,140 +752,149 @@ export default function WebAgentHome() {
             </section>
 
             <section className={`rounded-2xl border border-zinc-200/70 bg-white ${card} shadow-sm dark:border-zinc-800/70 dark:bg-zinc-900`}>
-              <h2 className="mb-4 text-sm font-semibold text-zinc-900 dark:text-zinc-100">Shipment details</h2>
+              <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
+                <button
+                  type="button"
+                  onClick={() => setShowShipmentDetails((open) => !open)}
+                  aria-expanded={showShipmentDetails}
+                  aria-controls="shipment-details"
+                  title={showShipmentDetails ? "Hide shipment details" : "Show shipment details"}
+                  className="group flex w-full items-center justify-between gap-3 text-left"
+                >
+                  Shipment details
+                  <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-zinc-300 text-zinc-600 transition-colors group-hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-300 dark:group-hover:bg-zinc-800">
+                    <ChevronIcon
+                      className={`h-4 w-4 transition-transform ${showShipmentDetails ? "rotate-180" : ""}`}
+                    />
+                  </span>
+                </button>
+              </h2>
 
-              <div className="grid grid-cols-2 gap-4 sm:grid-cols-3">
-                <Field label="Reference 2" value={order.referenceNumber2} />
-                <Field label="Reference 3" value={order.referenceNumber3} />
-                <Field label="Reference 4" value={order.referenceNumber4} />
-                <Field label="Invoice #" value={order.invoiceNumber} />
-                <Field label="Order type" value={order.orderType} />
-                <Field label="Service" value={order.service} />
-                <Field label="Vehicle" value={order.vehicle} />
-                <Field label="Third-party tracking #" value={order.thirdPartyTrackingRefNo} />
-              </div>
+              {showShipmentDetails && (
+                <div id="shipment-details" className="mt-4">
+                  <div className="grid grid-cols-2 gap-4 sm:grid-cols-3">
+                    <Field label="Reference 2" value={order.referenceNumber2} />
+                    <Field label="Reference 3" value={order.referenceNumber3} />
+                    <Field label="Reference 4" value={order.referenceNumber4} />
+                    <Field label="Invoice #" value={order.invoiceNumber} />
+                    <Field label="Order type" value={order.orderType} />
+                    <Field label="Service" value={order.service} />
+                    <Field label="Vehicle" value={order.vehicle} />
+                    <Field label="Third-party tracking #" value={order.thirdPartyTrackingRefNo} />
+                  </div>
 
-              {(order.caller.name || order.caller.department || order.caller.phone || order.caller.email) && (
-                <div className="mt-5 grid grid-cols-2 gap-4 border-t border-zinc-100 pt-4 dark:border-zinc-800 sm:grid-cols-3">
-                  <Field label="Called in by" value={order.caller.name} />
-                  <Field label="Department" value={order.caller.department} />
-                  <Field
-                    label="Caller contact"
-                    value={formatContact(null, order.caller.phone, order.caller.email)}
-                  />
-                </div>
-              )}
+                  <div className="mt-5 grid gap-4 border-t border-zinc-100 pt-4 dark:border-zinc-800 sm:grid-cols-2">
+                    <div className="space-y-3">
+                      <p className="text-xs font-semibold uppercase tracking-wide text-zinc-400 dark:text-zinc-500">
+                        Shipper
+                      </p>
+                      <Field label="Company" value={order.pickup.company} />
+                      <Field
+                        label="Address"
+                        value={formatFullAddress(
+                          order.pickup.street,
+                          order.pickup.street2,
+                          order.pickup.location,
+                          order.pickup.zip,
+                        )}
+                      />
+                      <Field
+                        label="Contact"
+                        value={formatContact(order.pickup.contact, order.pickup.phone, order.pickup.email)}
+                      />
+                      <Field label="Pickup Target" value={formatMaybeDate(order.pickup.scheduledTo)} />
+                      <Field label="Departed" value={formatMaybeDate(order.pickup.departedAt)} />
+                      <Field label="Special instructions" value={order.pickup.specialInstructions} />
+                    </div>
+                    <div className="space-y-3">
+                      <p className="text-xs font-semibold uppercase tracking-wide text-zinc-400 dark:text-zinc-500">
+                        Consignee
+                      </p>
+                      <Field label="Company" value={order.delivery.company} />
+                      <Field
+                        label="Address"
+                        value={formatFullAddress(
+                          order.delivery.street,
+                          order.delivery.street2,
+                          order.delivery.location,
+                          order.delivery.zip,
+                        )}
+                      />
+                      <Field
+                        label="Contact"
+                        value={formatContact(order.delivery.contact, order.delivery.phone, order.delivery.email)}
+                      />
+                      <Field label="Delivery Target" value={formatMaybeDate(order.delivery.scheduledTo)} />
+                      <Field label="Departed" value={formatMaybeDate(order.delivery.departedAt)} />
+                      <Field label="Special instructions" value={order.delivery.specialInstructions} />
+                    </div>
+                  </div>
 
-              <div className="mt-5 grid gap-4 border-t border-zinc-100 pt-4 dark:border-zinc-800 sm:grid-cols-2">
-                <div className="space-y-3">
-                  <p className="text-xs font-semibold uppercase tracking-wide text-zinc-400 dark:text-zinc-500">
-                    Shipper
-                  </p>
-                  <Field label="Company" value={order.pickup.company} />
-                  <Field
-                    label="Address"
-                    value={formatFullAddress(
-                      order.pickup.street,
-                      order.pickup.street2,
-                      order.pickup.location,
-                      order.pickup.zip,
-                    )}
-                  />
-                  <Field
-                    label="Contact"
-                    value={formatContact(order.pickup.contact, order.pickup.phone, order.pickup.email)}
-                  />
-                  <Field label="Target window" value={formatMaybeDate(order.pickup.scheduledTo)} />
-                  <Field label="Departed" value={formatMaybeDate(order.pickup.departedAt)} />
-                  <Field label="Special instructions" value={order.pickup.specialInstructions} />
-                </div>
-                <div className="space-y-3">
-                  <p className="text-xs font-semibold uppercase tracking-wide text-zinc-400 dark:text-zinc-500">
-                    Consignee
-                  </p>
-                  <Field label="Company" value={order.delivery.company} />
-                  <Field
-                    label="Address"
-                    value={formatFullAddress(
-                      order.delivery.street,
-                      order.delivery.street2,
-                      order.delivery.location,
-                      order.delivery.zip,
-                    )}
-                  />
-                  <Field
-                    label="Contact"
-                    value={formatContact(order.delivery.contact, order.delivery.phone, order.delivery.email)}
-                  />
-                  <Field label="Target window" value={formatMaybeDate(order.delivery.scheduledTo)} />
-                  <Field label="Departed" value={formatMaybeDate(order.delivery.departedAt)} />
-                  <Field label="Special instructions" value={order.delivery.specialInstructions} />
-                </div>
-              </div>
+                  {(order.shipment.pieces || order.shipment.weight || order.shipment.declaredValue) && (
+                    <div className="mt-5 grid grid-cols-2 gap-4 border-t border-zinc-100 pt-4 dark:border-zinc-800 sm:grid-cols-3">
+                      <Field label="Pieces" value={order.shipment.pieces} />
+                      <Field label="Total weight" value={formatWeight(order.shipment.weight)} />
+                      <Field
+                        label="Declared value"
+                        value={
+                          order.shipment.declaredValue
+                            ? new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(
+                                order.shipment.declaredValue,
+                              )
+                            : null
+                        }
+                      />
+                    </div>
+                  )}
 
-              {(order.shipment.pieces || order.shipment.weight || order.shipment.declaredValue) && (
-                <div className="mt-5 grid grid-cols-2 gap-4 border-t border-zinc-100 pt-4 dark:border-zinc-800 sm:grid-cols-3">
-                  <Field label="Pieces" value={order.shipment.pieces} />
-                  <Field label="Total weight" value={formatWeight(order.shipment.weight)} />
-                  <Field
-                    label="Declared value"
-                    value={
-                      order.shipment.declaredValue
-                        ? new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(
-                            order.shipment.declaredValue,
-                          )
-                        : null
-                    }
-                  />
-                </div>
-              )}
+                  {order.shipment.packages.length > 0 && (
+                    <div className="mt-5 overflow-x-auto border-t border-zinc-100 pt-4 dark:border-zinc-800">
+                      <table className="w-full min-w-[420px] border-collapse text-left text-sm">
+                        <thead className="text-xs uppercase text-zinc-500 dark:text-zinc-400">
+                          <tr>
+                            <th className="py-1 pr-4 font-medium">Package</th>
+                            <th className="py-1 pr-4 font-medium">Ref #</th>
+                            <th className="py-1 pr-4 font-medium">Weight</th>
+                            <th className="py-1 font-medium">Dimensions</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-zinc-100 dark:divide-zinc-800">
+                          {order.shipment.packages.map((pkg, i) => (
+                            <tr key={pkg.refNo ?? i}>
+                              <td className="py-2 pr-4 text-zinc-800 dark:text-zinc-200">{pkg.name ?? "—"}</td>
+                              <td className="py-2 pr-4 text-zinc-800 dark:text-zinc-200">{pkg.refNo ?? "—"}</td>
+                              <td className="py-2 pr-4 text-zinc-800 dark:text-zinc-200">
+                                {formatWeight(pkg.weight) ?? "—"}
+                              </td>
+                              <td className="py-2 text-zinc-800 dark:text-zinc-200">{formatDims(pkg) ?? "—"}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
 
-              {order.shipment.packages.length > 0 && (
-                <div className="mt-5 overflow-x-auto border-t border-zinc-100 pt-4 dark:border-zinc-800">
-                  <table className="w-full min-w-[420px] border-collapse text-left text-sm">
-                    <thead className="text-xs uppercase text-zinc-500 dark:text-zinc-400">
-                      <tr>
-                        <th className="py-1 pr-4 font-medium">Package</th>
-                        <th className="py-1 pr-4 font-medium">Ref #</th>
-                        <th className="py-1 pr-4 font-medium">Weight</th>
-                        <th className="py-1 font-medium">Dimensions</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-zinc-100 dark:divide-zinc-800">
-                      {order.shipment.packages.map((pkg, i) => (
-                        <tr key={pkg.refNo ?? i}>
-                          <td className="py-2 pr-4 text-zinc-800 dark:text-zinc-200">{pkg.name ?? "—"}</td>
-                          <td className="py-2 pr-4 text-zinc-800 dark:text-zinc-200">{pkg.refNo ?? "—"}</td>
-                          <td className="py-2 pr-4 text-zinc-800 dark:text-zinc-200">
-                            {formatWeight(pkg.weight) ?? "—"}
-                          </td>
-                          <td className="py-2 text-zinc-800 dark:text-zinc-200">{formatDims(pkg) ?? "—"}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-
-              {(order.cod.amount || order.specialInstructions || order.documents.length > 0) && (
-                <div className="mt-5 grid grid-cols-2 gap-4 border-t border-zinc-100 pt-4 dark:border-zinc-800 sm:grid-cols-3">
-                  <Field
-                    label="COD"
-                    value={
-                      order.cod.amount
-                        ? `${new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(order.cod.amount)}${order.cod.location ? ` (${order.cod.location})` : ""}`
-                        : null
-                    }
-                  />
-                  <Field label="Order-level instructions" value={order.specialInstructions} />
-                  <Field
-                    label="Documents"
-                    value={
-                      order.documents.length > 0
-                        ? order.documents.map((doc) => doc.name ?? doc.fileFormat ?? "file").join(", ")
-                        : null
-                    }
-                  />
+                  {(order.cod.amount || order.specialInstructions || order.documents.length > 0) && (
+                    <div className="mt-5 grid grid-cols-2 gap-4 border-t border-zinc-100 pt-4 dark:border-zinc-800 sm:grid-cols-3">
+                      <Field
+                        label="COD"
+                        value={
+                          order.cod.amount
+                            ? `${new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(order.cod.amount)}${order.cod.location ? ` (${order.cod.location})` : ""}`
+                            : null
+                        }
+                      />
+                      <Field label="Order-level instructions" value={order.specialInstructions} />
+                      <Field
+                        label="Documents"
+                        value={
+                          order.documents.length > 0
+                            ? order.documents.map((doc) => doc.name ?? doc.fileFormat ?? "file").join(", ")
+                            : null
+                        }
+                      />
+                    </div>
+                  )}
                 </div>
               )}
             </section>
