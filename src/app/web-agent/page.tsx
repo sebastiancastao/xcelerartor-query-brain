@@ -7,7 +7,7 @@ import type { OrderInquiry } from "@/lib/xcelerator";
 import type { WebAgentStep } from "@/lib/web-agent";
 import { buildSuggestedReply } from "@/lib/email";
 import { detectOrderReferences, type DetectedReference } from "@/lib/reference-detection";
-import { MissiveEmailSense, openLinkInNewTab, type MissiveSenseStatus } from "@/components/MissiveEmailSense";
+import { MissiveEmailSense, openLinkInNewTab } from "@/components/MissiveEmailSense";
 
 type LookupState =
   | { status: "idle" }
@@ -16,8 +16,6 @@ type LookupState =
   | {
       status: "success";
       order: OrderInquiry;
-      /** Caller (portal login) the agent found the order under. */
-      foundViaCaller: string | null;
       /** Xcelerator account the order is in (e.g. "DHLIN"), when known. */
       account: string | null;
       /** Xcelerator's own id for the order, read off the order window. */
@@ -84,15 +82,6 @@ function CopyIcon({ className }: { className?: string }) {
     <svg viewBox="0 0 20 20" fill="none" className={className} aria-hidden="true">
       <rect x="7.25" y="7.25" width="9" height="9" rx="1.5" stroke="currentColor" strokeWidth="1.5" />
       <path d="M4.25 12.5v-7a1.5 1.5 0 0 1 1.5-1.5h7" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
-    </svg>
-  );
-}
-
-function MailIcon({ className }: { className?: string }) {
-  return (
-    <svg viewBox="0 0 20 20" fill="none" className={className} aria-hidden="true">
-      <rect x="2.75" y="4.75" width="14.5" height="10.5" rx="1.5" stroke="currentColor" strokeWidth="1.5" />
-      <path d="M3.25 5.5l6.75 5 6.75-5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
     </svg>
   );
 }
@@ -219,22 +208,15 @@ export default function WebAgentHome() {
   // result so a CSR can see how the answer was reached.
   const [steps, setSteps] = useState<WebAgentStep[]>([]);
 
-  // Order/reference detection: the primary source is MissiveEmailSense
-  // below, which senses whichever email the CSR currently has open in
-  // Missive; opening an email with a reference in it starts the lookup right
-  // away, so the answer is usually there by the time the email is read.
-  // "Paste an email instead" is a manual fallback for when this page isn't
-  // embedded in Missive (or Missive isn't configured); pasted text only fills
-  // the search box, since it changes with every keystroke.
-  const [showEmailPanel, setShowEmailPanel] = useState(false);
-  const [emailText, setEmailText] = useState("");
+  // Order/reference detection: MissiveEmailSense below senses whichever
+  // email the CSR currently has open in Missive; opening an email with a
+  // reference in it starts the lookup right away, so the answer is usually
+  // there by the time the email is read. Outside Missive the CSR types the
+  // reference into the search box (this page has no paste-an-email box).
   const [detectedRefs, setDetectedRefs] = useState<DetectedReference[]>([]);
   // Tracks the value we last auto-filled so re-detecting doesn't fight a
   // value the CSR has since edited by hand in the search box.
   const lastAutoFilledRef = useRef<string | null>(null);
-  // Auto-opens the paste fallback once, the first time we learn Missive
-  // sensing isn't available — never re-opens it if the CSR then hides it.
-  const autoOpenedPasteRef = useRef(false);
   // The reference last looked up because an email was opened, so reopening
   // or re-sensing the same email doesn't start the same lookup again.
   const lastAutoLookedUpRef = useRef<string | null>(null);
@@ -293,7 +275,6 @@ export default function WebAgentHome() {
       setState({
         status: "success",
         order: body.order,
-        foundViaCaller: body.foundViaCaller,
         account: body.account ?? null,
         orderTrackingId: body.orderTrackingId ?? null,
         reviewOrderUrl: body.reviewOrderUrl ?? null,
@@ -350,9 +331,8 @@ export default function WebAgentHome() {
     }
   }
 
-  // Shared by both detection sources (Missive-sensed text and the manual
-  // paste fallback): scans the text and, when a new top candidate shows up,
-  // drops it into the search box. It only sets state and returns the top
+  // Scans the Missive-sensed email text and, when a new top candidate shows
+  // up, drops it into the search box. It only sets state and returns the top
   // candidate; starting a lookup is up to the caller. The search box stays a
   // normal controlled input, so the CSR can freely retype or correct it.
   function applyDetectedText(text: string): string | null {
@@ -367,29 +347,13 @@ export default function WebAgentHome() {
     return top?.value ?? null;
   }
 
-  function handleEmailTextChange(value: string) {
-    setEmailText(value);
-    applyDetectedText(value);
-  }
-
   // Called by MissiveEmailSense whenever the CSR opens a different email in
-  // Missive. Mirrors the pasted text into the same textarea (so expanding
-  // the fallback panel shows exactly what was scanned, and can be
-  // hand-corrected), runs the same detection path, and looks the top
-  // reference up straight away.
+  // Missive: runs detection and looks the top reference up straight away.
   function handleMissiveEmailText(text: string) {
-    setEmailText(text);
     const top = applyDetectedText(text);
     if (top && top !== lastAutoLookedUpRef.current) {
       lastAutoLookedUpRef.current = top;
       void handleLookup(top);
-    }
-  }
-
-  function handleMissiveStatusChange(status: MissiveSenseStatus) {
-    if (!autoOpenedPasteRef.current && (status === "not-embedded" || status === "not-configured")) {
-      autoOpenedPasteRef.current = true;
-      setShowEmailPanel(true);
     }
   }
 
@@ -400,14 +364,7 @@ export default function WebAgentHome() {
     setReferenceNumber(value);
   }
 
-  function clearEmailPanel() {
-    setEmailText("");
-    setDetectedRefs([]);
-    lastAutoFilledRef.current = null;
-  }
-
   const order = state.status === "success" ? state.order : null;
-  const foundViaCaller = state.status === "success" ? state.foundViaCaller : null;
   const orderAccount = state.status === "success" ? state.account : null;
   const orderTrackingId = state.status === "success" ? state.orderTrackingId : null;
   const reviewOrderLink = state.status === "success" ? state.reviewOrderUrl : null;
@@ -494,7 +451,7 @@ export default function WebAgentHome() {
           <div className="mt-3 flex flex-col gap-2">
             {/* Primary path: senses whichever email is open in Missive and
                 fills the search box above automatically — no paste needed. */}
-            <MissiveEmailSense onEmailText={handleMissiveEmailText} onStatusChange={handleMissiveStatusChange} />
+            <MissiveEmailSense onEmailText={handleMissiveEmailText} pasteFallback={false} />
 
             {detectedRefs.length > 0 && (
               <div className="flex flex-wrap items-center gap-2">
@@ -514,46 +471,6 @@ export default function WebAgentHome() {
                     {ref.value}
                   </button>
                 ))}
-              </div>
-            )}
-
-            <button
-              type="button"
-              onClick={() => setShowEmailPanel((prev) => !prev)}
-              className="inline-flex w-fit items-center gap-1.5 text-xs font-medium text-zinc-500 transition-colors hover:text-indigo-600 dark:text-zinc-400 dark:hover:text-indigo-400"
-            >
-              <MailIcon className="h-3.5 w-3.5" />
-              {showEmailPanel ? "Hide pasted email" : "Paste an email instead"}
-            </button>
-
-            {showEmailPanel && (
-              <div className="rounded-xl border border-zinc-200 bg-zinc-50 p-3 dark:border-zinc-800 dark:bg-zinc-950/40">
-                <textarea
-                  value={emailText}
-                  onChange={(e) => handleEmailTextChange(e.target.value)}
-                  placeholder="Paste the customer's email here — we'll scan it for an order or reference number and fill in the search box above. You can still edit the search box before looking it up."
-                  rows={5}
-                  className="w-full resize-y rounded-lg border border-zinc-300 bg-white p-2.5 text-xs leading-relaxed text-zinc-800 outline-none transition-shadow focus:border-indigo-500 focus:ring-4 focus:ring-indigo-500/15 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200"
-                />
-                <div className="mt-2 flex flex-wrap items-center gap-2">
-                  {detectedRefs.length === 0 &&
-                    (emailText.trim() ? (
-                      <span className="text-xs text-zinc-500 dark:text-zinc-400">
-                        No order or reference number detected — you can still type one into the search box above.
-                      </span>
-                    ) : (
-                      <span className="text-xs text-zinc-400 dark:text-zinc-500">Nothing pasted yet.</span>
-                    ))}
-                  {emailText && (
-                    <button
-                      type="button"
-                      onClick={clearEmailPanel}
-                      className="ml-auto text-xs font-medium text-zinc-400 hover:text-zinc-600 hover:underline dark:hover:text-zinc-300"
-                    >
-                      Clear
-                    </button>
-                  )}
-                </div>
               </div>
             )}
           </div>
@@ -613,18 +530,12 @@ export default function WebAgentHome() {
         {order && (
           <div className="flex flex-col gap-6">
             <section className={`rounded-2xl border border-zinc-200/70 bg-white ${card} shadow-sm dark:border-zinc-800/70 dark:bg-zinc-900`}>
-              <div className="mb-1 flex flex-wrap items-center justify-between gap-2">
-                <div className="flex flex-wrap items-center gap-2">
-                  <h2 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">
-                    {order.referenceNumber}
-                  </h2>
-                  <Badge tone="indigo">
-                    Source: Web agent{foundViaCaller ? ` (${foundViaCaller})` : ""}
-                  </Badge>
-                  {orderAccount && <Badge tone="zinc">Account {orderAccount}</Badge>}
-                  {orderTrackingId && <Badge tone="zinc">Tracking ID {orderTrackingId}</Badge>}
-                </div>
-                <span className="text-xs text-zinc-500 dark:text-zinc-400">Carrier: {order.carrier}</span>
+              <div className="mb-1 flex flex-wrap items-center gap-2">
+                <h2 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">
+                  {order.referenceNumber}
+                </h2>
+                {orderAccount && <Badge tone="zinc">Account {orderAccount}</Badge>}
+                {orderTrackingId && <Badge tone="zinc">Tracking ID {orderTrackingId}</Badge>}
               </div>
               <p className="text-sm text-zinc-500 dark:text-zinc-400">{order.customer}</p>
               {reviewOrderLink && (
@@ -716,23 +627,6 @@ export default function WebAgentHome() {
                         Not yet available
                         {order.pod.receivedBy ? ` (POD name entered: ${order.pod.receivedBy})` : ""}
                       </p>
-                    )}
-                    {order.pod.activity && order.pod.activity.length > 0 && (
-                      <details className="mt-2 text-sm">
-                        <summary className="cursor-pointer text-zinc-500 hover:text-zinc-700 dark:text-zinc-400 dark:hover:text-zinc-200">
-                          POD activity ({order.pod.activity.length})
-                        </summary>
-                        <ul className="mt-1.5 space-y-1">
-                          {order.pod.activity.map((entry, i) => (
-                            <li key={i} className="text-zinc-600 dark:text-zinc-400">
-                              <span className="text-zinc-400 dark:text-zinc-500">
-                                {entry.at ? formatMaybeDate(entry.at) : "—"} · {entry.kind}
-                              </span>{" "}
-                              <span className="break-words">{entry.text}</span>
-                            </li>
-                          ))}
-                        </ul>
-                      </details>
                     )}
                   </div>
                 </div>

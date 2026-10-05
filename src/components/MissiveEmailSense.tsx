@@ -64,12 +64,19 @@ type ConversationTextResponse = {
   error?: string;
 };
 
-function statusLabel(status: MissiveSenseStatus, subject: string, errorMessage: string): string {
+function statusLabel(
+  status: MissiveSenseStatus,
+  subject: string,
+  errorMessage: string,
+  pasteFallback: boolean,
+): string {
   switch (status) {
     case "loading-script":
       return "Connecting to Missive…";
     case "not-embedded":
-      return "Not opened inside Missive — paste an email below to detect its order #.";
+      return pasteFallback
+        ? "Not opened inside Missive — paste an email below to detect its order #."
+        : "Not opened inside Missive — type an order # above.";
     case "waiting":
       return "Open an email in Missive — its order # will appear in the search box above.";
     case "scanning":
@@ -79,7 +86,9 @@ function statusLabel(status: MissiveSenseStatus, subject: string, errorMessage: 
     case "empty":
       return "No order or reference number detected in the selected email.";
     case "not-configured":
-      return "Missive isn't connected yet (set MISSIVE_API_TOKEN) — paste an email below instead.";
+      return pasteFallback
+        ? "Missive isn't connected yet (set MISSIVE_API_TOKEN) — paste an email below instead."
+        : "Missive isn't connected yet (set MISSIVE_API_TOKEN) — type an order # above.";
     case "error":
       return errorMessage || "Couldn't read the selected Missive email.";
     default:
@@ -95,9 +104,12 @@ function statusLabel(status: MissiveSenseStatus, subject: string, errorMessage: 
 export function MissiveEmailSense({
   onEmailText,
   onStatusChange,
+  pasteFallback = true,
 }: {
   onEmailText: (text: string, meta: { subject: string; from: string; conversationId: string }) => void;
   onStatusChange?: (status: MissiveSenseStatus) => void;
+  /** Whether the page has a "paste an email" box for the status line to point to. */
+  pasteFallback?: boolean;
 }) {
   const [status, setStatus] = useState<MissiveSenseStatus>("loading-script");
   const [subject, setSubject] = useState("");
@@ -240,7 +252,7 @@ export function MissiveEmailSense({
                   : "bg-zinc-300 dark:bg-zinc-600"
           }`}
         />
-        <span>{statusLabel(status, subject, errorMessage)}</span>
+        <span>{statusLabel(status, subject, errorMessage, pasteFallback)}</span>
         {selectedConversationId && status !== "scanning" && (
           <button
             type="button"
