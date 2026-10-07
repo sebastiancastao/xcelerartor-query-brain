@@ -861,6 +861,43 @@ function mergePod(
   };
 }
 
+/** An order-list time ("2026-10-07T05:40:00", wall clock) as the same zone-less ISO string portalDate gives. */
+function listTime(value: string | null | undefined): string | null {
+  const v = value?.trim();
+  if (!v) return null;
+  const iso = v.match(/^(\d{4})-\d{2}-\d{2}T\d{2}:\d{2}/);
+  if (!iso) return portalDate(v);
+  return Number(iso[1]) < 2000 ? null : `${iso[0]}:00`;
+}
+
+/**
+ * Pickup and delivery arrival and departure times from the order list row.
+ * The order window only shows the two arrivals (it has no op_*Departure
+ * fields, checked 2026-10-07), while the list row has all four, filled on
+ * nearly every completed order. The row's times win and the window's
+ * arrivals fill in when the row has none. This also swaps the list-row
+ * fallback's delivery time (POD D/T, usually the same as the departure) for
+ * the actual delivery arrival.
+ */
+function withStopTimes(order: OrderInquiry, row: OrderListRow): OrderInquiry {
+  const pickupArrivedAt = listTime(row.PickupArrival) ?? order.pickup.arrivedAt;
+  return {
+    ...order,
+    status: order.status === "pending_pickup" && pickupArrivedAt ? "in_transit" : order.status,
+    pickup: {
+      ...order.pickup,
+      arrived: order.pickup.arrived || Boolean(pickupArrivedAt),
+      arrivedAt: pickupArrivedAt,
+      departedAt: listTime(row.PickupDeparture) ?? order.pickup.departedAt,
+    },
+    delivery: {
+      ...order.delivery,
+      deliveredAt: listTime(row.DeliveryArrival) ?? order.delivery.deliveredAt,
+      departedAt: listTime(row.DeliveryDeparture) ?? order.delivery.departedAt,
+    },
+  };
+}
+
 function numberOrNull(value: string | undefined): number | null {
   if (!value?.trim()) return null;
   const n = Number(value.replace(/[^0-9.-]/g, ""));
@@ -1173,11 +1210,11 @@ async function readListHit(
   const rowPod = { receivedBy: row.PODname, signedAt: row.PODcompletion };
   const window = await openOrderWindow(page, row);
   if (window) {
-    const order = mergePod(orderFromWindow(window, referenceNumber), rowPod);
+    const order = withStopTimes(mergePod(orderFromWindow(window, referenceNumber), rowPod), row);
     log("read order", `${orderTrackingId}: ${order.status.replace("_", " ")} (${Date.now() - started} ms)`);
     return { order, orderTrackingId: window.fields.OrderTrackingID2 || orderTrackingId, account };
   }
-  const order = mergePod(mapPortalOrderListRowToInquiryFallback(row), rowPod);
+  const order = withStopTimes(mergePod(mapPortalOrderListRowToInquiryFallback(row), rowPod), row);
   log(
     "read order",
     `${orderTrackingId}: ${order.status.replace("_", " ")}, from the order list, because the portal would not open ` +

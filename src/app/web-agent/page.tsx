@@ -144,14 +144,22 @@ function formatDims(pkg: { length: number | null; width: number | null; height: 
   return `${pkg.length} x ${pkg.width} x ${pkg.height} in`;
 }
 
+/** A stop's arrival or departure time, or what to say when there is none. */
+function formatStopTime(value: string | null, missing: string): string {
+  return value ? formatMaybeDate(value) : missing;
+}
+
 function StatusRow({
   label,
   answer,
   positive,
+  times,
 }: {
   label: string;
   answer: string;
   positive: boolean;
+  /** Arrival and departure lines shown under the answer, already formatted. */
+  times?: { arrived: string; departed: string };
 }) {
   return (
     <div className="flex items-start gap-3 py-3.5">
@@ -167,6 +175,14 @@ function StatusRow({
       <div>
         <p className="text-sm font-medium text-zinc-900 dark:text-zinc-100">{label}</p>
         <p className="mt-0.5 text-sm text-zinc-600 dark:text-zinc-400">{answer}</p>
+        {times && (
+          <dl className="mt-1 grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 text-sm">
+            <dt className="text-zinc-500 dark:text-zinc-400">Arrived</dt>
+            <dd className="text-zinc-800 dark:text-zinc-200">{times.arrived}</dd>
+            <dt className="text-zinc-500 dark:text-zinc-400">Departed</dt>
+            <dd className="text-zinc-800 dark:text-zinc-200">{times.departed}</dd>
+          </dl>
+        )}
       </div>
     </div>
   );
@@ -566,8 +582,19 @@ export default function WebAgentHome() {
                   positive={order.pickup.arrived}
                   answer={
                     order.pickup.arrived
-                      ? `Yes — arrived at ${order.pickup.location} on ${formatMaybeDate(order.pickup.arrivedAt)}`
+                      ? `Yes — arrived at ${order.pickup.location}`
                       : `Not yet — scheduled for ${formatMaybeDate(order.pickup.scheduledAt)} at ${order.pickup.location}`
+                  }
+                  times={
+                    order.pickup.arrived
+                      ? {
+                          arrived: formatStopTime(order.pickup.arrivedAt, "Not recorded"),
+                          departed: formatStopTime(
+                            order.pickup.departedAt,
+                            order.delivery.delivered ? "Not recorded" : "Not yet",
+                          ),
+                        }
+                      : undefined
                   }
                 />
                 <StatusRow
@@ -575,8 +602,16 @@ export default function WebAgentHome() {
                   positive={order.delivery.delivered}
                   answer={
                     order.delivery.delivered
-                      ? `Yes — delivered to ${order.delivery.location} on ${formatMaybeDate(order.delivery.deliveredAt)}`
+                      ? `Yes — delivered to ${order.delivery.location}`
                       : `Not yet — scheduled for ${formatMaybeDate(order.delivery.scheduledAt)} at ${order.delivery.location}`
+                  }
+                  times={
+                    order.delivery.delivered
+                      ? {
+                          arrived: formatStopTime(order.delivery.deliveredAt, "Not recorded"),
+                          departed: formatStopTime(order.delivery.departedAt, "Not yet"),
+                        }
+                      : undefined
                   }
                 />
                 <div className="flex items-start gap-3 py-3.5">
@@ -697,7 +732,14 @@ export default function WebAgentHome() {
                         value={formatContact(order.pickup.contact, order.pickup.phone, order.pickup.email)}
                       />
                       <Field label="Pickup Target" value={formatMaybeDate(order.pickup.scheduledTo)} />
-                      <Field label="Departed" value={formatMaybeDate(order.pickup.departedAt)} />
+                      <Field
+                        label="Pickup Arrival"
+                        value={order.pickup.arrivedAt ? formatMaybeDate(order.pickup.arrivedAt) : null}
+                      />
+                      <Field
+                        label="Pickup Departure"
+                        value={order.pickup.departedAt ? formatMaybeDate(order.pickup.departedAt) : null}
+                      />
                       <Field label="Special instructions" value={order.pickup.specialInstructions} />
                     </div>
                     <div className="space-y-3">
@@ -719,7 +761,14 @@ export default function WebAgentHome() {
                         value={formatContact(order.delivery.contact, order.delivery.phone, order.delivery.email)}
                       />
                       <Field label="Delivery Target" value={formatMaybeDate(order.delivery.scheduledTo)} />
-                      <Field label="Departed" value={formatMaybeDate(order.delivery.departedAt)} />
+                      <Field
+                        label="Delivery Arrival"
+                        value={order.delivery.deliveredAt ? formatMaybeDate(order.delivery.deliveredAt) : null}
+                      />
+                      <Field
+                        label="Delivery Departure"
+                        value={order.delivery.departedAt ? formatMaybeDate(order.delivery.departedAt) : null}
+                      />
                       <Field label="Special instructions" value={order.delivery.specialInstructions} />
                     </div>
                   </div>
