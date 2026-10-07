@@ -585,17 +585,13 @@ export default function WebAgentHome() {
                       ? `Yes — arrived at ${order.pickup.location}`
                       : `Not yet — scheduled for ${formatMaybeDate(order.pickup.scheduledAt)} at ${order.pickup.location}`
                   }
-                  times={
-                    order.pickup.arrived
-                      ? {
-                          arrived: formatStopTime(order.pickup.arrivedAt, "Not recorded"),
-                          departed: formatStopTime(
-                            order.pickup.departedAt,
-                            order.delivery.delivered ? "Not recorded" : "Not yet",
-                          ),
-                        }
-                      : undefined
-                  }
+                  times={{
+                    arrived: formatStopTime(order.pickup.arrivedAt, order.pickup.arrived ? "Not recorded" : "Not yet"),
+                    departed: formatStopTime(
+                      order.pickup.departedAt,
+                      order.delivery.delivered || order.delivery.deliveredAt ? "Not recorded" : "Not yet",
+                    ),
+                  }}
                 />
                 <StatusRow
                   label="Has this order been delivered?"
@@ -605,14 +601,13 @@ export default function WebAgentHome() {
                       ? `Yes — delivered to ${order.delivery.location}`
                       : `Not yet — scheduled for ${formatMaybeDate(order.delivery.scheduledAt)} at ${order.delivery.location}`
                   }
-                  times={
-                    order.delivery.delivered
-                      ? {
-                          arrived: formatStopTime(order.delivery.deliveredAt, "Not recorded"),
-                          departed: formatStopTime(order.delivery.departedAt, "Not yet"),
-                        }
-                      : undefined
-                  }
+                  times={{
+                    arrived: formatStopTime(
+                      order.delivery.deliveredAt,
+                      order.delivery.delivered ? "Not recorded" : "Not yet",
+                    ),
+                    departed: formatStopTime(order.delivery.departedAt, "Not yet"),
+                  }}
                 />
                 <div className="flex items-start gap-3 py-3.5">
                   <span
