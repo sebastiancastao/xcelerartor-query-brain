@@ -7,9 +7,15 @@ export type ToolCall = {
   function: { name: string; arguments: string };
 };
 
+/** Parts of a user message: text, an image (URL or data: URL), or a PDF as a data: URL. */
+export type UserContentPart =
+  | { type: "text"; text: string }
+  | { type: "image_url"; image_url: { url: string; detail?: "auto" | "low" | "high" } }
+  | { type: "file"; file: { filename: string; file_data: string } };
+
 export type ChatMessage =
   | { role: "system"; content: string }
-  | { role: "user"; content: string }
+  | { role: "user"; content: string | UserContentPart[] }
   | { role: "assistant"; content: string | null; tool_calls?: ToolCall[] }
   | { role: "tool"; tool_call_id: string; content: string };
 
@@ -44,6 +50,8 @@ export async function chatCompletion(params: {
   temperature?: number;
   /** Overrides OPENAI_MODEL for this one call. */
   model?: string;
+  /** "json_object" makes the model reply with a single JSON object (the prompt must mention JSON). */
+  responseFormat?: { type: "json_object" };
 }): Promise<ChatCompletionResponse> {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
@@ -63,6 +71,7 @@ export async function chatCompletion(params: {
       tool_choice: params.toolChoice,
       max_tokens: params.maxTokens,
       temperature: params.temperature ?? 0.2,
+      response_format: params.responseFormat,
     }),
   });
 

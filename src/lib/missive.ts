@@ -1,9 +1,9 @@
-// Server-side Missive REST client — deliberately minimal. All we need for
-// order-reference sensing is the subject + body text of the message a CSR
-// currently has open in Missive; we don't fetch attachments, classify
-// documents, or scan whole conversation histories the way a full ticketing
-// integration would. See src/lib/reference-detection.ts for what happens to
-// this text once it comes back.
+// Server-side Missive REST client — deliberately minimal. Order-reference
+// sensing needs the subject + body text of the message a CSR currently has
+// open in Missive (see src/lib/reference-detection.ts for what happens to
+// it). The documents panel needs the conversation's latest messages with
+// their attachments and bodies (fetchConversationMessages below; see
+// src/lib/email-documents.ts).
 
 const API_BASE = "https://public.missiveapp.com/v1";
 
@@ -130,4 +130,70 @@ export async function fetchMissiveConversationText(
       (message.delivered_at ?? conversation.last_activity_at ?? Date.now() / 1000) * 1000
     ).toISOString(),
   };
+}
+
+/** A file attached to a Missive message. `url` is a signed download link that expires after about 10 minutes. */
+export type MissiveAttachment = {
+  id: string;
+  filename: string | null;
+  extension: string | null;
+  url: string | null;
+  media_type: string | null;
+  sub_type: string | null;
+  size: number | null;
+  width: number | null;
+  height: number | null;
+};
+
+export type MissiveThreadMessage = {
+  id: string;
+  subject: string | null;
+  from: string;
+  receivedAt: string | null;
+  attachments: MissiveAttachment[];
+  /** The message body (usually HTML); null unless bodies were asked for. */
+  body: string | null;
+};
+
+type MissiveListedMessage = MissiveMessageSummary & {
+  subject?: string | null;
+  from_field?: MissiveAddress | null;
+  attachments?: MissiveAttachment[] | null;
+};
+
+/**
+ * The latest messages of a conversation (up to 10, Missive's page size),
+ * newest first, with their attachments. Missive's message list already
+ * carries attachments with fresh download links; bodies take one more
+ * request, since /messages/<id1>,<id2>,... returns several messages at once.
+ */
+export async function fetchConversationMessages(
+  conversationId: string,
+  options: { bodies?: boolean } = {},
+): Promise<MissiveThreadMessage[]> {
+  const { messages: listed } = await missiveGet<{ messages: MissiveListedMessage[] }>(
+    `/conversations/${conversationId}/messages`,
+    { limit: "10" },
+  );
+  if (!listed?.length) return [];
+
+  const bodies = new Map<string, string | null>();
+  if (options.bodies) {
+    const { messages } = await missiveGet<{ messages: MissiveMessage | MissiveMessage[] }>(
+      `/messages/${listed.map((m) => m.id).join(",")}`,
+      {},
+    );
+    for (const message of Array.isArray(messages) ? messages : [messages]) {
+      if (message) bodies.set(message.id, message.body ?? null);
+    }
+  }
+
+  return listed.map((m) => ({
+    id: m.id,
+    subject: m.subject ?? null,
+    from: m.from_field?.address ?? "",
+    receivedAt: m.delivered_at ? new Date(m.delivered_at * 1000).toISOString() : null,
+    attachments: m.attachments ?? [],
+    body: bodies.get(m.id) ?? null,
+  }));
 }

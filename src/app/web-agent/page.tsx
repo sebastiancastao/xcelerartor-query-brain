@@ -7,7 +7,8 @@ import type { OrderInquiry } from "@/lib/xcelerator";
 import type { WebAgentStep } from "@/lib/web-agent";
 import { buildSuggestedReply } from "@/lib/email";
 import { detectOrderReferences, type DetectedReference } from "@/lib/reference-detection";
-import { MissiveEmailSense, openLinkInNewTab } from "@/components/MissiveEmailSense";
+import { MissiveEmailSense, openLinkInNewTab, type MissiveSenseStatus } from "@/components/MissiveEmailSense";
+import { EmailDocuments } from "@/components/EmailDocuments";
 
 type LookupState =
   | { status: "idle" }
@@ -239,6 +240,11 @@ export default function WebAgentHome() {
   // Numbers each lookup. Opening another email starts a new lookup while the
   // previous one may still be running; only the newest one may show its result.
   const lookupSeqRef = useRef(0);
+  // The Missive email whose attachments and document links are listed;
+  // scanId changes on every scan (Rescan included) so the list reloads.
+  const [emailScan, setEmailScan] = useState<{ conversationId: string; scanId: number } | null>(null);
+  // How many documents that email has, for the link under the search box.
+  const [documentCount, setDocumentCount] = useState<number | null>(null);
 
   useEffect(() => {
     fetch("/api/config")
@@ -365,7 +371,8 @@ export default function WebAgentHome() {
 
   // Called by MissiveEmailSense whenever the CSR opens a different email in
   // Missive: runs detection and looks the top reference up straight away.
-  function handleMissiveEmailText(text: string) {
+  function handleMissiveEmailText(text: string, meta: { conversationId: string }) {
+    setEmailScan((prev) => ({ conversationId: meta.conversationId, scanId: (prev?.scanId ?? 0) + 1 }));
     const top = applyDetectedText(text);
     if (top && top !== lastAutoLookedUpRef.current) {
       lastAutoLookedUpRef.current = top;
@@ -467,7 +474,17 @@ export default function WebAgentHome() {
           <div className="mt-3 flex flex-col gap-2">
             {/* Primary path: senses whichever email is open in Missive and
                 fills the search box above automatically — no paste needed. */}
-            <MissiveEmailSense onEmailText={handleMissiveEmailText} pasteFallback={false} />
+            <MissiveEmailSense
+              onEmailText={handleMissiveEmailText}
+              onStatusChange={(status: MissiveSenseStatus) => {
+                // No single email open any more: drop the old email's documents.
+                if (status === "waiting" || status === "empty") {
+                  setEmailScan(null);
+                  setDocumentCount(null);
+                }
+              }}
+              pasteFallback={false}
+            />
 
             {detectedRefs.length > 0 && (
               <div className="flex flex-wrap items-center gap-2">
@@ -488,6 +505,16 @@ export default function WebAgentHome() {
                   </button>
                 ))}
               </div>
+            )}
+
+            {documentCount !== null && documentCount > 0 && (
+              <button
+                type="button"
+                onClick={() => document.getElementById("email-documents")?.scrollIntoView({ behavior: "smooth" })}
+                className="self-start text-xs font-medium text-indigo-600 hover:underline dark:text-indigo-400"
+              >
+                View {documentCount} {documentCount === 1 ? "document" : "documents"} in this email
+              </button>
             )}
           </div>
 
@@ -862,6 +889,20 @@ export default function WebAgentHome() {
 
           </div>
         )}
+
+        <EmailDocuments
+          conversationId={emailScan?.conversationId ?? null}
+          scanId={emailScan?.scanId ?? 0}
+          onLookup={(reference) => {
+            applyDetectedReference(reference);
+            void handleLookup(reference);
+            // The result shows at the top of the page, above the documents.
+            window.scrollTo({ top: 0, behavior: "smooth" });
+          }}
+          onCount={setDocumentCount}
+          cardClass={card}
+        />
+
         {steps.length > 0 && state.status !== "loading" && (
           <section className={`rounded-2xl border border-zinc-200/70 bg-white ${card} shadow-sm dark:border-zinc-800/70 dark:bg-zinc-900`}>
             <h2 className="mb-3 text-sm font-semibold text-zinc-900 dark:text-zinc-100">What the agent did</h2>
