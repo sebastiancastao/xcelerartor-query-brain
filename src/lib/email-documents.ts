@@ -39,8 +39,19 @@ export type EmailDocument = {
   preview: DocumentPreview | null;
   /** Whether a summary can be made; when it can't, `note` says why. */
   summarizable: boolean;
+  /** Whether Xcelerator would take it as an order document (PDF, JPG, PNG, GIF or BMP up to 25 MB). */
+  attachable: boolean;
   note: string | null;
 };
+
+/** File types Xcelerator's ClientPortal accepts on an order (MainFrame.js allowedExtensions). */
+const ORDER_FILE_EXTENSIONS = new Set(["pdf", "jpg", "jpeg", "png", "gif", "bmp"]);
+const MAX_ORDER_FILE_BYTES = 25 * 1024 * 1024;
+
+function isAttachable(kind: FileKind, extension: string | null, size: number | null): boolean {
+  if ((size ?? 0) > MAX_ORDER_FILE_BYTES) return false;
+  return kind === "pdf" || ORDER_FILE_EXTENSIONS.has((extension ?? "").toLowerCase());
+}
 
 export type DocumentSummary = {
   /** e.g. "Bill of lading", "Pickup request", "Invoice". */
@@ -329,6 +340,7 @@ function buildListing(conversationId: string, messages: MissiveThreadMessage[]):
         fileUrl: fileRoute(conversationId, id),
         preview: tooBig ? null : previewFor(kind),
         summarizable,
+        attachable: isAttachable(kind, a.extension, a.size ?? null),
         note: summarizable
           ? null
           : tooBig
@@ -363,6 +375,7 @@ function buildListing(conversationId: string, messages: MissiveThreadMessage[]):
         fileUrl: plan.fetchUrl ? fileRoute(conversationId, id) : null,
         preview: plan.fetchUrl ? previewFor(plan.kind) : null,
         summarizable: Boolean(plan.fetchUrl),
+        attachable: Boolean(plan.fetchUrl) && isAttachable(plan.kind, url.pathname.match(DOCUMENT_PATH)?.[1] ?? null, null),
         note: plan.note,
       });
     }

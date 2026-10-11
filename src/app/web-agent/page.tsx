@@ -8,7 +8,9 @@ import type { WebAgentStep } from "@/lib/web-agent";
 import { buildSuggestedReply } from "@/lib/email";
 import { detectOrderReferences, type DetectedReference } from "@/lib/reference-detection";
 import { MissiveEmailSense, openLinkInNewTab, type MissiveSenseStatus } from "@/components/MissiveEmailSense";
-import { EmailDocuments } from "@/components/EmailDocuments";
+import { EmailDocuments, type EmailDocumentList } from "@/components/EmailDocuments";
+import { UploadDocumentsToOrder } from "@/components/UploadDocumentsToOrder";
+import { useOrderAttachments } from "@/components/useOrderAttachments";
 
 type LookupState =
   | { status: "idle" }
@@ -21,6 +23,8 @@ type LookupState =
       account: string | null;
       /** Xcelerator's own id for the order, read off the order window. */
       orderTrackingId: string | null;
+      /** The ClientPortal login that found the order; documents are attached through it. */
+      foundViaCaller: string | null;
       /** The order's back-office Review Order screen (…/ReviewOrder?_p_Odata=<tracking id>). */
       reviewOrderUrl: string | null;
       /** e.g. "found under the QUKIN account instead of the default one" or "the default Xcelerator login is currently failing" — surfaced so a CSR knows to flag it rather than the app silently papering over it. */
@@ -243,8 +247,10 @@ export default function WebAgentHome() {
   // The Missive email whose attachments and document links are listed;
   // scanId changes on every scan (Rescan included) so the list reloads.
   const [emailScan, setEmailScan] = useState<{ conversationId: string; scanId: number } | null>(null);
-  // How many documents that email has, for the link under the search box.
-  const [documentCount, setDocumentCount] = useState<number | null>(null);
+  // That email's documents as the documents panel loaded them, for the link
+  // under the search box and the order card's "Upload documents" button.
+  const [emailDocs, setEmailDocs] = useState<EmailDocumentList | null>(null);
+  const documentCount = emailDocs?.status === "ready" ? emailDocs.documents.length : null;
 
   useEffect(() => {
     fetch("/api/config")
@@ -299,6 +305,7 @@ export default function WebAgentHome() {
         order: body.order,
         account: body.account ?? null,
         orderTrackingId: body.orderTrackingId ?? null,
+        foundViaCaller: body.foundViaCaller ?? null,
         reviewOrderUrl: body.reviewOrderUrl ?? null,
         warning: body.warning,
       });
@@ -392,6 +399,13 @@ export default function WebAgentHome() {
   const orderTrackingId = state.status === "success" ? state.orderTrackingId : null;
   const reviewOrderLink = state.status === "success" ? state.reviewOrderUrl : null;
   const lookupWarning = state.status === "success" ? state.warning : null;
+  const attachTarget =
+    state.status === "success" && state.orderTrackingId && state.foundViaCaller
+      ? { reference: state.order.referenceNumber, orderTrackingId: state.orderTrackingId, caller: state.foundViaCaller }
+      : null;
+  // Attaching the email's documents to that order, shared by the order card's
+  // "Upload documents" button and the documents panel's per-file buttons.
+  const attachments = useOrderAttachments(emailScan?.conversationId ?? null, emailScan?.scanId ?? 0, attachTarget);
 
   return (
     <div className="flex flex-1 flex-col bg-gradient-to-b from-zinc-50 to-white font-sans dark:from-zinc-950 dark:to-zinc-900">
@@ -480,7 +494,7 @@ export default function WebAgentHome() {
                 // No single email open any more: drop the old email's documents.
                 if (status === "waiting" || status === "empty") {
                   setEmailScan(null);
-                  setDocumentCount(null);
+                  setEmailDocs(null);
                 }
               }}
               pasteFallback={false}
@@ -602,6 +616,16 @@ export default function WebAgentHome() {
                     {linkCopied ? "Copied!" : "Copy"}
                   </button>
                 </div>
+              )}
+              {attachments.target && emailScan && (
+                <UploadDocumentsToOrder
+                  key={`${emailScan.conversationId}|${attachments.target.orderTrackingId}|${attachments.target.caller}`}
+                  attachments={attachments}
+                  list={emailDocs}
+                  onShowDocuments={() =>
+                    document.getElementById("email-documents")?.scrollIntoView({ behavior: "smooth" })
+                  }
+                />
               )}
               <div className="mt-2 divide-y divide-zinc-100 dark:divide-zinc-800">
                 <StatusRow
@@ -899,7 +923,8 @@ export default function WebAgentHome() {
             // The result shows at the top of the page, above the documents.
             window.scrollTo({ top: 0, behavior: "smooth" });
           }}
-          onCount={setDocumentCount}
+          onList={setEmailDocs}
+          attachments={attachments}
           cardClass={card}
         />
 

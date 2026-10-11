@@ -3,11 +3,15 @@
 import { useEffect, useRef, useState } from "react";
 import type { DocumentSummary, EmailDocument } from "@/lib/email-documents";
 import { openLinkInNewTab } from "./MissiveEmailSense";
+import type { AttachState, AttachTarget, OrderAttachments, OrderDocument } from "./useOrderAttachments";
 
-type ListState =
+/** The open email's documents, as the panel last loaded them. */
+export type EmailDocumentList =
   | { status: "loading" }
   | { status: "error"; message: string }
   | { status: "ready"; documents: EmailDocument[]; summariesEnabled: boolean };
+
+type ListState = EmailDocumentList;
 
 type SummaryState =
   | { status: "loading" }
@@ -47,6 +51,8 @@ function DocumentIcon({ className }: { className?: string }) {
 
 const buttonClass =
   "inline-flex items-center gap-1 rounded-lg border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-700 transition-colors hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800";
+const attachButtonClass =
+  "inline-flex items-center gap-1 rounded-lg border border-indigo-300 px-2 py-1 text-xs font-medium text-indigo-700 transition-colors hover:bg-indigo-50 dark:border-indigo-800 dark:text-indigo-300 dark:hover:bg-indigo-950";
 
 function Preview({ doc }: { doc: EmailDocument }) {
   if (!doc.fileUrl || !doc.preview) return null;
@@ -145,16 +151,84 @@ function SummaryBlock({
   );
 }
 
+/** The confirm step, progress and outcome of attaching one document to the order. */
+function AttachStatus({
+  doc,
+  state,
+  target,
+  similar,
+  onConfirm,
+  onCancel,
+}: {
+  doc: EmailDocument;
+  state: AttachState | undefined;
+  target: AttachTarget;
+  similar: OrderDocument | undefined;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  const already = similar ? `The order already has a file named “${similar.name}”.` : null;
+  if (!state) {
+    return already ? <p className="mt-2 text-xs text-zinc-500 dark:text-zinc-400">{already}</p> : null;
+  }
+  if (state.status === "confirm") {
+    return (
+      <div className="mt-2 rounded-lg border border-indigo-200 bg-indigo-50/60 p-3 text-sm dark:border-indigo-900 dark:bg-indigo-950/40">
+        <p className="text-zinc-800 dark:text-zinc-200">
+          Attach <span className="font-medium">{doc.name}</span> to order{" "}
+          <span className="font-medium">{target.reference}</span> in Xcelerator? Anyone who can open the order in the
+          portal, including the customer, will see it.
+        </p>
+        {already && <p className="mt-1 text-amber-700 dark:text-amber-400">{already}</p>}
+        <div className="mt-2 flex gap-1.5">
+          <button
+            type="button"
+            onClick={onConfirm}
+            className="rounded-lg bg-indigo-600 px-3 py-1 text-xs font-medium text-white hover:bg-indigo-500 dark:bg-indigo-500 dark:hover:bg-indigo-400"
+          >
+            {already ? "Attach anyway" : "Attach"}
+          </button>
+          <button type="button" onClick={onCancel} className={buttonClass}>
+            Cancel
+          </button>
+        </div>
+      </div>
+    );
+  }
+  if (state.status === "uploading") {
+    return (
+      <p className="mt-2 flex items-center gap-2 text-sm text-zinc-500 dark:text-zinc-400">
+        <span className="h-3 w-3 animate-spin rounded-full border-2 border-zinc-300 border-t-indigo-500" />
+        Attaching to order {target.reference}…
+      </p>
+    );
+  }
+  if (state.status === "done") {
+    return (
+      <p className="mt-2 flex items-start gap-1.5 text-sm text-emerald-700 dark:text-emerald-400">
+        <span aria-hidden="true">✓</span>
+        <span>
+          Attached to order {target.reference} as “{state.name}”.
+        </span>
+      </p>
+    );
+  }
+  return <p className="mt-2 text-sm text-amber-700 dark:text-amber-400">{state.message}</p>;
+}
+
 /**
  * Attachments and document links in the email open in Missive, each with an
- * AI summary, an inline preview and an Open button. Renders nothing until
- * an email is open, and nothing when the email has no documents.
+ * AI summary, an inline preview and an Open button, and, once an order is
+ * on screen, an "Attach to order" button that uploads PDFs and images to it
+ * in Xcelerator after the CSR confirms. Renders nothing until an email is
+ * open, and nothing when the email has no documents.
  */
 export function EmailDocuments({
   conversationId,
   scanId,
   onLookup,
-  onCount,
+  onList,
+  attachments,
   cardClass,
 }: {
   conversationId: string | null;
@@ -162,19 +236,26 @@ export function EmailDocuments({
   scanId: number;
   /** Looks up an order number found in a document. */
   onLookup: (reference: string) => void;
-  /** Told how many documents the email has once known, and null while unknown. */
-  onCount?: (count: number | null) => void;
+  /** Told the document list whenever it changes (loading, failed or loaded). */
+  onList?: (list: EmailDocumentList) => void;
+  /** Attaching documents to the order on screen, shared with the order card's upload button. */
+  attachments: OrderAttachments;
   cardClass: string;
 }) {
   const [list, setList] = useState<ListState>({ status: "loading" });
   const [summaries, setSummaries] = useState<Record<string, SummaryState>>({});
   const [previews, setPreviews] = useState<Record<string, boolean>>({});
+  const attachTarget = attachments.target;
+
   // Only the newest email's requests may update the panel.
   const seqRef = useRef(0);
-  const onCountRef = useRef(onCount);
+  const onListRef = useRef(onList);
   useEffect(() => {
-    onCountRef.current = onCount;
+    onListRef.current = onList;
   });
+  useEffect(() => {
+    onListRef.current?.(list);
+  }, [list]);
 
   async function summarize(id: string, seq: number) {
     if (!conversationId) return;
@@ -198,7 +279,6 @@ export function EmailDocuments({
   }
 
   useEffect(() => {
-    onCountRef.current?.(null);
     if (!conversationId) return;
     const seq = ++seqRef.current;
     // Resetting here is the point of this effect: a new email clears the old one's documents.
@@ -219,7 +299,6 @@ export function EmailDocuments({
         const documents = (data?.documents ?? []) as EmailDocument[];
         const summariesEnabled = Boolean(data?.summaries);
         setList({ status: "ready", documents, summariesEnabled });
-        onCountRef.current?.(documents.length);
         if (!summariesEnabled) return;
 
         const queue = documents.filter((d) => d.summarizable).slice(0, AUTO_SUMMARY_LIMIT).map((d) => d.id);
@@ -258,6 +337,13 @@ export function EmailDocuments({
         </p>
       )}
       {list.status === "error" && <p className="mt-3 text-sm text-amber-700 dark:text-amber-400">{list.message}</p>}
+      {list.status === "ready" && list.documents.some((d) => d.attachable) && (
+        <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+          {attachTarget
+            ? `PDFs and images can be attached to order ${attachTarget.reference} in Xcelerator.`
+            : "Look up the order to attach these files to it in Xcelerator."}
+        </p>
+      )}
 
       {list.status === "ready" && (
         <ul className="mt-3 divide-y divide-zinc-100 dark:divide-zinc-800">
@@ -269,6 +355,8 @@ export function EmailDocuments({
               doc.from ? `from ${doc.from}` : null,
             ].filter(Boolean);
             const canSummarize = list.summariesEnabled && doc.summarizable;
+            const attachState = attachments.states[doc.id];
+            const similar = attachments.similar(doc);
             return (
               <li key={doc.id} className="py-3 first:pt-0 last:pb-0">
                 <div className="flex min-w-0 items-start gap-2">
@@ -312,8 +400,27 @@ export function EmailDocuments({
                       {summary ? "Try again" : "Summarize"}
                     </button>
                   )}
+                  {attachTarget && doc.attachable && (!attachState || attachState.status === "error") && (
+                    <button
+                      type="button"
+                      onClick={() => attachments.ask(doc.id)}
+                      className={attachButtonClass}
+                    >
+                      {attachState ? "Try attaching again" : `Attach to order ${attachTarget.reference}`}
+                    </button>
+                  )}
                 </div>
 
+                {attachTarget && (
+                  <AttachStatus
+                    doc={doc}
+                    state={attachState}
+                    target={attachTarget}
+                    similar={similar}
+                    onConfirm={() => void attachments.attach(doc)}
+                    onCancel={() => attachments.cancel(doc.id)}
+                  />
+                )}
                 {previews[doc.id] && <Preview doc={doc} />}
                 {doc.note && !summary && <p className="mt-2 text-xs text-zinc-500 dark:text-zinc-400">{doc.note}</p>}
                 <SummaryBlock state={summary} onLookup={onLookup} />
