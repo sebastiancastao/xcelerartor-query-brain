@@ -217,6 +217,127 @@ function AttachStatus({
 }
 
 /**
+ * "Attach all": sends every PDF and image in the email to the order in one
+ * go, after one confirm. Files that look like ones already on the order are
+ * skipped (their own button still offers "Attach anyway"), as are files
+ * already attached. Give it a `key` per email and order so it resets.
+ */
+function AttachAll({
+  documents,
+  attachments,
+  target,
+}: {
+  documents: EmailDocument[];
+  attachments: OrderAttachments;
+  target: AttachTarget;
+}) {
+  const [confirming, setConfirming] = useState(false);
+  // The files the last "Attach all" sent, for its progress and summary.
+  const [run, setRun] = useState<string[] | null>(null);
+  // True only while this button's own run is going (busy also covers the order card's).
+  const [running, setRunning] = useState(false);
+  const { states, busy } = attachments;
+
+  const attachable = documents.filter((d) => d.attachable);
+  const open = attachable.filter((d) => {
+    const status = states[d.id]?.status;
+    return status !== "done" && status !== "uploading";
+  });
+  const pending = open.filter((d) => !attachments.similar(d));
+  const skipped = open.filter((d) => attachments.similar(d));
+
+  const settled = run ? run.filter((id) => states[id]?.status === "done" || states[id]?.status === "error").length : 0;
+  const attached = run ? run.filter((id) => states[id]?.status === "done").length : 0;
+  const failed = run ? run.filter((id) => states[id]?.status === "error").length : 0;
+
+  const summary = run && !running && (attached > 0 || failed > 0);
+  if (attachable.length < 2 && !run) return null;
+  if (!running && !summary && pending.length === 0) return null;
+
+  async function attachAll() {
+    const docs = pending;
+    setConfirming(false);
+    if (docs.length === 0) return;
+    setRun(docs.map((d) => d.id));
+    setRunning(true);
+    try {
+      await attachments.attachAll(docs);
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  const files = (n: number) => `${n} ${n === 1 ? "file" : "files"}`;
+
+  return (
+    <div className="mt-2">
+      {running && run ? (
+        <p className="flex items-center gap-2 text-sm text-zinc-600 dark:text-zinc-300">
+          <span className="h-3 w-3 animate-spin rounded-full border-2 border-zinc-300 border-t-indigo-500" />
+          Attaching {Math.min(settled + 1, run.length)} of {run.length} to order {target.reference}…
+        </p>
+      ) : (
+        <>
+          {run && summary && (
+            <p className={`mb-2 text-sm ${failed ? "text-amber-700 dark:text-amber-400" : "text-emerald-700 dark:text-emerald-400"}`}>
+              {failed ? "" : "✓ "}Attached {attached} of {files(run.length)} to order {target.reference}.
+              {failed > 0 && " Check the order's documents in Xcelerator before trying the others again."}
+            </p>
+          )}
+          {confirming && pending.length > 0 ? (
+            <div className="rounded-lg border border-indigo-200 bg-indigo-50/60 p-3 text-sm dark:border-indigo-900 dark:bg-indigo-950/40">
+              <p className="text-zinc-800 dark:text-zinc-200">
+                Attach {pending.length === 1 ? "this file" : `all ${pending.length} files`} to order{" "}
+                <span className="font-medium">{target.reference}</span> in Xcelerator? Anyone who can open the order in the
+                portal, including the customer, will see them.
+              </p>
+              <ul className="mt-1 list-disc pl-5 text-xs text-zinc-600 dark:text-zinc-400">
+                {pending.map((d) => (
+                  <li key={d.id} className="truncate" title={d.name}>
+                    {d.name}
+                  </li>
+                ))}
+              </ul>
+              {skipped.length > 0 && (
+                <p className="mt-1 text-xs text-amber-700 dark:text-amber-400">
+                  Skipping {skipped.map((d) => d.name).join(", ")}: the order already seems to have{" "}
+                  {skipped.length === 1 ? "it" : "them"}. Use {skipped.length === 1 ? "its" : "their"} own button to attach anyway.
+                </p>
+              )}
+              <div className="mt-2 flex gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => void attachAll()}
+                  disabled={busy}
+                  className="rounded-lg bg-indigo-600 px-3 py-1 text-xs font-medium text-white hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-60 dark:bg-indigo-500 dark:hover:bg-indigo-400"
+                >
+                  Attach {files(pending.length)}
+                </button>
+                <button type="button" onClick={() => setConfirming(false)} className={buttonClass}>
+                  Cancel
+                </button>
+              </div>
+            </div>
+          ) : (
+            pending.length > 0 && (
+              <button
+                type="button"
+                onClick={() => setConfirming(true)}
+                disabled={busy}
+                title={busy ? "Wait for the current upload to finish" : undefined}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3 py-1.5 text-xs font-medium text-white shadow-sm transition-colors hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-60 dark:bg-indigo-500 dark:hover:bg-indigo-400"
+              >
+                {run ? `Try ${files(pending.length)} again` : `Attach all ${pending.length} to order ${target.reference}`}
+              </button>
+            )
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+/**
  * Attachments and document links in the email open in Missive, each with an
  * AI summary, an inline preview and an Open button, and, once an order is
  * on screen, an "Attach to order" button that uploads PDFs and images to it
@@ -343,6 +464,14 @@ export function EmailDocuments({
             ? `PDFs and images can be attached to order ${attachTarget.reference} in Xcelerator.`
             : "Look up the order to attach these files to it in Xcelerator."}
         </p>
+      )}
+      {list.status === "ready" && attachTarget && (
+        <AttachAll
+          key={`${conversationId}|${scanId}|${attachTarget.orderTrackingId}|${attachTarget.caller}`}
+          documents={list.documents}
+          attachments={attachments}
+          target={attachTarget}
+        />
       )}
 
       {list.status === "ready" && (
