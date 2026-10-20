@@ -49,6 +49,14 @@ function DocumentIcon({ className }: { className?: string }) {
   );
 }
 
+function ChevronIcon({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 20 20" fill="none" className={className} aria-hidden="true">
+      <path d="M5.5 7.75L10 12.25l4.5-4.5" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
 const buttonClass =
   "inline-flex items-center gap-1 rounded-lg border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-700 transition-colors hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800";
 const attachButtonClass =
@@ -366,6 +374,9 @@ export function EmailDocuments({
   const [list, setList] = useState<ListState>({ status: "loading" });
   const [summaries, setSummaries] = useState<Record<string, SummaryState>>({});
   const [previews, setPreviews] = useState<Record<string, boolean>>({});
+  // Each document's details (summary, key facts, look-up chips) start collapsed,
+  // like the order card's shipment details, so the list stays short.
+  const [details, setDetails] = useState<Record<string, boolean>>({});
   const attachTarget = attachments.target;
 
   // Only the newest email's requests may update the panel.
@@ -407,6 +418,7 @@ export function EmailDocuments({
     setList({ status: "loading" });
     setSummaries({});
     setPreviews({});
+    setDetails({});
 
     (async () => {
       try {
@@ -476,8 +488,10 @@ export function EmailDocuments({
 
       {list.status === "ready" && (
         <ul className="mt-3 divide-y divide-zinc-100 dark:divide-zinc-800">
-          {list.documents.map((doc) => {
+          {list.documents.map((doc, index) => {
             const summary = summaries[doc.id];
+            const detailsOpen = Boolean(details[doc.id]);
+            const detailsId = `document-details-${index}`;
             const meta = [
               doc.kind === "attachment" ? "Attached" : doc.host,
               formatSize(doc.size),
@@ -523,7 +537,11 @@ export function EmailDocuments({
                   {canSummarize && (!summary || summary.status === "error") && (
                     <button
                       type="button"
-                      onClick={() => void summarize(doc.id, seqRef.current)}
+                      onClick={() => {
+                        // Asked for by hand, so show the result as it arrives.
+                        setDetails((d) => ({ ...d, [doc.id]: true }));
+                        void summarize(doc.id, seqRef.current);
+                      }}
                       className={buttonClass}
                     >
                       {summary ? "Try again" : "Summarize"}
@@ -551,8 +569,41 @@ export function EmailDocuments({
                   />
                 )}
                 {previews[doc.id] && <Preview doc={doc} />}
-                {doc.note && !summary && <p className="mt-2 text-xs text-zinc-500 dark:text-zinc-400">{doc.note}</p>}
-                <SummaryBlock state={summary} onLookup={onLookup} />
+                {(summary || doc.note) && (
+                  <div className="mt-2">
+                    <button
+                      type="button"
+                      onClick={() => setDetails((d) => ({ ...d, [doc.id]: !d[doc.id] }))}
+                      aria-expanded={detailsOpen}
+                      aria-controls={detailsId}
+                      title={detailsOpen ? "Hide document details" : "Show document details"}
+                      className="group flex w-full items-center justify-between gap-3 text-left"
+                    >
+                      <span className="flex min-w-0 items-center gap-2 text-xs font-semibold text-zinc-700 dark:text-zinc-300">
+                        <span className="shrink-0">Document details</span>
+                        {summary?.status === "loading" && (
+                          <span className="flex items-center gap-1.5 font-normal text-zinc-500 dark:text-zinc-400">
+                            <span className="h-3 w-3 animate-spin rounded-full border-2 border-zinc-300 border-t-indigo-500" />
+                            Reading…
+                          </span>
+                        )}
+                        {summary?.status === "ready" && (
+                          <span className="truncate font-normal text-zinc-500 dark:text-zinc-400">{summary.summary.docType}</span>
+                        )}
+                        {summary?.status === "error" && (
+                          <span className="truncate font-normal text-amber-700 dark:text-amber-400">Couldn&apos;t summarize</span>
+                        )}
+                      </span>
+                      <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-lg border border-zinc-300 text-zinc-600 transition-colors group-hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-300 dark:group-hover:bg-zinc-800">
+                        <ChevronIcon className={`h-3.5 w-3.5 transition-transform ${detailsOpen ? "rotate-180" : ""}`} />
+                      </span>
+                    </button>
+                    <div id={detailsId} hidden={!detailsOpen}>
+                      {doc.note && !summary && <p className="mt-2 text-xs text-zinc-500 dark:text-zinc-400">{doc.note}</p>}
+                      <SummaryBlock state={summary} onLookup={onLookup} />
+                    </div>
+                  </div>
+                )}
               </li>
             );
           })}
