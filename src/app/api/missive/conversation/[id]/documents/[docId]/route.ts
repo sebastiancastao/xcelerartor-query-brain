@@ -5,8 +5,8 @@ import { isMissiveConfigured } from "@/lib/missive";
 
 export const maxDuration = 60;
 
-// Serves one document from the conversation, for the panel's previews and
-// "Open" buttons. Missive's own download links expire after ~10 minutes, and
+// Serves one document from the conversation, for the panel's "Open"
+// buttons. Missive's own download links expire after ~10 minutes, and
 // linked files are fetched server-side, so both come through here. Only
 // PDFs, images and plain text are shown inline; anything else downloads.
 export async function GET(_request: NextRequest, { params }: { params: Promise<{ id: string; docId: string }> }) {

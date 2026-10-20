@@ -186,7 +186,7 @@ export function UploadDocumentsToOrder({
               onClick={onShowDocuments}
               className="font-medium text-indigo-600 hover:underline dark:text-indigo-400"
             >
-              Preview them
+              View them
             </button>
           </p>
 

@@ -62,33 +62,6 @@ const buttonClass =
 const attachButtonClass =
   "inline-flex items-center gap-1 rounded-lg border border-indigo-300 px-2 py-1 text-xs font-medium text-indigo-700 transition-colors hover:bg-indigo-50 dark:border-indigo-800 dark:text-indigo-300 dark:hover:bg-indigo-950";
 
-function Preview({ doc }: { doc: EmailDocument }) {
-  if (!doc.fileUrl || !doc.preview) return null;
-  const frame = "mt-2 w-full rounded-lg border border-zinc-200 bg-white dark:border-zinc-800";
-  if (doc.preview === "image") {
-    // eslint-disable-next-line @next/next/no-img-element
-    return <img src={doc.fileUrl} alt={doc.name} className={`${frame} max-h-[480px] object-contain`} />;
-  }
-  if (doc.preview === "text") {
-    return <iframe src={doc.fileUrl} sandbox="" title={doc.name} className={`${frame} h-64`} />;
-  }
-  return (
-    <object data={doc.fileUrl} type="application/pdf" className={`${frame} h-[480px]`} aria-label={doc.name}>
-      <p className="p-3 text-sm text-zinc-600 dark:text-zinc-400">
-        This viewer can&apos;t show PDFs inline.{" "}
-        <a
-          href={doc.fileUrl}
-          onClick={openLinkInNewTab}
-          className="text-indigo-600 underline underline-offset-2 dark:text-indigo-400"
-        >
-          Open it instead
-        </a>
-        .
-      </p>
-    </object>
-  );
-}
-
 /** Details shown before "Show N more", so several documents fit in the narrow Missive panel. */
 const FACTS_SHOWN = 4;
 
@@ -347,7 +320,7 @@ function AttachAll({
 
 /**
  * Attachments and document links in the email open in Missive, each with an
- * AI summary, an inline preview and an Open button, and, once an order is
+ * AI summary and an Open button, and, once an order is
  * on screen, an "Attach to order" button that uploads PDFs and images to it
  * in Xcelerator after the CSR confirms. Renders nothing until an email is
  * open, and nothing when the email has no documents.
@@ -373,7 +346,6 @@ export function EmailDocuments({
 }) {
   const [list, setList] = useState<ListState>({ status: "loading" });
   const [summaries, setSummaries] = useState<Record<string, SummaryState>>({});
-  const [previews, setPreviews] = useState<Record<string, boolean>>({});
   // Each document's details (summary, key facts, look-up chips) start collapsed,
   // like the order card's shipment details, so the list stays short.
   const [details, setDetails] = useState<Record<string, boolean>>({});
@@ -417,7 +389,6 @@ export function EmailDocuments({
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setList({ status: "loading" });
     setSummaries({});
-    setPreviews({});
     setDetails({});
 
     (async () => {
@@ -521,16 +492,6 @@ export function EmailDocuments({
                 </div>
 
                 <div className="mt-2 flex flex-wrap gap-1.5">
-                  {doc.preview && doc.fileUrl && (
-                    <button
-                      type="button"
-                      onClick={() => setPreviews((p) => ({ ...p, [doc.id]: !p[doc.id] }))}
-                      aria-expanded={Boolean(previews[doc.id])}
-                      className={buttonClass}
-                    >
-                      {previews[doc.id] ? "Hide preview" : "Preview"}
-                    </button>
-                  )}
                   <a href={doc.openUrl} onClick={openLinkInNewTab} rel="noopener noreferrer" className={buttonClass}>
                     Open
                   </a>
@@ -568,7 +529,6 @@ export function EmailDocuments({
                     onCancel={() => attachments.cancel(doc.id)}
                   />
                 )}
-                {previews[doc.id] && <Preview doc={doc} />}
                 {(summary || doc.note) && (
                   <div className="mt-2">
                     <button
