@@ -7,7 +7,13 @@ import type { OrderInquiry } from "@/lib/xcelerator";
 import type { WebAgentStep } from "@/lib/web-agent";
 import { buildSuggestedReply } from "@/lib/email";
 import { detectOrderReferences, type DetectedReference } from "@/lib/reference-detection";
-import { MissiveEmailSense, openLinkInNewTab, type MissiveSenseStatus } from "@/components/MissiveEmailSense";
+import {
+  MissiveEmailSense,
+  insertIntoMissiveReply,
+  isMissiveHost,
+  openLinkInNewTab,
+  type MissiveSenseStatus,
+} from "@/components/MissiveEmailSense";
 import { EmailDocuments, type EmailDocumentList } from "@/components/EmailDocuments";
 import { UploadDocumentsToOrder } from "@/components/UploadDocumentsToOrder";
 import { useOrderAttachments } from "@/components/useOrderAttachments";
@@ -35,6 +41,13 @@ type ReplyState =
   | { status: "idle" }
   | { status: "loading" }
   | { status: "ready"; text: string };
+
+/** Putting the AI reply into a reply draft in Missive. */
+type ReplyInsertState =
+  | { status: "idle" }
+  | { status: "inserting" }
+  | { status: "inserted" }
+  | { status: "error"; message: string };
 
 function formatMaybeDate(value: string | null): string {
   if (!value) return "TBD";
@@ -78,6 +91,15 @@ function ChevronIcon({ className }: { className?: string }) {
   return (
     <svg viewBox="0 0 20 20" fill="none" className={className} aria-hidden="true">
       <path d="M5.5 7.75L10 12.25l4.5-4.5" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function ReplyIcon({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 20 20" fill="none" className={className} aria-hidden="true">
+      <path d="M8 5.5L3.75 9.75 8 14" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M4.25 9.75h6.5a5 5 0 0 1 5 5v.75" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
     </svg>
   );
 }
@@ -225,6 +247,10 @@ export default function WebAgentHome() {
   const [live, setLive] = useState<boolean | null>(null);
   const [aiDrafting, setAiDrafting] = useState(false);
   const [reply, setReply] = useState<ReplyState>({ status: "idle" });
+  // Whether Missive is hosting this page; only then can the AI reply go
+  // straight into a reply draft there.
+  const [missiveHost, setMissiveHost] = useState(false);
+  const [replyInsert, setReplyInsert] = useState<ReplyInsertState>({ status: "idle" });
   // What the browser agent did (login, clicks, typing), shown under the
   // result so a CSR can see how the answer was reached.
   const [steps, setSteps] = useState<WebAgentStep[]>([]);
@@ -271,6 +297,7 @@ export default function WebAgentHome() {
     setReferenceNumber(ref);
     setState({ status: "loading" });
     setReply({ status: "idle" });
+    setReplyInsert({ status: "idle" });
     setCopied(false);
     setShowShipmentDetails(false);
     setSteps([]);
@@ -329,6 +356,22 @@ export default function WebAgentHome() {
       if (current()) setReply({ status: "ready", text: data?.reply ?? buildSuggestedReply(order) });
     } catch {
       if (current()) setReply({ status: "ready", text: buildSuggestedReply(order) });
+    }
+  }
+
+  // Opens a reply to the email open in Missive with the AI text in it. It is
+  // never sent from here: the CSR reviews the draft and sends it in Missive.
+  async function handleInsertIntoReply(text: string) {
+    const seq = lookupSeqRef.current;
+    setReplyInsert({ status: "inserting" });
+    try {
+      await insertIntoMissiveReply(text);
+      if (seq === lookupSeqRef.current) setReplyInsert({ status: "inserted" });
+    } catch (error) {
+      if (seq !== lookupSeqRef.current) return;
+      const message =
+        typeof error === "string" ? error : error instanceof Error ? error.message : "";
+      setReplyInsert({ status: "error", message: (message || "Missive did not open the reply").replace(/\.+$/, "") });
     }
   }
 
@@ -491,6 +534,8 @@ export default function WebAgentHome() {
             <MissiveEmailSense
               onEmailText={handleMissiveEmailText}
               onStatusChange={(status: MissiveSenseStatus) => {
+                // Missive sets its id on init, before it reports an open email.
+                setMissiveHost(isMissiveHost());
                 // No single email open any more: drop the old email's documents.
                 if (status === "waiting" || status === "empty") {
                   setEmailScan(null);
@@ -889,19 +934,34 @@ export default function WebAgentHome() {
             </section>
 
             <section className={`rounded-2xl border border-zinc-200/70 bg-white ${card} shadow-sm dark:border-zinc-800/70 dark:bg-zinc-900`}>
-              <div className="mb-3 flex items-center justify-between">
+              <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
                 <div className="flex items-center gap-2">
                   <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">AI-suggested reply</h2>
                   <Badge tone={aiDrafting ? "indigo" : "zinc"}>{aiDrafting ? "GPT-drafted" : "Template"}</Badge>
                 </div>
-                <button
-                  onClick={() => handleCopy(reply.status === "ready" ? reply.text : "")}
-                  disabled={reply.status !== "ready"}
-                  className="inline-flex items-center gap-1.5 rounded-lg border border-zinc-300 px-2.5 py-1.5 text-xs font-medium text-zinc-700 transition-colors hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800"
-                >
-                  <CopyIcon className="h-3.5 w-3.5" />
-                  {copied ? "Copied!" : "Copy"}
-                </button>
+                <div className="flex items-center gap-2">
+                  {missiveHost && (
+                    <button
+                      type="button"
+                      onClick={() => reply.status === "ready" && void handleInsertIntoReply(reply.text)}
+                      disabled={reply.status !== "ready" || replyInsert.status === "inserting"}
+                      title="Opens a reply to this email in Missive with this text in it. Nothing is sent."
+                      className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-2.5 py-1.5 text-xs font-medium text-white shadow-sm transition-colors hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-indigo-500 dark:hover:bg-indigo-400"
+                    >
+                      <ReplyIcon className="h-3.5 w-3.5" />
+                      {replyInsert.status === "inserting" ? "Inserting…" : "Insert into reply"}
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => handleCopy(reply.status === "ready" ? reply.text : "")}
+                    disabled={reply.status !== "ready"}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-zinc-300 px-2.5 py-1.5 text-xs font-medium text-zinc-700 transition-colors hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-50 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800"
+                  >
+                    <CopyIcon className="h-3.5 w-3.5" />
+                    {copied ? "Copied!" : "Copy"}
+                  </button>
+                </div>
               </div>
               <textarea
                 readOnly
@@ -909,6 +969,16 @@ export default function WebAgentHome() {
                 rows={10}
                 className="w-full resize-none rounded-xl border border-zinc-200 bg-zinc-50 p-3.5 font-mono text-xs leading-relaxed text-zinc-800 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-200"
               />
+              {replyInsert.status === "inserted" && (
+                <p className="mt-2 text-xs text-emerald-700 dark:text-emerald-400">
+                  Put into a reply in Missive. Nothing was sent: review it there and send it.
+                </p>
+              )}
+              {replyInsert.status === "error" && (
+                <p className="mt-2 text-xs text-red-600 dark:text-red-400">
+                  Couldn&apos;t put the reply into Missive ({replyInsert.message}). Use Copy instead.
+                </p>
+              )}
             </section>
 
           </div>

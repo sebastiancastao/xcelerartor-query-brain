@@ -30,6 +30,10 @@ type MissiveIframeApi = {
   fetchConversations: (ids: string[]) => Promise<MissiveIframeConversation[]>;
   /** Asks Missive to open a link in the user's browser. */
   openURL: (url: string) => void;
+  /** Opens a reply draft to the latest message of the open conversation; sends it only when deliver is true. */
+  reply: (options: { deliver?: boolean }) => Promise<unknown>;
+  /** Inserts HTML in the currently selected composer. */
+  insertHtml: (html: string) => Promise<unknown> | undefined;
   /** Set once Missive has initialized this page; null when it is open outside Missive. */
   id?: string | null;
 };
@@ -57,6 +61,70 @@ export function openLinkInNewTab(event: MouseEvent<HTMLAnchorElement>): void {
     return;
   }
   window.open(url, "_blank", "noopener,noreferrer");
+}
+
+/** True when Missive is hosting this page, so its composer can be reached. */
+export function isMissiveHost(): boolean {
+  const missive = window.Missive;
+  return Boolean(missive?.id && typeof missive.reply === "function" && typeof missive.insertHtml === "function");
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+/** Plain text as the paragraph HTML Missive uses for message bodies: blank lines split paragraphs, single newlines become line breaks. */
+function textToEmailHtml(text: string): string {
+  return text
+    .replace(/\r\n?/g, "\n")
+    .trim()
+    .split(/\n(?:[ \t]*\n)+/)
+    .map((paragraph) => `<p>${paragraph.split("\n").map(escapeHtml).join("<br>")}</p>`)
+    .join("");
+}
+
+function wait(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Waits for a Missive call, but no longer than `ms`: Missive may never answer some calls. */
+async function settleWithin(promise: Promise<unknown> | undefined, ms: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([promise, new Promise<void>((resolve) => (timer = setTimeout(resolve, ms)))]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Opens a reply to the latest message of the email open in Missive and puts
+ * `text` in it. Nothing is sent: the reply is opened with deliver false, so
+ * the CSR reads it, edits it if needed, and sends it from Missive. The text
+ * goes in through insertHtml, which Missive documents as HTML, so the
+ * paragraphs survive; Missive does not document the format of a reply body.
+ */
+export async function insertIntoMissiveReply(text: string): Promise<void> {
+  const missive = window.Missive;
+  if (!missive || !isMissiveHost()) throw new Error("This page is not open inside Missive.");
+
+  await settleWithin(missive.reply({ deliver: false }), 4000);
+  const html = textToEmailHtml(text);
+
+  // Give the new reply's composer a moment to become the selected one, and
+  // retry if Missive says there is no composer yet.
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    await wait(attempt === 0 ? 300 : 600);
+    try {
+      await settleWithin(missive.insertHtml(html), 4000);
+      return;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  if (lastError instanceof Error) throw lastError;
+  throw new Error(typeof lastError === "string" && lastError ? lastError : "Missive did not accept the text.");
 }
 
 type ConversationTextResponse = {
