@@ -161,6 +161,9 @@ export function memoryBackend(): "redis" | "supabase" | "file" {
   return supabaseConfig() ? "supabase" : "file";
 }
 
+/** A learning-store request that takes longer is dropped: the lookup goes on without it. */
+const STORE_TIMEOUT_MS = 10_000;
+
 /** Calls one of the web_agent_memory_* database functions through Supabase's REST API. */
 async function supabaseRpc(
   cfg: { url: string; key: string; secret: string },
@@ -172,6 +175,7 @@ async function supabaseRpc(
     headers: { apikey: cfg.key, "Content-Type": "application/json" },
     body: JSON.stringify({ p_secret: cfg.secret, p_key: REDIS_KEY, ...args }),
     cache: "no-store",
+    signal: AbortSignal.timeout(STORE_TIMEOUT_MS),
   });
   const text = await res.text();
   if (!res.ok) throw new Error(`Supabase ${fn} failed (HTTP ${res.status}): ${text.slice(0, 200)}`);
@@ -184,6 +188,7 @@ async function redisCommand(cfg: { url: string; token: string }, command: string
     headers: { Authorization: `Bearer ${cfg.token}`, "Content-Type": "application/json" },
     body: JSON.stringify(command),
     cache: "no-store",
+    signal: AbortSignal.timeout(STORE_TIMEOUT_MS),
   });
   const body = (await res.json().catch(() => null)) as { result?: unknown; error?: string } | null;
   if (!res.ok || body?.error) throw new Error(`Upstash ${command[0]} failed: ${body?.error ?? `HTTP ${res.status}`}`);
@@ -200,32 +205,74 @@ function parseMemory(raw: unknown): WebAgentMemory {
   }
 }
 
-// The file backend keeps one copy in process memory. Redis is re-read on
-// every load, since each serverless instance would otherwise hold its own
-// stale copy and overwrite the others' learning.
+// The file backend keeps one copy in process memory and is its only writer.
+// A shared store (Supabase, Redis) is written by every serverless instance,
+// so each instance keeps a recent copy only for planning: a lookup plans
+// from it without waiting on the store (one read took about 0.5 s in
+// production, 2026-10-28), and the copy is re-read in the background once it
+// is a little old. Saving always re-reads the store first, never this copy,
+// so one instance never overwrites what another instance learned.
 let fileCache: WebAgentMemory | null = null;
+let sharedCopy: { memory: WebAgentMemory; at: number } | null = null;
+let sharedRead: Promise<WebAgentMemory> | null = null;
 let writeChain: Promise<void> = Promise.resolve();
 
-export async function loadMemory(): Promise<WebAgentMemory> {
+/** A copy of the shared store younger than this is used as it is. */
+const COPY_FRESH_MS = 30_000;
+/**
+ * Up to this age a copy is still used while a newer one is read in the
+ * background; an older one (or none, on a new instance) is waited for.
+ */
+const COPY_MAX_AGE_MS = 15 * 60_000;
+
+function usesSharedStore(): boolean {
+  return Boolean(redisConfig() || supabaseConfig());
+}
+
+function warn(what: "load" | "save", err: unknown): void {
+  console.warn(`[web-agent-memory] could not ${what}:`, err instanceof Error ? err.message : err);
+}
+
+/** Reads the shared store, or throws. */
+async function readSharedStore(): Promise<WebAgentMemory> {
   const redis = redisConfig();
-  if (redis) {
+  if (redis) return parseMemory(await redisCommand(redis, ["GET", REDIS_KEY]));
+  const value = await supabaseRpc(supabaseConfig()!, "web_agent_memory_get", {});
+  return parseMemory(value === null ? null : JSON.stringify(value));
+}
+
+/** Re-reads this instance's copy of the shared store, one read at a time. */
+function refreshSharedCopy(): Promise<WebAgentMemory> {
+  sharedRead ??= readSharedStore()
+    .then((memory) => {
+      sharedCopy = { memory, at: Date.now() };
+      return memory;
+    })
+    .finally(() => {
+      sharedRead = null;
+    });
+  return sharedRead;
+}
+
+/**
+ * What the agent has learned, for planning a lookup. With a shared store
+ * this is usually the instance's recent copy, returned at once; `fresh`
+ * reads the store itself (the learning page uses it). Treat the result as
+ * read-only: it is shared by every lookup on this instance.
+ */
+export async function loadMemory(options: { fresh?: boolean } = {}): Promise<WebAgentMemory> {
+  if (usesSharedStore()) {
+    const age = sharedCopy ? Date.now() - sharedCopy.at : Number.POSITIVE_INFINITY;
+    if (sharedCopy && !options.fresh && age < COPY_MAX_AGE_MS) {
+      if (age >= COPY_FRESH_MS) refreshSharedCopy().catch((err: unknown) => warn("load", err));
+      return sharedCopy.memory;
+    }
     try {
-      return parseMemory(await redisCommand(redis, ["GET", REDIS_KEY]));
+      return await refreshSharedCopy();
     } catch (err) {
       // Learning is an optimisation: a storage outage must not break lookups.
-      console.warn("[web-agent-memory] could not load:", err instanceof Error ? err.message : err);
-      return emptyMemory();
-    }
-  }
-
-  const supabase = supabaseConfig();
-  if (supabase) {
-    try {
-      const value = await supabaseRpc(supabase, "web_agent_memory_get", {});
-      return parseMemory(value === null ? null : JSON.stringify(value));
-    } catch (err) {
-      console.warn("[web-agent-memory] could not load:", err instanceof Error ? err.message : err);
-      return emptyMemory();
+      warn("load", err);
+      return sharedCopy?.memory ?? emptyMemory();
     }
   }
 
@@ -238,33 +285,42 @@ export async function loadMemory(): Promise<WebAgentMemory> {
   return fileCache;
 }
 
-function persist(memory: WebAgentMemory): Promise<void> {
-  // Serialize writes so two lookups finishing together in one process can't
-  // interleave. (Across serverless instances a rare lost update is possible;
-  // for learning statistics that only costs one data point.)
+async function save(memory: WebAgentMemory): Promise<void> {
+  const redis = redisConfig();
+  const supabase = supabaseConfig();
+  if (redis) {
+    await redisCommand(redis, ["SET", REDIS_KEY, JSON.stringify(memory)]);
+  } else if (supabase) {
+    await supabaseRpc(supabase, "web_agent_memory_set", { p_value: memory });
+  } else {
+    const file = memoryFile();
+    // The file store is only for local/long-running servers; keep the build
+    // tracer from bundling the whole project because of these dynamic paths.
+    await fs.mkdir(/*turbopackIgnore: true*/ path.dirname(file), { recursive: true });
+    const tmp = `${file}.tmp`;
+    await fs.writeFile(/*turbopackIgnore: true*/ tmp, JSON.stringify(memory, null, 1), "utf8");
+    await fs.rename(/*turbopackIgnore: true*/ tmp, file);
+    fileCache = memory;
+    return;
+  }
+  sharedCopy = { memory, at: Date.now() };
+}
+
+/**
+ * One read-change-save of the learning. Runs one at a time in this process,
+ * so two lookups finishing together can't drop each other's update. (Across
+ * serverless instances a rare lost update is still possible; for learning
+ * statistics that only costs one data point.) When the shared store can't
+ * be read nothing is saved, since saving then would wipe it.
+ */
+function updateMemory(change: (memory: WebAgentMemory) => void): Promise<void> {
   writeChain = writeChain
     .then(async () => {
-      const redis = redisConfig();
-      if (redis) {
-        await redisCommand(redis, ["SET", REDIS_KEY, JSON.stringify(memory)]);
-        return;
-      }
-      const supabase = supabaseConfig();
-      if (supabase) {
-        await supabaseRpc(supabase, "web_agent_memory_set", { p_value: memory });
-        return;
-      }
-      const file = memoryFile();
-      // The file store is only for local/long-running servers; keep the build
-      // tracer from bundling the whole project because of these dynamic paths.
-      await fs.mkdir(/*turbopackIgnore: true*/ path.dirname(file), { recursive: true });
-      const tmp = `${file}.tmp`;
-      await fs.writeFile(/*turbopackIgnore: true*/ tmp, JSON.stringify(memory, null, 1), "utf8");
-      await fs.rename(/*turbopackIgnore: true*/ tmp, file);
+      const memory = usesSharedStore() ? await readSharedStore() : await loadMemory();
+      change(memory);
+      await save(memory);
     })
-    .catch((err) => {
-      console.warn("[web-agent-memory] could not save:", err instanceof Error ? err.message : err);
-    });
+    .catch((err: unknown) => warn("save", err));
   return writeChain;
 }
 
@@ -507,15 +563,18 @@ export function accountListIsStale(memory: WebAgentMemory, caller: string): bool
  * accounts are all seen by the callers already picked adds nothing. Picks
  * the caller that adds the most unseen accounts, then the next, and so on
  * (ties go to the higher-ranked caller); the rest are backups, searched
- * only if a picked caller fails. A caller whose account list is unknown or
- * stale is always picked, so its list gets read. Both lists keep `ranked`'s
- * order.
+ * only if a picked caller fails. A caller whose account list is unknown is
+ * always picked, so its list gets read. An old list is still used here and
+ * the web agent re-reads it in the background: picking every caller with an
+ * old list (as before 2026-10-28) never refreshed them, because a caller
+ * ranked below a hit is never started, so QUKIN and AIT stayed in every
+ * search for a week. Both lists keep `ranked`'s order.
  */
 export function planCallerCoverage(
   memory: WebAgentMemory,
   ranked: readonly string[],
 ): { search: string[]; backup: string[] } {
-  const picked = new Set(ranked.filter((c) => accountListIsStale(memory, c)));
+  const picked = new Set(ranked.filter((c) => !memory.callerAccounts?.[c]?.accounts.length));
   const seen = new Set<string>();
   let candidates = ranked.filter((c) => !picked.has(c));
   for (;;) {
@@ -560,9 +619,11 @@ export type CallerOutcome = {
 /**
  * Records one finished lookup. `outcomes` is what each caller had answered
  * by the time the winner was settled. When nobody found the order, the
- * episode is logged but nothing is rewarded or penalized.
+ * episode is logged but nothing is rewarded or penalized. The web agent
+ * answers first and records after (in the background), so the save never
+ * holds up a lookup.
  */
-export async function recordEpisode(params: {
+export function recordEpisode(params: {
   context: ReferenceContext;
   /** Label of the caller whose result was used, or null when nobody found the order. */
   winner: string | null;
@@ -574,8 +635,11 @@ export async function recordEpisode(params: {
   /** Account lists read from the portal during this lookup, by caller. */
   accounts?: Record<string, string[]>;
 }): Promise<void> {
-  const memory = await loadMemory();
   const at = new Date().toISOString();
+  return updateMemory((memory) => recordEpisodeInto(memory, params, at));
+}
+
+function recordEpisodeInto(memory: WebAgentMemory, params: Parameters<typeof recordEpisode>[0], at: string): void {
   const { shape, taxonomy, keys } = params.context;
 
   const exploration = (memory.exploration ??= {});
@@ -629,11 +693,20 @@ export async function recordEpisode(params: {
       for (const [key] of oldest) delete places[key];
     }
   }
-  await persist(memory);
+}
+
+/** Saves account lists the web agent re-read outside a lookup, by caller. */
+export function recordCallerAccounts(accounts: Record<string, string[]>): Promise<void> {
+  const at = new Date().toISOString();
+  return updateMemory((memory) => {
+    for (const [caller, list] of Object.entries(accounts)) {
+      (memory.callerAccounts ??= {})[caller] = { accounts: list, at };
+    }
+  });
 }
 
 export async function resetMemory(): Promise<void> {
   const fresh = emptyMemory();
-  if (!redisConfig()) fileCache = fresh;
-  await persist(fresh);
+  writeChain = writeChain.then(() => save(fresh)).catch((err: unknown) => warn("save", err));
+  await writeChain;
 }

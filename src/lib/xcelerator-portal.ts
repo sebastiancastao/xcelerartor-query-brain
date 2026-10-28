@@ -140,6 +140,11 @@ export class CookieJar {
     return this.values.has(name);
   }
 
+  /** Every cookie held, as name/value pairs (the portal sets them all on path "/", host-only). */
+  entries(): { name: string; value: string }[] {
+    return [...this.values.entries()].map(([name, value]) => ({ name, value }));
+  }
+
   capture(headers: Headers) {
     const withGetSetCookie = headers as Headers & { getSetCookie?: () => string[] };
     const rawCookies =
@@ -272,10 +277,17 @@ export async function postPortalJson<T>(
  * subsequent calls. Each call to this function performs a fresh login — the
  * caller is responsible for holding on to the returned session if it wants
  * to make several calls without logging in again.
+ *
+ * `skipLandingPage` stops at the redirect that carries the sign-in cookie
+ * instead of also downloading the page it points to, for a caller that only
+ * needs the cookies (the web agent hands them to its browser). `signal`
+ * aborts the login's requests (for a time limit).
  */
 export async function loginToPortal(
   cfg: XceleratorPortalConfig = xceleratorConfigFromEnv(),
+  options: { skipLandingPage?: boolean; signal?: AbortSignal } = {},
 ): Promise<PortalSession> {
+  const { signal } = options;
   const credentialLabel = cfg.credentialLabel ?? "XCELERATOR_USERNAME and XCELERATOR_PASSWORD";
 
   if (!cfg.username || !cfg.password) {
@@ -289,6 +301,7 @@ export async function loginToPortal(
 
   const loginPage = await portalFetch(session, loginPath, {
     headers: { Accept: "text/html" },
+    signal,
   });
   const loginHtml = await loginPage.text();
   if (!loginPage.ok) {
@@ -310,17 +323,20 @@ export async function loginToPortal(
       Referer: `${cfg.portalBaseUrl}${loginPath}`,
     },
     body: new URLSearchParams(form),
+    signal,
   });
 
   let text = "";
   let status = res.status;
   if (res.status >= 300 && res.status < 400 && res.headers.get("location")) {
+    if (options.skipLandingPage && session.jar.has("Xcelerator.ClientPortal")) return session;
     const nextPath = portalPathFromLocation(cfg, res.headers.get("location")!);
     const finalRes = await portalFetch(session, nextPath, {
       headers: {
         Accept: "text/html",
         Referer: `${cfg.portalBaseUrl}${loginPath}`,
       },
+      signal,
     });
     status = finalRes.status;
     text = await finalRes.text();
@@ -333,10 +349,18 @@ export async function loginToPortal(
   }
 
   if (!session.jar.has("Xcelerator.ClientPortal") && /id=["']loginForm["']/i.test(text)) {
-    throw new XceleratorPortalError(
+    throw new XceleratorLoginRejectedError(
       `Xcelerator portal login failed for ${cfg.username}; check ${credentialLabel}.`,
     );
   }
 
   return session;
+}
+
+/** The portal showed its login form again after the username and password were sent. */
+export class XceleratorLoginRejectedError extends XceleratorPortalError {
+  constructor(message: string) {
+    super(message);
+    this.name = "XceleratorLoginRejectedError";
+  }
 }

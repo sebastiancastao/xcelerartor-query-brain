@@ -17,7 +17,8 @@ import { xceleratorCallersFromEnv } from "@/lib/xcelerator-portal";
 // DELETE /api/web-agent/memory             -> forget everything and start over
 export async function GET(request: Request) {
   const ref = new URL(request.url).searchParams.get("ref");
-  const memory = await loadMemory();
+  // The store itself, not this instance's planning copy, so this shows the latest.
+  const memory = await loadMemory({ fresh: true });
   const context = ref ? referenceContext(ref) : null;
   const callers = xceleratorCallersFromEnv().map((c) => c.label);
 

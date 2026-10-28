@@ -9,21 +9,23 @@
 // reference's type). Searching and reading run in code, not the model.
 //
 // Which callers (XCELERATOR_CALLER_N_*, same list the API path uses): only
-// the ones that see an account no other picked caller sees (today Seb2 and
-// AIT; Seb2 also sees STRLN's and QUKIN's accounts, so those are backups,
-// searched only if a picked caller fails). They run in parallel, a few at a
-// time on Vercel; when several have the order, the caller ranked first for
-// this type of reference wins, and a reference found before goes to the
-// caller that had it, alone, first.
+// the ones that see an account no other picked caller sees (since October
+// 2026 just Seb2, which also sees AIT's, STRLN's and QUKIN's accounts, so
+// those are backups, searched only if a picked caller fails). They run in
+// parallel, a few at a time on Vercel; when several have the order, the
+// caller ranked first for this type of reference wins. A reference found
+// before goes first, alone, to the caller that had it, or to another caller
+// that sees the same account and is already logged in on this server.
 //
 // Flow per caller:
 //  1. A page on the portal's Main page, logged in. Usually the caller's page
 //     left open by an earlier lookup on this server; otherwise a new one in
 //     headless Chromium (playwright-core: the installed Chrome/Edge locally,
 //     a bundled serverless Chromium on Vercel, or a hosted browser, see
-//     launchBrowser), on a saved session or through the real login form.
-//     Logging in is deterministic code, never the model, so credentials
-//     never reach OpenAI.
+//     launchBrowser), on a saved session or a plain HTTP login whose cookies
+//     the page is handed (the real login form only as a fallback). Logging
+//     in is deterministic code, never the model, so credentials never reach
+//     OpenAI.
 //  2. Search the portal's order list (the Tracking page's search, with "All
 //     Accounts") for the reference, one field at a time in the learned
 //     order. A login can see several accounts (Seb2 sees seven), but Quick
@@ -48,7 +50,14 @@
 import os from "node:os";
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright-core";
 import { chatCompletion, isOpenAIConfigured, type ToolDefinition } from "./openai";
-import { xceleratorCallersFromEnv, type NamedXceleratorCaller } from "./xcelerator-portal";
+import {
+  loginToPortal,
+  portalJson,
+  xceleratorCallersFromEnv,
+  XceleratorLoginRejectedError,
+  type NamedXceleratorCaller,
+  type PortalSession,
+} from "./xcelerator-portal";
 import {
   mapPortalOrderListRowToInquiryFallback,
   type OrderInquiry,
@@ -63,6 +72,7 @@ import {
   planCallerCoverage,
   planSearches,
   rankCallers,
+  recordCallerAccounts,
   recordEpisode,
   referenceContext,
   rememberedPlace,
@@ -370,12 +380,59 @@ function takeSavedSession(caller: string): SessionState | null {
   return null;
 }
 
+/** Whether takeSavedSession would find one for this caller right now. */
+function hasSavedSession(caller: string): boolean {
+  const list = savedSessions.get(caller) ?? [];
+  return list.length > 0 && Date.now() - list[list.length - 1].savedAt < SESSION_IDLE_MS;
+}
+
 function keepSession(caller: string, state: SessionState, lastUsed: number): void {
   const list = savedSessions.get(caller) ?? [];
   list.push({ state, savedAt: lastUsed });
   list.sort((a, b) => a.savedAt - b.savedAt);
   if (list.length > MAX_SAVED_SESSIONS) list.splice(0, list.length - MAX_SAVED_SESSIONS);
   savedSessions.set(caller, list);
+}
+
+// --- Plain HTTP login ------------------------------------------------------------
+
+/**
+ * A portal login over plain HTTP (the same one the main page's API lookups
+ * use), as cookies a browser page can take. It needs no browser, so a new
+ * page's login runs while its browser starts. Logging in through the login
+ * page in Chromium took 4-5 s in production (2026-10-28): that page loads
+ * Google Maps and reCAPTCHA, and the form waited for the portal to go quiet.
+ */
+type HttpLogin = { ok: true; cookies: SessionState["cookies"] } | { ok: false; error: unknown };
+
+/** Longest a plain login may take; past it, the page logs in through the login form instead. */
+const HTTP_LOGIN_TIMEOUT_MS = 15_000;
+
+function loginOverHttp(caller: NamedXceleratorCaller): Promise<HttpLogin> {
+  const signal = AbortSignal.timeout(HTTP_LOGIN_TIMEOUT_MS);
+  return loginToPortal(caller.cfg, { skipLandingPage: true, signal }).then(
+    (session): HttpLogin => ({ ok: true, cookies: portalCookies(session) }),
+    (error: unknown): HttpLogin => ({ ok: false, error }),
+  );
+}
+
+/**
+ * A session's cookies the way the portal itself sets them (checked
+ * 2026-10-28: ASP.NET_SessionId, the __RequestVerificationToken one and
+ * Xcelerator.ClientPortal, all host-only on path "/", secure, HttpOnly).
+ */
+function portalCookies(session: PortalSession): SessionState["cookies"] {
+  const url = new URL(session.cfg.portalBaseUrl);
+  return session.jar.entries().map(({ name, value }) => ({
+    name,
+    value,
+    domain: url.hostname,
+    path: "/",
+    expires: -1,
+    httpOnly: true,
+    secure: url.protocol === "https:",
+    sameSite: "Lax" as const,
+  }));
 }
 
 // --- Open pages kept between lookups ---------------------------------------------
@@ -462,6 +519,11 @@ function takeIdlePage(caller: string): Workspace | null {
     void closeWorkspace(ws, false);
   }
   return null;
+}
+
+/** Whether takeIdlePage would find a usable page for this caller right now. */
+function hasIdlePage(caller: string): boolean {
+  return idlePages.some((ws) => ws.caller === caller && isAlive(ws) && Date.now() - ws.lastUsed < PAGE_IDLE_MS);
 }
 
 /**
@@ -568,6 +630,38 @@ function mainPageUrl(portalBaseUrl: string): string {
   return `${portalBaseUrl}/ClientPortal/ClientPortal/Main`;
 }
 
+/** Whether the portal sent this page to its login form instead of where it was going. */
+async function isAtLogin(page: Page): Promise<boolean> {
+  return /\/ClientPortal\/?$/i.test(new URL(page.url()).pathname) || (await page.locator("#loginForm").count()) > 0;
+}
+
+/**
+ * Logs this page in as the caller and leaves it on Main: a plain HTTP login
+ * (`early` when one was started while the page's browser was starting),
+ * its cookies handed to the page, then one load of Main. Falls back to the
+ * real login form when the plain login fails for any reason other than the
+ * portal refusing the password. Returns a note for the steps when it had to
+ * fall back.
+ */
+async function logIn(page: Page, caller: NamedXceleratorCaller, early?: Promise<HttpLogin>): Promise<string> {
+  const login = await (early ?? loginOverHttp(caller));
+  let why: string;
+  if (login.ok) {
+    const context = page.context();
+    await context.clearCookies(); // an expired session's cookies, if any
+    await context.addCookies(login.cookies);
+    await openPortalPage(page, mainPageUrl(caller.cfg.portalBaseUrl), "main page");
+    if (!(await isAtLogin(page))) return "";
+    why = "the portal did not take the plain login's cookies";
+  } else if (login.error instanceof XceleratorLoginRejectedError) {
+    throw new Error(`Portal login failed for ${caller.label}; check ${caller.cfg.credentialLabel}.`);
+  } else {
+    why = `plain login failed: ${login.error instanceof Error ? login.error.message.split("\n")[0] : String(login.error)}`;
+  }
+  await loginViaUi(page, caller);
+  return ` through the login page (${why})`;
+}
+
 /**
  * Leaves the page on the portal's Main page, logged in as this caller. With
  * a saved session (its cookies already in the page's context) that is one
@@ -580,21 +674,20 @@ async function openSession(
   caller: NamedXceleratorCaller,
   saved: boolean,
   log: (action: string, detail?: string) => void,
+  early?: Promise<HttpLogin>,
 ): Promise<void> {
   const started = Date.now();
   if (saved) {
     await openPortalPage(page, mainPageUrl(caller.cfg.portalBaseUrl), "main page");
-    const backAtLogin =
-      /\/ClientPortal\/?$/i.test(new URL(page.url()).pathname) || (await page.locator("#loginForm").count()) > 0;
-    if (!backAtLogin) {
+    if (!(await isAtLogin(page))) {
       log("reused session", `${Date.now() - started} ms`);
       return;
     }
     log("session expired", "logging in again");
   }
   const loginStarted = Date.now();
-  await loginViaUi(page, caller);
-  log("logged in", `${Date.now() - loginStarted} ms`);
+  const how = await logIn(page, caller, early);
+  log("logged in", `${Date.now() - loginStarted} ms${how}`);
 }
 
 // --- Quick Track ---------------------------------------------------------------
@@ -1060,13 +1153,15 @@ export function listFieldsFor(referenceNumber: string): string[] {
   return TRACK_BY_OPTIONS.filter((f) => f !== "OrderTrackingID" || looksLikeTrackingId);
 }
 
+const ACCOUNT_LIST_PATH = "/ClientPortal/ClientPortal/api/onlineaccess/GetAccounts";
+type AccountListBody = { Data?: { Value?: number; Text?: string }[] | null };
+
 /** The account codes this page's login can see, from the portal's own account list. */
 async function readAccounts(page: Page, portalBaseUrl: string): Promise<string[]> {
-  const body = await portalGet<{ Data?: { Value?: number; Text?: string }[] | null }>(
-    page,
-    `${portalBaseUrl}/ClientPortal/ClientPortal/api/onlineaccess/GetAccounts`,
-    "account list",
-  );
+  return accountCodes(await portalGet<AccountListBody>(page, `${portalBaseUrl}${ACCOUNT_LIST_PATH}`, "account list"));
+}
+
+function accountCodes(body: AccountListBody): string[] {
   // Value -1 is "Current Acct." and 0 is "*All Accounts"; the rest are the accounts, e.g. "DHL Same Day[DHLIN]".
   const codes = (body.Data ?? [])
     .filter((a) => (a.Value ?? 0) > 0)
@@ -1779,6 +1874,13 @@ async function resetOpenPage(page: Page, portalBaseUrl: string): Promise<void> {
     .catch(() => {});
 }
 
+/** How a caller's page begins a lookup. */
+type PageStart =
+  /** Its page left open on Main by an earlier lookup, logged in. */
+  | { from: "open page" }
+  /** A new page: `saved` when it starts with a saved session's cookies; `login` is a plain login already under way. */
+  | { from: "new page"; saved: boolean; login?: Promise<HttpLogin> };
+
 /**
  * One caller's search, all in code (no model calls):
  *  1. A page on the portal: the caller's page left open by an earlier
@@ -1791,8 +1893,7 @@ async function resetOpenPage(page: Page, portalBaseUrl: string): Promise<void> {
  */
 async function searchCaller(
   ws: Workspace,
-  /** null: a page left open by an earlier lookup; otherwise whether the new page has a saved session. */
-  savedSession: boolean | null,
+  start: PageStart,
   caller: NamedXceleratorCaller,
   referenceNumber: string,
   fields: string[],
@@ -1809,11 +1910,11 @@ async function searchCaller(
   const ref = referenceNumber.trim();
 
   const started = Date.now();
-  if (savedSession === null) {
+  if (start.from === "open page") {
     await resetOpenPage(page, base);
     log("reused open page", `${Date.now() - started} ms`);
   } else {
-    await openSession(page, caller, savedSession, log);
+    await openSession(page, caller, start.saved, log, start.login);
   }
 
   // A session can end while its page waits open; the portal then refuses
@@ -1826,9 +1927,9 @@ async function searchCaller(
       if (!(err instanceof SessionEndedError)) throw err;
       log("session expired", "logging in again");
       const loginStarted = Date.now();
-      await loginViaUi(page, caller);
+      const how = await logIn(page, caller);
       reloginMs += Date.now() - loginStarted;
-      log("logged in", `${Date.now() - loginStarted} ms`);
+      log("logged in", `${Date.now() - loginStarted} ms${how}`);
       return work();
     }
   };
@@ -1895,17 +1996,26 @@ function describePlan(
   backup: string[],
   fields: Map<string, string[]>,
   place: Place | null,
+  first: FirstCaller | null,
 ): string {
   const type = context.taxonomy === context.shape ? context.shape : `${context.taxonomy} (shape ${context.shape})`;
   const names = (list: string[]) =>
     list.length <= 1 ? list.join("") : `${list.slice(0, -1).join(", ")} and ${list[list.length - 1]}`;
+  const firstText =
+    first && place && first.caller !== place.caller
+      ? `${first.caller}, which sees that account and ${first.why}, goes first`
+      : `${place?.caller} goes first`;
   const before = place
-    ? `Found under ${place.caller}${place.account ? ` (account ${place.account})` : ""} before, so ${place.caller} ` +
-      `goes first and the others wait for it. `
+    ? `Found under ${place.caller}${place.account ? ` (account ${place.account})` : ""} before, so ${firstText} ` +
+      `and the others wait for it. `
     : "";
   const who =
     `Searching ${names(searching)}` +
-    (backup.length ? `, which between them see every account; ${names(backup)} only if one of them fails` : "");
+    (!backup.length
+      ? ""
+      : searching.length === 1
+        ? `, which sees every account; ${names(backup)} only if it fails`
+        : `, which between them see every account; ${names(backup)} only if one of them fails`);
   const plans = searching.map((c) => (fields.get(c) ?? []).join(", "));
   const order = plans.every((p) => p === plans[0])
     ? plans[0]
@@ -1968,6 +2078,75 @@ async function withBackOfficePod(
   }
 }
 
+type FirstCaller = { caller: string; why?: string };
+
+/**
+ * Who searches first for a reference found before: the caller that had it,
+ * unless another caller that sees the same account is quicker to start on
+ * this server (a page already open beats a saved session, which beats
+ * logging in). On 2026-10-28 212620423M waited 3.9 s for STRLN to log in
+ * while Seb2, which sees STRLN's account, had a page open.
+ */
+function firstCallerFor(place: Place, memory: WebAgentMemory, ranked: string[]): FirstCaller {
+  const account = place.account?.trim().toUpperCase() || null;
+  const sees = (c: string) =>
+    c === place.caller || (account !== null && (memory.callerAccounts?.[c]?.accounts ?? []).includes(account));
+  const readiness = (c: string) => (hasIdlePage(c) ? 2 : hasSavedSession(c) ? 1 : 0);
+  let best = place.caller;
+  for (const c of ranked) {
+    if (sees(c) && readiness(c) > readiness(best)) best = c;
+  }
+  if (best === place.caller) return { caller: best };
+  return { caller: best, why: readiness(best) === 2 ? "has a page open already" : "has a saved session" };
+}
+
+/** When this server last tried to re-read each caller's account list in the background. */
+const accountListTries = new Map<string, number>();
+/** A failed background re-read is tried again after this long. */
+const ACCOUNT_LIST_RETRY_MS = 10 * 60_000;
+
+/**
+ * Re-reads account lists that are a day old, over plain HTTP (no browser),
+ * after the lookup has answered. The planner trusts an old list rather than
+ * searching that caller every time (see planCallerCoverage), so this is
+ * what keeps the lists current. Each login's cookies are kept as a saved
+ * session, so that caller's next page on this server skips logging in.
+ */
+async function refreshOldAccountLists(
+  memory: WebAgentMemory,
+  callers: NamedXceleratorCaller[],
+  readDuringLookup: Record<string, string[]>,
+): Promise<void> {
+  const due = callers.filter(
+    (c) =>
+      accountListIsStale(memory, c.label) &&
+      !readDuringLookup[c.label] &&
+      Date.now() - (accountListTries.get(c.label) ?? 0) > ACCOUNT_LIST_RETRY_MS,
+  );
+  if (!due.length) return;
+  for (const c of due) accountListTries.set(c.label, Date.now());
+
+  const lists: Record<string, string[]> = {};
+  await Promise.all(
+    due.map(async (caller) => {
+      try {
+        // One time limit for the login and the read together.
+        const signal = AbortSignal.timeout(HTTP_LOGIN_TIMEOUT_MS + 5_000);
+        const session = await loginToPortal(caller.cfg, { skipLandingPage: true, signal });
+        const codes = accountCodes(await portalJson<AccountListBody>(session, ACCOUNT_LIST_PATH, { signal }));
+        if (codes.length) lists[caller.label] = codes;
+        keepSession(caller.label, { cookies: portalCookies(session), origins: [] }, Date.now());
+      } catch (err) {
+        console.warn(
+          `[web-agent] could not re-read ${caller.label}'s account list:`,
+          err instanceof Error ? err.message.split("\n")[0] : err,
+        );
+      }
+    }),
+  );
+  if (Object.keys(lists).length) await recordCallerAccounts(lists);
+}
+
 type PassResult = {
   callers: NamedXceleratorCaller[];
   winner: { caller: string; hit: CallerHit } | null;
@@ -1989,18 +2168,20 @@ export async function findOrderWithWebAgent(referenceNumber: string): Promise<We
 
   // Who to search. Each caller's order-list search covers every account it
   // can see, so only callers that see something the others don't are
-  // searched (today Seb2 and AIT: Seb2 also sees STRLN's and QUKIN's
-  // accounts); the rest are backups. The learned order for this type of
-  // reference (its shape plus any letter code, like the M in 212620423M)
-  // decides who goes first, and a reference found before goes to the caller
-  // that had it, alone, before anyone else.
+  // searched (today just Seb2, which sees every other caller's accounts);
+  // the rest are backups. The learned order for this type of reference (its
+  // shape plus any letter code, like the M in 212620423M) decides who goes
+  // first. A reference found before goes, alone and before anyone else, to
+  // the caller that had it, or to one that sees the same account and is
+  // already logged in here (firstCallerFor).
   const context = referenceContext(referenceNumber);
   const memory = await loadMemory();
   const ranked = rankCallers(memory, context, configured.map((c) => c.label)).map((r) => r.caller);
   const coverage = planCallerCoverage(memory, ranked);
   const known = rememberedPlace(memory, referenceNumber);
   const place = known && byLabel.has(known.caller) ? known : null;
-  const firstPass = place ? [place.caller, ...coverage.search.filter((c) => c !== place.caller)] : coverage.search;
+  const first = place ? firstCallerFor(place, memory, ranked) : null;
+  const firstPass = place && first ? [...new Set([first.caller, place.caller, ...coverage.search])] : coverage.search;
   const backups = coverage.backup.filter((c) => !firstPass.includes(c));
 
   // Every field is searched (they cost about 0.1 s each), best first for this caller and type.
@@ -2011,7 +2192,7 @@ export async function findOrderWithWebAgent(referenceNumber: string): Promise<We
   steps.push({
     caller: "planner",
     action: "plan",
-    detail: describePlan(context, memory, firstPass, backups, fields, place),
+    detail: describePlan(context, memory, firstPass, backups, fields, place, first),
   });
 
   const stop = { value: false };
@@ -2042,12 +2223,18 @@ export async function findOrderWithWebAgent(referenceNumber: string): Promise<We
         if (stop.value || rank > bestHitRank) return "skipped";
         const waited = Date.now() - queuedAt;
         if (waited > 500) steps.push({ caller: caller.label, action: "waited", detail: `${waited} ms for a free browser` });
-        let savedSession: boolean | null = null;
+        let start: PageStart = { from: "open page" };
         ws = takeIdlePage(caller.label);
-        if (!ws) ({ ws, savedSession } = await openWorkspace(caller.label));
+        if (!ws) {
+          // With no session to reuse, the login runs while the browser starts.
+          const login = hasSavedSession(caller.label) ? undefined : loginOverHttp(caller);
+          const opened = await openWorkspace(caller.label);
+          ws = opened.ws;
+          start = { from: "new page", saved: opened.savedSession, login };
+        }
         const hit = await searchCaller(
           ws,
-          savedSession,
+          start,
           caller,
           referenceNumber,
           fields.get(caller.label) ?? fieldOptions,
@@ -2103,22 +2290,28 @@ export async function findOrderWithWebAgent(referenceNumber: string): Promise<We
     passes.push(await runPass(backups, false));
   }
   stop.value = true;
-  const background = Promise.allSettled(running).then(() => {});
 
   const winnerPass = passes.find((p) => p.winner);
   const winner = winnerPass?.winner ?? null;
   const failures = passes.flatMap((p) => p.failures);
 
-  const [order] = await Promise.all([
-    winner ? withBackOfficePod(winner.hit.order, winner.hit.orderTrackingId, steps) : null,
-    recordEpisode({
-      context,
-      winner: winner?.caller ?? null,
-      outcomes: passes.flatMap((p) => p.settled),
-      found: winner ? { ref: referenceNumber, caller: winner.caller, account: winner.hit.account } : undefined,
-      accounts: accountsRead,
-    }),
-  ]);
+  // Learning is saved after answering, with callers still finishing and old
+  // account lists being re-read: the route keeps the function alive for
+  // `background`. Saving used to hold up every answer by about 1 s (a
+  // re-read plus a write of the shared store, production 2026-10-28).
+  const episode = recordEpisode({
+    context,
+    winner: winner?.caller ?? null,
+    outcomes: passes.flatMap((p) => p.settled),
+    found: winner ? { ref: referenceNumber, caller: winner.caller, account: winner.hit.account } : undefined,
+    accounts: accountsRead,
+  });
+  const background = Promise.allSettled([
+    ...running,
+    episode,
+    refreshOldAccountLists(memory, configured, accountsRead),
+  ]).then(() => {});
+  const order = winner ? await withBackOfficePod(winner.hit.order, winner.hit.orderTrackingId, steps) : null;
 
   if (winner) {
     const notes = [
@@ -2138,6 +2331,9 @@ export async function findOrderWithWebAgent(referenceNumber: string): Promise<We
   const searched = passes.flatMap((p) => p.callers);
   const errors = passes.flatMap((p) => p.errors);
   if (failures.length === searched.length) {
+    // An error answer has no `background` for the route to keep alive, so
+    // the learning is saved before it (as before; the rest may be cut short).
+    await episode;
     if (errors.every((e) => e instanceof PortalTimeoutError)) {
       throw new WebAgentError(
         `The Xcelerator portal did not respond: its pages did not load within ${NAV_TIMEOUT_MS / 1000} seconds ` +
