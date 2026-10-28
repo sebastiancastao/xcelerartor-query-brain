@@ -1,6 +1,6 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { extractUuid } from "@/lib/missive-id";
-import { fetchMissiveConversationText, isMissiveConfigured } from "@/lib/missive";
+import { MissiveNotVisibleError, fetchMissiveConversationText, isMissiveConfigured } from "@/lib/missive";
 
 // Backs the "sense the open Missive email" panel on the home page: given the
 // conversation id Missive's iframe SDK reports as currently selected, this
@@ -32,6 +32,9 @@ export async function GET(
     const email = await fetchMissiveConversationText(conversationId);
     return NextResponse.json({ email });
   } catch (error) {
+    if (error instanceof MissiveNotVisibleError) {
+      return NextResponse.json({ error: error.message }, { status: 404 });
+    }
     console.error("Failed to fetch Missive conversation:", error);
     const message = error instanceof Error ? error.message : "Failed to fetch Missive conversation.";
     return NextResponse.json({ error: message }, { status: 502 });

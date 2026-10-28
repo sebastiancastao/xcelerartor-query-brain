@@ -1,7 +1,7 @@
 import { describeAxisAuth, isAxisApiConfigured, type AxisAuthDescription } from "./axis-api";
 import { recentDebugEvents, type DebugEvent } from "./debug-log";
 import { loginPerformanceSnapshot, type LoginPerformanceSnapshot } from "./login-performance";
-import { isMissiveConfigured } from "./missive";
+import { isMissiveConfigured, missiveTokenCount } from "./missive";
 import { isOpenAIConfigured } from "./openai";
 import { xceleratorCallersFromEnv } from "./xcelerator-portal";
 import { debugCacheStats } from "./xcelerator";
@@ -18,6 +18,8 @@ export type DebugStatus = {
   };
   axis: { configured: boolean; auth: AxisAuthDescription };
   missiveConfigured: boolean;
+  /** MISSIVE_API_TOKEN plus each MISSIVE_API_TOKEN_<NAME>. */
+  missiveTokens: number;
   openai: { configured: boolean; model: string };
   /** AXIS_ACCOUNT_NO parsed into its codes, or null when not set (no filtering). */
   accountScoping: string[] | null;
@@ -96,6 +98,7 @@ export function collectDebugStatus(): DebugStatus {
     },
     axis: { configured: isAxisApiConfigured(), auth: axisAuth },
     missiveConfigured: isMissiveConfigured(),
+    missiveTokens: missiveTokenCount(),
     openai: {
       configured: isOpenAIConfigured(),
       model: process.env.OPENAI_MODEL?.trim() || "gpt-4o-mini (default)",

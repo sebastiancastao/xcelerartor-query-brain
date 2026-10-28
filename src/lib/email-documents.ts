@@ -13,7 +13,12 @@ import { createHash } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
 import { inflateRawSync } from "node:zlib";
-import { fetchConversationMessages, type MissiveAttachment, type MissiveThreadMessage } from "./missive";
+import {
+  MissiveNotVisibleError,
+  fetchConversationMessages,
+  type MissiveAttachment,
+  type MissiveThreadMessage,
+} from "./missive";
 import { chatCompletion, isOpenAIConfigured, type UserContentPart } from "./openai";
 
 export type DocumentPreview = "pdf" | "image" | "text";
@@ -386,7 +391,18 @@ function buildListing(conversationId: string, messages: MissiveThreadMessage[]):
 async function getListing(conversationId: string): Promise<Listing> {
   const cached = listings.get(conversationId);
   if (cached && cached.expiresAt > Date.now()) return cached;
-  const messages = await fetchConversationMessages(conversationId, { bodies: true });
+  let messages: MissiveThreadMessage[];
+  try {
+    messages = await fetchConversationMessages(conversationId, { bodies: true });
+  } catch (error) {
+    if (error instanceof MissiveNotVisibleError) {
+      throw new EmailDocumentError(
+        "Attachments in this email can't be read here: none of the app's Missive API tokens belongs to a user who can see it.",
+        404,
+      );
+    }
+    throw error;
+  }
   return remember(listings, conversationId, buildListing(conversationId, messages), 100);
 }
 

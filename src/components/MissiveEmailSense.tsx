@@ -4,6 +4,7 @@ import Script from "next/script";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { MouseEvent } from "react";
 import { extractUuids } from "@/lib/missive-id";
+import { messageBodyText } from "@/lib/missive-text";
 
 export type MissiveSenseStatus =
   | "loading-script"
@@ -15,9 +16,22 @@ export type MissiveSenseStatus =
   | "not-configured"
   | "error";
 
+type MissiveIframeAddress = { name?: string | null; address?: string | null };
+
+/** The latest message as Missive's in-page API returns it with a conversation. */
+type MissiveIframeMessage = {
+  id?: string;
+  subject?: string | null;
+  preview?: string | null;
+  body?: string | null;
+  from_field?: MissiveIframeAddress | null;
+};
+
 type MissiveIframeConversation = {
   id: string;
-  latest_message?: { id: string } | null;
+  subject?: string | null;
+  authors?: MissiveIframeAddress[] | null;
+  latest_message?: MissiveIframeMessage | null;
   messages_count?: number;
 };
 
@@ -132,6 +146,54 @@ type ConversationTextResponse = {
   error?: string;
 };
 
+type SensedEmail = { subject: string; from: string; fromName: string; body: string };
+
+/** How long to wait for Missive's in-page API before asking the server instead. */
+const IFRAME_FETCH_TIMEOUT_MS = 5000;
+
+/** Missive's in-page view of a conversation, or null when it gave none in time. */
+async function fetchIframeConversation(conversationId: string): Promise<MissiveIframeConversation | null> {
+  const missive = window.Missive;
+  if (typeof missive?.fetchConversations !== "function") return null;
+  try {
+    const conversations = await Promise.race([
+      missive.fetchConversations([conversationId]),
+      wait(IFRAME_FETCH_TIMEOUT_MS).then(() => null),
+    ]);
+    return conversations?.[0] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The open email as Missive's in-page API gives it. That API runs as
+ * whoever is signed in to Missive, so it reads every email they can open.
+ * The server's REST API token only sees what its own user can see, so it
+ * is the fallback. `complete` is false when Missive left out the body; then
+ * the server is asked, and `email` (subject and preview) is used if the
+ * server can't read the email either.
+ */
+function emailFromIframe(conversation: MissiveIframeConversation | null): {
+  email: SensedEmail | null;
+  complete: boolean;
+} {
+  if (!conversation) return { email: null, complete: false };
+  const message = conversation.latest_message;
+  // A conversation with only chat comments has no latest message.
+  if (!message) return { email: null, complete: conversation.messages_count === 0 };
+  const body = messageBodyText(message.body).trim();
+  return {
+    email: {
+      subject: message.subject ?? conversation.subject ?? "",
+      from: message.from_field?.address ?? conversation.authors?.[0]?.address ?? "",
+      fromName: message.from_field?.name ?? "",
+      body: body || (message.preview ?? ""),
+    },
+    complete: Boolean(body),
+  };
+}
+
 function statusLabel(
   status: MissiveSenseStatus,
   subject: string,
@@ -189,6 +251,7 @@ export function MissiveEmailSense({
 
   const lastScannedIdRef = useRef<string | null>(null);
   const requestIdRef = useRef(0);
+  const changeIdRef = useRef(0);
   const listenerRegisteredRef = useRef(false);
 
   useEffect(() => {
@@ -198,19 +261,47 @@ export function MissiveEmailSense({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [status]);
 
+  // `prefetched` is Missive's in-page view of the conversation when the caller
+  // already has it; Rescan leaves it out so the email is read fresh.
   const scanConversation = useCallback(
-    async (conversationId: string) => {
+    async (conversationId: string, prefetched?: MissiveIframeConversation | null) => {
       const requestId = requestIdRef.current + 1;
       requestIdRef.current = requestId;
       setSelectedConversationId(conversationId);
       setStatus("scanning");
       setErrorMessage("");
 
+      const report = (email: SensedEmail) => {
+        setSubject(email.subject);
+        setStatus("ready");
+        onEmailText(`${email.subject}\n\n${email.body}`, { ...email, conversationId });
+      };
+      const showEmpty = () => {
+        setSubject("");
+        setStatus("empty");
+      };
+
+      const sensed = emailFromIframe(
+        prefetched === undefined ? await fetchIframeConversation(conversationId) : prefetched,
+      );
+      if (requestId !== requestIdRef.current) return;
+      if (sensed.complete) {
+        if (sensed.email) report(sensed.email);
+        else showEmpty();
+        return;
+      }
+      // What Missive did give (subject, preview), for when the server can't do better.
+      const partial = sensed.email && (sensed.email.subject || sensed.email.body) ? sensed.email : null;
+
       try {
         const response = await fetch(`/api/missive/conversation/${encodeURIComponent(conversationId)}`);
         const data = (await response.json().catch(() => ({}))) as Partial<ConversationTextResponse>;
         if (requestId !== requestIdRef.current) return;
 
+        if (!response.ok && partial) {
+          report(partial);
+          return;
+        }
         if (response.status === 501) {
           setStatus("not-configured");
           return;
@@ -219,22 +310,23 @@ export function MissiveEmailSense({
           throw new Error(data.error ?? `status ${response.status}`);
         }
         if (!data.email) {
-          setSubject("");
-          setStatus("empty");
+          if (partial) report(partial);
+          else showEmpty();
           return;
         }
 
-        setSubject(data.email.subject ?? "");
-        setStatus("ready");
-        onEmailText(`${data.email.subject ?? ""}\n\n${data.email.body ?? ""}`, {
+        report({
           subject: data.email.subject ?? "",
           from: data.email.from ?? "",
           fromName: data.email.fromName ?? "",
           body: data.email.body ?? "",
-          conversationId,
         });
       } catch (error) {
         if (requestId !== requestIdRef.current) return;
+        if (partial) {
+          report(partial);
+          return;
+        }
         setStatus("error");
         setErrorMessage(
           error instanceof Error ? error.message : "Couldn't read the selected Missive email."
@@ -246,6 +338,7 @@ export function MissiveEmailSense({
 
   const handleConversationChange = useCallback(
     async (payload: unknown) => {
+      const changeId = ++changeIdRef.current;
       const ids = extractUuids(payload);
 
       if (ids.length !== 1) {
@@ -257,15 +350,11 @@ export function MissiveEmailSense({
         return;
       }
 
-      const missive = window.Missive;
-      let conversationId = ids[0];
-
-      try {
-        const [conversation] = (await missive?.fetchConversations(ids)) ?? [];
-        conversationId = extractUuids(conversation?.id)[0] ?? conversationId;
-      } catch {
-        // The backend can still resolve the selected conversation id.
-      }
+      // One call gets both the canonical id and the email itself.
+      const conversation = await fetchIframeConversation(ids[0]);
+      // The CSR opened something else while Missive answered; that change scans instead.
+      if (changeId !== changeIdRef.current) return;
+      const conversationId = extractUuids(conversation?.id)[0] ?? ids[0];
 
       // Missive can re-fire "change:conversations" for the same still-open
       // email (e.g. a label change) — skip re-scanning it so we don't stomp
@@ -273,7 +362,7 @@ export function MissiveEmailSense({
       if (conversationId === lastScannedIdRef.current) return;
       lastScannedIdRef.current = conversationId;
 
-      await scanConversation(conversationId);
+      await scanConversation(conversationId, conversation);
     },
     [scanConversation]
   );

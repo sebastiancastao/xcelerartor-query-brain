@@ -480,7 +480,15 @@ export default function DebugPage() {
                   </div>
                   <div className="flex items-center justify-between gap-3">
                     <dt className="text-zinc-600 dark:text-zinc-400">Missive</dt>
-                    <dd>{status.missiveConfigured ? <Badge tone="emerald">token set</Badge> : <Badge tone="zinc">not configured</Badge>}</dd>
+                    <dd>
+                      {status.missiveConfigured ? (
+                        <Badge tone="emerald">
+                          {status.missiveTokens > 1 ? `${status.missiveTokens} tokens set` : "token set"}
+                        </Badge>
+                      ) : (
+                        <Badge tone="zinc">not configured</Badge>
+                      )}
+                    </dd>
                   </div>
                   <div className="flex items-center justify-between gap-3">
                     <dt className="text-zinc-600 dark:text-zinc-400">OpenAI replies</dt>
