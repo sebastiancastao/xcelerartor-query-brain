@@ -5,6 +5,7 @@ import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import type { ReactNode } from "react";
 import type { OrderInquiry } from "@/lib/xcelerator";
 import type { WebAgentStep } from "@/lib/web-agent";
+import type { InquiryEmail } from "@/lib/agent";
 import { buildSuggestedReply } from "@/lib/email";
 import { detectOrderReferences, type DetectedReference } from "@/lib/reference-detection";
 import {
@@ -40,7 +41,8 @@ type LookupState =
 type ReplyState =
   | { status: "idle" }
   | { status: "loading" }
-  | { status: "ready"; text: string };
+  /** `asks`: what the open email asks for, as the AI read it; empty when there was no email. */
+  | { status: "ready"; text: string; asks: string[] };
 
 /** Putting the AI reply into a reply draft in Missive. */
 type ReplyInsertState =
@@ -270,6 +272,10 @@ export default function WebAgentHome() {
   // Numbers each lookup. Opening another email starts a new lookup while the
   // previous one may still be running; only the newest one may show its result.
   const lookupSeqRef = useRef(0);
+  // The email open in Missive, so the AI reply answers what it actually
+  // asks. Cleared when no single email is open; outside Missive it stays
+  // null and the reply is the general status update.
+  const openEmailRef = useRef<InquiryEmail | null>(null);
   // The Missive email whose attachments and document links are listed;
   // scanId changes on every scan (Rescan included) so the list reloads.
   const [emailScan, setEmailScan] = useState<{ conversationId: string; scanId: number } | null>(null);
@@ -293,6 +299,9 @@ export default function WebAgentHome() {
     if (!ref) return;
     const seq = ++lookupSeqRef.current;
     const current = () => seq === lookupSeqRef.current;
+    // The email this lookup answers, taken now: opening another email
+    // while the lookup runs must not swap the email under this order.
+    const email = openEmailRef.current;
 
     setReferenceNumber(ref);
     setState({ status: "loading" });
@@ -336,26 +345,28 @@ export default function WebAgentHome() {
         reviewOrderUrl: body.reviewOrderUrl ?? null,
         warning: body.warning,
       });
-      loadReplyForOrder(body.order, current);
+      loadReplyForOrder(body.order, email, current);
     } catch {
       if (current()) setState({ status: "error", message: "Network error — please try again." });
     }
   }
 
   /** `current` says whether the lookup this reply belongs to is still the one on screen. */
-  async function loadReplyForOrder(order: OrderInquiry, current: () => boolean) {
+  async function loadReplyForOrder(order: OrderInquiry, email: InquiryEmail | null, current: () => boolean) {
     setReply({ status: "loading" });
 
     try {
       const res = await fetch("/api/web-agent/reply", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ order }),
+        body: JSON.stringify({ order, email }),
       });
       const data = await res.json().catch(() => null);
-      if (current()) setReply({ status: "ready", text: data?.reply ?? buildSuggestedReply(order) });
+      if (!current()) return;
+      const asks = Array.isArray(data?.asks) ? data.asks.filter((a: unknown): a is string => typeof a === "string") : [];
+      setReply({ status: "ready", text: data?.reply ?? buildSuggestedReply(order), asks: data?.reply ? asks : [] });
     } catch {
-      if (current()) setReply({ status: "ready", text: buildSuggestedReply(order) });
+      if (current()) setReply({ status: "ready", text: buildSuggestedReply(order), asks: [] });
     }
   }
 
@@ -421,7 +432,11 @@ export default function WebAgentHome() {
 
   // Called by MissiveEmailSense whenever the CSR opens a different email in
   // Missive: runs detection and looks the top reference up straight away.
-  function handleMissiveEmailText(text: string, meta: { conversationId: string }) {
+  function handleMissiveEmailText(
+    text: string,
+    meta: { subject: string; from: string; fromName: string; body: string; conversationId: string },
+  ) {
+    openEmailRef.current = { subject: meta.subject, from: meta.from, fromName: meta.fromName, body: meta.body };
     setEmailScan((prev) => ({ conversationId: meta.conversationId, scanId: (prev?.scanId ?? 0) + 1 }));
     const top = applyDetectedText(text);
     if (top && top !== lastAutoLookedUpRef.current) {
@@ -541,6 +556,10 @@ export default function WebAgentHome() {
                   setEmailScan(null);
                   setEmailDocs(null);
                 }
+                // The reply only answers an email that is still open and read.
+                // "scanning" leaves it alone: the new email replaces it as soon
+                // as it arrives, and this notice can land after that.
+                if (status !== "ready" && status !== "scanning") openEmailRef.current = null;
               }}
               pasteFallback={false}
             />
@@ -963,6 +982,21 @@ export default function WebAgentHome() {
                   </button>
                 </div>
               </div>
+              {reply.status === "ready" && reply.asks.length > 0 && (
+                <div className="mb-3 flex flex-col gap-1.5">
+                  <span className="text-xs font-medium text-zinc-500 dark:text-zinc-400">The email asks for</span>
+                  <ul className="flex flex-wrap gap-1.5">
+                    {reply.asks.map((ask, i) => (
+                      <li
+                        key={`${i}-${ask}`}
+                        className="rounded-full border border-indigo-200 bg-indigo-50 px-2.5 py-1 text-xs text-indigo-700 dark:border-indigo-900 dark:bg-indigo-950 dark:text-indigo-300"
+                      >
+                        {ask}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
               <textarea
                 readOnly
                 value={reply.status === "ready" ? reply.text : "Drafting reply…"}

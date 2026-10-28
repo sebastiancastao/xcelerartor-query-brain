@@ -128,7 +128,7 @@ export async function insertIntoMissiveReply(text: string): Promise<void> {
 }
 
 type ConversationTextResponse = {
-  email: { subject: string; body: string; from: string; receivedAt: string } | null;
+  email: { subject: string; body: string; from: string; fromName?: string; receivedAt: string } | null;
   error?: string;
 };
 
@@ -174,7 +174,10 @@ export function MissiveEmailSense({
   onStatusChange,
   pasteFallback = true,
 }: {
-  onEmailText: (text: string, meta: { subject: string; from: string; conversationId: string }) => void;
+  onEmailText: (
+    text: string,
+    meta: { subject: string; from: string; fromName: string; body: string; conversationId: string },
+  ) => void;
   onStatusChange?: (status: MissiveSenseStatus) => void;
   /** Whether the page has a "paste an email" box for the status line to point to. */
   pasteFallback?: boolean;
@@ -226,6 +229,8 @@ export function MissiveEmailSense({
         onEmailText(`${data.email.subject ?? ""}\n\n${data.email.body ?? ""}`, {
           subject: data.email.subject ?? "",
           from: data.email.from ?? "",
+          fromName: data.email.fromName ?? "",
+          body: data.email.body ?? "",
           conversationId,
         });
       } catch (error) {

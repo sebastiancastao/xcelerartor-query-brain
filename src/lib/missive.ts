@@ -82,6 +82,8 @@ export type MissiveConversationText = {
   subject: string;
   body: string;
   from: string;
+  /** The sender's display name, when Missive has one. */
+  fromName: string;
   receivedAt: string;
 };
 
@@ -126,6 +128,7 @@ export async function fetchMissiveConversationText(
     subject: message.subject ?? conversation.latest_message_subject ?? conversation.subject ?? "",
     body: looksLikeHtml(rawBody) ? stripHtml(rawBody) : rawBody,
     from,
+    fromName: message.from_field?.name ?? "",
     receivedAt: new Date(
       (message.delivered_at ?? conversation.last_activity_at ?? Date.now() / 1000) * 1000
     ).toISOString(),
