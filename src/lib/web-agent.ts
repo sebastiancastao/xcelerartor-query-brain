@@ -423,7 +423,10 @@ function loginOverHttp(caller: NamedXceleratorCaller): Promise<HttpLogin> {
  */
 function portalCookies(session: PortalSession): SessionState["cookies"] {
   const url = new URL(session.cfg.portalBaseUrl);
-  return session.jar.entries().map(({ name, value }) => ({
+  // Empty ones are cookies the portal deleted (.AspNet.ExternalCookie, with
+  // an "expires=Thu, 01-Jan-1970" the jar doesn't read as a deletion); a
+  // browser would have dropped them.
+  return session.jar.entries().filter(({ value }) => value !== "").map(({ name, value }) => ({
     name,
     value,
     domain: url.hostname,
@@ -635,31 +638,41 @@ async function isAtLogin(page: Page): Promise<boolean> {
   return /\/ClientPortal\/?$/i.test(new URL(page.url()).pathname) || (await page.locator("#loginForm").count()) > 0;
 }
 
+/** How a page got logged in: `plain` for a plain HTTP login, and a note for the steps when it used the login form. */
+type LoginResult = { plain: boolean; note: string };
+
 /**
  * Logs this page in as the caller and leaves it on Main: a plain HTTP login
  * (`early` when one was started while the page's browser was starting),
- * its cookies handed to the page, then one load of Main. Falls back to the
- * real login form when the plain login fails for any reason other than the
- * portal refusing the password. Returns a note for the steps when it had to
- * fall back.
+ * its cookies handed to the page, then one load of Main. That load is what
+ * sets the session up: the portal's order search finds nothing for a plain
+ * login's session until Main has been loaded once (2026-10-28). Falls back
+ * to the real login form when the plain login fails for any reason other
+ * than the portal refusing the password, or straight away with `formBecause`.
  */
-async function logIn(page: Page, caller: NamedXceleratorCaller, early?: Promise<HttpLogin>): Promise<string> {
-  const login = await (early ?? loginOverHttp(caller));
-  let why: string;
-  if (login.ok) {
-    const context = page.context();
-    await context.clearCookies(); // an expired session's cookies, if any
-    await context.addCookies(login.cookies);
-    await openPortalPage(page, mainPageUrl(caller.cfg.portalBaseUrl), "main page");
-    if (!(await isAtLogin(page))) return "";
-    why = "the portal did not take the plain login's cookies";
-  } else if (login.error instanceof XceleratorLoginRejectedError) {
-    throw new Error(`Portal login failed for ${caller.label}; check ${caller.cfg.credentialLabel}.`);
-  } else {
-    why = `plain login failed: ${login.error instanceof Error ? login.error.message.split("\n")[0] : String(login.error)}`;
+async function logIn(
+  page: Page,
+  caller: NamedXceleratorCaller,
+  options: { early?: Promise<HttpLogin>; formBecause?: string } = {},
+): Promise<LoginResult> {
+  let why = options.formBecause;
+  if (!why) {
+    const login = await (options.early ?? loginOverHttp(caller));
+    if (login.ok) {
+      const context = page.context();
+      await context.clearCookies(); // an expired session's cookies, if any
+      await context.addCookies(login.cookies);
+      await openPortalPage(page, mainPageUrl(caller.cfg.portalBaseUrl), "main page");
+      if (!(await isAtLogin(page))) return { plain: true, note: "" };
+      why = "the portal did not take the plain login's cookies";
+    } else if (login.error instanceof XceleratorLoginRejectedError) {
+      throw new Error(`Portal login failed for ${caller.label}; check ${caller.cfg.credentialLabel}.`);
+    } else {
+      why = `plain login failed: ${login.error instanceof Error ? login.error.message.split("\n")[0] : String(login.error)}`;
+    }
   }
   await loginViaUi(page, caller);
-  return ` through the login page (${why})`;
+  return { plain: false, note: ` through the login page (${why})` };
 }
 
 /**
@@ -667,7 +680,8 @@ async function logIn(page: Page, caller: NamedXceleratorCaller, early?: Promise<
  * a saved session (its cookies already in the page's context) that is one
  * page load; if the portal sent it back to the login form, the session had
  * expired and this logs in again. Loading Main (no ?id=) also puts the
- * session back on the caller's default account.
+ * session back on the caller's default account. Returns true when the page
+ * is on a plain login made just now.
  */
 async function openSession(
   page: Page,
@@ -675,19 +689,20 @@ async function openSession(
   saved: boolean,
   log: (action: string, detail?: string) => void,
   early?: Promise<HttpLogin>,
-): Promise<void> {
+): Promise<boolean> {
   const started = Date.now();
   if (saved) {
     await openPortalPage(page, mainPageUrl(caller.cfg.portalBaseUrl), "main page");
     if (!(await isAtLogin(page))) {
       log("reused session", `${Date.now() - started} ms`);
-      return;
+      return false;
     }
     log("session expired", "logging in again");
   }
   const loginStarted = Date.now();
-  const how = await logIn(page, caller, early);
-  log("logged in", `${Date.now() - loginStarted} ms${how}`);
+  const login = await logIn(page, caller, { early });
+  log("logged in", `${Date.now() - loginStarted} ms${login.note}`);
+  return login.plain;
 }
 
 // --- Quick Track ---------------------------------------------------------------
@@ -1910,26 +1925,35 @@ async function searchCaller(
   const ref = referenceNumber.trim();
 
   const started = Date.now();
+  let freshPlainLogin = false;
   if (start.from === "open page") {
     await resetOpenPage(page, base);
     log("reused open page", `${Date.now() - started} ms`);
   } else {
-    await openSession(page, caller, start.saved, log, start.login);
+    freshPlainLogin = await openSession(page, caller, start.saved, log, start.login);
   }
 
   // A session can end while its page waits open; the portal then refuses
-  // its API. Log in again on the same page and retry once.
+  // its API. Log in again on the same page and retry once. A session the
+  // portal refuses right after a plain login gets the login form instead
+  // (seen once, 2026-10-28, while the portal took 15-45 s per login: every
+  // caller's plain-login session was refused, twice).
   let reloginMs = 0;
   const withSession = async <T>(work: () => Promise<T>): Promise<T> => {
     try {
       return await work();
     } catch (err) {
       if (!(err instanceof SessionEndedError)) throw err;
-      log("session expired", "logging in again");
+      log(freshPlainLogin ? "session refused" : "session expired", "logging in again");
       const loginStarted = Date.now();
-      const how = await logIn(page, caller);
+      const login = await logIn(
+        page,
+        caller,
+        freshPlainLogin ? { formBecause: "the portal refused the plain login's session" } : {},
+      );
+      freshPlainLogin = login.plain;
       reloginMs += Date.now() - loginStarted;
-      log("logged in", `${Date.now() - loginStarted} ms${how}`);
+      log("logged in", `${Date.now() - loginStarted} ms${login.note}`);
       return work();
     }
   };

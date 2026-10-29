@@ -4,7 +4,6 @@ import Link from "next/link";
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import type { ReactNode } from "react";
 import type { OrderInquiry } from "@/lib/xcelerator";
-import type { WebAgentStep } from "@/lib/web-agent";
 import type { InquiryEmail } from "@/lib/agent";
 import { buildSuggestedReply } from "@/lib/email";
 import { detectOrderReferences, type DetectedReference } from "@/lib/reference-detection";
@@ -253,9 +252,6 @@ export default function WebAgentHome() {
   // straight into a reply draft there.
   const [missiveHost, setMissiveHost] = useState(false);
   const [replyInsert, setReplyInsert] = useState<ReplyInsertState>({ status: "idle" });
-  // What the browser agent did (login, clicks, typing), shown under the
-  // result so a CSR can see how the answer was reached.
-  const [steps, setSteps] = useState<WebAgentStep[]>([]);
 
   // Order/reference detection: MissiveEmailSense below senses whichever
   // email the CSR currently has open in Missive; opening an email with a
@@ -309,7 +305,6 @@ export default function WebAgentHome() {
     setReplyInsert({ status: "idle" });
     setCopied(false);
     setShowShipmentDetails(false);
-    setSteps([]);
 
     try {
       const res = await fetch(`/api/web-agent/orders/${encodeURIComponent(ref)}`);
@@ -317,7 +312,6 @@ export default function WebAgentHome() {
       if (!res.ok) {
         const body = await res.json().catch(() => null);
         if (!current()) return;
-        setSteps(body?.steps ?? []);
         const baseMessage = body?.error ?? `Lookup failed (${res.status})`;
         setState({
           status: "error",
@@ -332,10 +326,8 @@ export default function WebAgentHome() {
         orderTrackingId: string | null;
         reviewOrderUrl?: string | null;
         warning?: string;
-        steps: WebAgentStep[];
       } = await res.json();
       if (!current()) return;
-      setSteps(body.steps ?? []);
       setState({
         status: "success",
         order: body.order,
@@ -658,7 +650,6 @@ export default function WebAgentHome() {
                 {orderAccount && <Badge tone="zinc">Account {orderAccount}</Badge>}
                 {orderTrackingId && <Badge tone="zinc">Tracking ID {orderTrackingId}</Badge>}
               </div>
-              <p className="text-sm text-zinc-500 dark:text-zinc-400">{order.customer}</p>
               {reviewOrderLink && (
                 <div className="mt-2 flex min-w-0 items-center gap-2 text-sm">
                   <span className="shrink-0 text-zinc-500 dark:text-zinc-400">Review Order:</span>
@@ -1031,24 +1022,6 @@ export default function WebAgentHome() {
           attachments={attachments}
           cardClass={card}
         />
-
-        {steps.length > 0 && state.status !== "loading" && (
-          <section className={`rounded-2xl border border-zinc-200/70 bg-white ${card} shadow-sm dark:border-zinc-800/70 dark:bg-zinc-900`}>
-            <h2 className="mb-3 text-sm font-semibold text-zinc-900 dark:text-zinc-100">What the agent did</h2>
-            <ol className="flex flex-col gap-1.5 text-xs text-zinc-600 dark:text-zinc-400">
-              {steps.map((step, i) => (
-                <li key={i} className="flex gap-2">
-                  <span className="w-5 shrink-0 text-right text-zinc-400 dark:text-zinc-500">{i + 1}.</span>
-                  <span>
-                    <span className="font-medium text-zinc-800 dark:text-zinc-200">{step.action}</span>
-                    {step.detail ? ` ${step.detail}` : ""}
-                    <span className="text-zinc-400 dark:text-zinc-500"> · {step.caller}</span>
-                  </span>
-                </li>
-              ))}
-            </ol>
-          </section>
-        )}
       </main>
     </div>
   );
