@@ -53,7 +53,7 @@ type ReplyInsertState =
 function formatMaybeDate(value: string | null): string {
   if (!value) return "TBD";
   const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? "TBD" : date.toLocaleString();
+  return Number.isNaN(date.getTime()) ? "TBD" : date.toLocaleString(undefined, { hourCycle: "h23" });
 }
 
 function SearchIcon({ className }: { className?: string }) {
