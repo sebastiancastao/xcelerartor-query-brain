@@ -17,6 +17,8 @@ import {
 import { EmailDocuments, type EmailDocumentList } from "@/components/EmailDocuments";
 import { UploadDocumentsToOrder } from "@/components/UploadDocumentsToOrder";
 import { useOrderAttachments } from "@/components/useOrderAttachments";
+import { QuoteRequest } from "@/components/QuoteRequest";
+import type { QuoteRequestDetection } from "@/lib/quote-types";
 
 type LookupState =
   | { status: "idle" }
@@ -279,6 +281,16 @@ export default function WebAgentHome() {
   // under the search box and the order card's "Upload documents" button.
   const [emailDocs, setEmailDocs] = useState<EmailDocumentList | null>(null);
   const documentCount = emailDocs?.status === "ready" ? emailDocs.documents.length : null;
+  // Set when the open email asks for a price quote: the quote card prices it
+  // with Quote Engine. `id` changes per scan so a new email gets a fresh card.
+  const [quoteRequest, setQuoteRequest] = useState<{
+    id: number;
+    email: InquiryEmail;
+    detection: QuoteRequestDetection;
+  } | null>(null);
+  const [quoteEngine, setQuoteEngine] = useState(false);
+  // Numbers each quote check; only the newest email's answer may show.
+  const quoteSeqRef = useRef(0);
 
   useEffect(() => {
     fetch("/api/config")
@@ -286,6 +298,7 @@ export default function WebAgentHome() {
       .then((data) => {
         setLive(Boolean(data.live));
         setAiDrafting(Boolean(data.aiDrafting));
+        setQuoteEngine(Boolean(data.quoteEngine));
       })
       .catch(() => setLive(false));
   }, []);
@@ -422,13 +435,35 @@ export default function WebAgentHome() {
     return top?.value ?? null;
   }
 
+  // Asks whether the email is a quote request. Runs beside the order lookup:
+  // a quote request usually has no order number, and when it has one both show.
+  async function checkQuoteRequest(email: InquiryEmail) {
+    const seq = ++quoteSeqRef.current;
+    setQuoteRequest(null);
+    if (!email.body.trim()) return;
+    try {
+      const res = await fetch("/api/web-agent/quote/detect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email }),
+      });
+      const data = (await res.json().catch(() => null)) as { detection?: QuoteRequestDetection } | null;
+      if (seq !== quoteSeqRef.current || !res.ok) return;
+      if (data?.detection?.isQuoteRequest) setQuoteRequest({ id: seq, email, detection: data.detection });
+    } catch {
+      // Not knowing is treated as "not a quote request"; the order lookup is unaffected.
+    }
+  }
+
   // Called by MissiveEmailSense whenever the CSR opens a different email in
   // Missive: runs detection and looks the top reference up straight away.
   function handleMissiveEmailText(
     text: string,
     meta: { subject: string; from: string; fromName: string; body: string; conversationId: string },
   ) {
-    openEmailRef.current = { subject: meta.subject, from: meta.from, fromName: meta.fromName, body: meta.body };
+    const email = { subject: meta.subject, from: meta.from, fromName: meta.fromName, body: meta.body };
+    openEmailRef.current = email;
+    void checkQuoteRequest(email);
     setEmailScan((prev) => ({ conversationId: meta.conversationId, scanId: (prev?.scanId ?? 0) + 1 }));
     const top = applyDetectedText(text);
     if (top && top !== lastAutoLookedUpRef.current) {
@@ -551,7 +586,11 @@ export default function WebAgentHome() {
                 // The reply only answers an email that is still open and read.
                 // "scanning" leaves it alone: the new email replaces it as soon
                 // as it arrives, and this notice can land after that.
-                if (status !== "ready" && status !== "scanning") openEmailRef.current = null;
+                if (status !== "ready" && status !== "scanning") {
+                  openEmailRef.current = null;
+                  quoteSeqRef.current += 1;
+                  setQuoteRequest(null);
+                }
               }}
               pasteFallback={false}
             />
@@ -609,7 +648,18 @@ export default function WebAgentHome() {
           </p>
         )}
 
-        {state.status === "idle" && (
+        {quoteRequest && (
+          <QuoteRequest
+            key={quoteRequest.id}
+            detection={quoteRequest.detection}
+            email={quoteRequest.email}
+            configured={quoteEngine}
+            missiveHost={missiveHost}
+            cardClass={card}
+          />
+        )}
+
+        {state.status === "idle" && !quoteRequest && (
           <div className={`flex flex-col items-center gap-3 rounded-2xl border border-dashed border-zinc-300 bg-white/60 px-6 ${embedded ? "py-6" : "py-16"} text-center dark:border-zinc-700 dark:bg-zinc-900/40`}>
             <div className="flex h-12 w-12 items-center justify-center rounded-full bg-indigo-50 text-indigo-600 dark:bg-indigo-950 dark:text-indigo-400">
               <SearchIcon className="h-5 w-5" />

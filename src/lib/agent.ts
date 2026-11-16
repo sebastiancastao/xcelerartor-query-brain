@@ -280,7 +280,7 @@ const EMAIL_REPLY_PROMPT = [
 ].join(" ");
 
 /** Today in the portal's zone, so the reply can say "today" or "tomorrow" correctly. */
-function todayText(): string {
+export function todayText(): string {
   return new Date().toLocaleDateString("en-US", {
     timeZone: "America/New_York",
     weekday: "long",
@@ -290,7 +290,7 @@ function todayText(): string {
   });
 }
 
-function emailForPrompt(email: InquiryEmail): string {
+export function emailForPrompt(email: InquiryEmail): string {
   const body = email.body.trim();
   const clipped = body.length > EMAIL_BODY_LIMIT ? `${body.slice(0, EMAIL_BODY_LIMIT)}\n[...rest of thread cut]` : body;
   const sender = email.fromName ? `${email.fromName} <${email.from}>` : email.from;
