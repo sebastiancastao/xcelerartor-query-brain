@@ -8,7 +8,7 @@ function finite(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
 }
 
-/** The quote inputs as the page sent them. Quote Engine checks ranges; this only checks the shape. */
+/** The quote inputs as the page sent them. The rate sheet checks ranges; this only checks the shape. */
 function readInputs(value: unknown): QuoteInputs | null {
   if (!value || typeof value !== "object") return null;
   const v = value as Record<string, unknown>;
@@ -49,8 +49,8 @@ function address(value: unknown): string | null {
 }
 
 /**
- * Prices the shipment with Quote Engine and drafts the reply that gives the
- * customer that price. Read-only on the Quote Engine side: no quote is saved.
+ * Prices the shipment on Quote Engine's rate sheet (in-process, no API call)
+ * and drafts the reply that gives the customer that price. No quote is saved.
  */
 export async function POST(request: Request) {
   const body = await request.json().catch(() => null);
@@ -58,7 +58,7 @@ export async function POST(request: Request) {
   if (!inputs) return NextResponse.json({ error: "Fill in the quote details first." }, { status: 400 });
 
   try {
-    const quote = await calculateQuote(inputs);
+    const quote = calculateQuote(inputs);
     const reply = await draftQuoteReply(readEmail(body?.email), quote, inputs, {
       pickupAddress: address(body?.route?.pickupAddress),
       deliveryAddress: address(body?.route?.deliveryAddress),

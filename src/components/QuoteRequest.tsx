@@ -163,22 +163,19 @@ function Labeled({ label, hint, children }: { label: string; hint?: string; chil
 /**
  * Shown when the email open in Missive asks for a price quote. The details
  * the email states are filled in; the CSR adds the rest (route miles and the
- * fuel surcharge are never guessed), Quote Engine prices it, and the reply
- * with that price is drafted. Nothing is saved in Quote Engine and nothing is
+ * fuel surcharge are never guessed), Quote Engine's rate sheet prices it, and
+ * the reply with that price is drafted. No quote is saved anywhere and nothing is
  * sent: the CSR puts the reply into Missive and sends it there.
  */
 export function QuoteRequest({
   detection,
   email,
-  configured,
   missiveHost,
   cardClass,
 }: {
   detection: QuoteRequestDetection;
   /** The email the quote answers. */
   email: InquiryEmail;
-  /** Whether QUOTE_API_KEY is set on the server. */
-  configured: boolean;
   /** Whether Missive is hosting the page, so the reply can go into a draft there. */
   missiveHost: boolean;
   cardClass: string;
@@ -192,7 +189,7 @@ export function QuoteRequest({
     const emailGaveAll = Boolean(
       fields.vehicleClass && fields.miles && fields.weight && fields.pickupStart && fields.deliveryEnd,
     );
-    return configured && emailGaveAll && "inputs" in buildInputs(initialForm(detection))
+    return emailGaveAll && "inputs" in buildInputs(initialForm(detection))
       ? { status: "loading" }
       : { status: "idle" };
   });
@@ -219,7 +216,7 @@ export function QuoteRequest({
         | null;
       if (seq !== seqRef.current) return;
       if (!res.ok || !data?.quote || typeof data.reply !== "string") {
-        setCalc({ status: "error", message: data?.error ?? `Quote Engine error (${res.status})` });
+        setCalc({ status: "error", message: data?.error ?? `Quote error (${res.status})` });
         return;
       }
       saveDefaults(current);
@@ -345,12 +342,6 @@ export function QuoteRequest({
         </dl>
       )}
 
-      {!configured && (
-        <p className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:border-amber-900/60 dark:bg-amber-950 dark:text-amber-300">
-          Quote Engine isn&apos;t connected yet, so no price can be calculated. Set QUOTE_API_KEY on the server.
-        </p>
-      )}
-
       {notInEmail.length > 0 && (
         <p className="mt-3 text-xs text-zinc-500 dark:text-zinc-400">
           Not in the email: {notInEmail.join(", ")}.
@@ -361,7 +352,7 @@ export function QuoteRequest({
       <form
         onSubmit={(e) => {
           e.preventDefault();
-          if (!configured || missing.length > 0) return;
+          if (missing.length > 0) return;
           setCalc({ status: "loading" });
           setInsert({ status: "idle" });
           void runCalculation(form);
@@ -505,7 +496,7 @@ export function QuoteRequest({
         <div className="flex flex-wrap items-center gap-3">
           <button
             type="submit"
-            disabled={!configured || missing.length > 0 || calc.status === "loading"}
+            disabled={missing.length > 0 || calc.status === "loading"}
             className="inline-flex items-center justify-center gap-1.5 rounded-xl bg-indigo-600 px-4 py-2 text-sm font-medium text-white shadow-sm transition-colors hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-indigo-500 dark:hover:bg-indigo-400"
           >
             {calc.status === "loading" ? (

@@ -13,6 +13,7 @@ const eslintConfig = defineConfig([
     "build/**",
     "next-env.d.ts",
     "skyline-xcelarator-master/**",
+    "quote-engine/**",
   ]),
 ]);
 

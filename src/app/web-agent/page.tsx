@@ -282,13 +282,12 @@ export default function WebAgentHome() {
   const [emailDocs, setEmailDocs] = useState<EmailDocumentList | null>(null);
   const documentCount = emailDocs?.status === "ready" ? emailDocs.documents.length : null;
   // Set when the open email asks for a price quote: the quote card prices it
-  // with Quote Engine. `id` changes per scan so a new email gets a fresh card.
+  // on the rate sheet. `id` changes per scan so a new email gets a fresh card.
   const [quoteRequest, setQuoteRequest] = useState<{
     id: number;
     email: InquiryEmail;
     detection: QuoteRequestDetection;
   } | null>(null);
-  const [quoteEngine, setQuoteEngine] = useState(false);
   // Numbers each quote check; only the newest email's answer may show.
   const quoteSeqRef = useRef(0);
 
@@ -298,7 +297,6 @@ export default function WebAgentHome() {
       .then((data) => {
         setLive(Boolean(data.live));
         setAiDrafting(Boolean(data.aiDrafting));
-        setQuoteEngine(Boolean(data.quoteEngine));
       })
       .catch(() => setLive(false));
   }, []);
@@ -653,7 +651,6 @@ export default function WebAgentHome() {
             key={quoteRequest.id}
             detection={quoteRequest.detection}
             email={quoteRequest.email}
-            configured={quoteEngine}
             missiveHost={missiveHost}
             cardClass={card}
           />
