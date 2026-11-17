@@ -154,3 +154,19 @@ export function toEasternWallClock(date: Date): string {
   const t = date.getTime();
   return new Date(t + easternOffsetMs(t)).toISOString().slice(0, 16);
 }
+
+// Two-letter codes are matched in capitals only, so "in", "me" and "or" in a place name don't count.
+const US_STATE_CODE =
+  /\b(?:A[LKZR]|C[AOT]|D[EC]|FL|GA|HI|I[DLNA]|K[SY]|LA|M[EDAINSOT]|N[EVHJMYCD]|O[HKR]|PA|RI|S[CD]|T[NX]|UT|V[TA]|W[AVIY])\b|\b\d{5}\b/;
+const US_STATE_NAME =
+  /\b(?:alabama|alaska|arizona|arkansas|california|colorado|connecticut|delaware|florida|georgia|hawaii|idaho|illinois|indiana|iowa|kansas|kentucky|louisiana|maine|maryland|massachusetts|michigan|minnesota|mississippi|missouri|montana|nebraska|nevada|new\s+(?:hampshire|jersey|mexico|york)|(?:north|south)\s+(?:carolina|dakota)|ohio|oklahoma|oregon|pennsylvania|rhode\s+island|tennessee|texas|utah|vermont|virginia|washington|wisconsin|wyoming)\b/i;
+
+/**
+ * The place as sent to Google Maps. Customers usually name Atlanta-area places
+ * without a state ("LabCorp in Norcross"), so one without a state or ZIP is
+ * looked up in Georgia; the Google Maps link on the card uses the same text.
+ */
+export function routeAddress(place: string): string {
+  const value = place.trim();
+  return US_STATE_CODE.test(value) || US_STATE_NAME.test(value) ? value : `${value}, GA`;
+}

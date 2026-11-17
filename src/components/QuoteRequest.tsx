@@ -13,6 +13,7 @@ import {
   VEHICLE_CLASSES,
   VEHICLE_LABELS,
   formatCents,
+  routeAddress,
   toEasternWallClock,
   type FuelBasis,
   type QuoteExtra,
@@ -24,6 +25,8 @@ import {
 } from "@/lib/quote-types";
 
 type Form = {
+  pickupAddress: string;
+  deliveryAddress: string;
   vehicleClass: VehicleClass | "";
   miles: string;
   weight: string;
@@ -42,6 +45,12 @@ type CalcState =
   | { status: "loading" }
   | { status: "error"; message: string }
   | { status: "ready"; quote: QuoteResult; reply: string };
+
+type MilesState =
+  | { status: "idle" }
+  | { status: "loading" }
+  | { status: "error"; message: string }
+  | { status: "ready"; minutes: number | null };
 
 type InsertState = { status: "idle" } | { status: "inserting" } | { status: "inserted" } | { status: "error"; message: string };
 
@@ -131,6 +140,8 @@ function initialForm(detection: QuoteRequestDetection): Form {
   const saved = loadDefaults();
   const now = new Date();
   return {
+    pickupAddress: f.pickupAddress ?? "",
+    deliveryAddress: f.deliveryAddress ?? "",
     vehicleClass: f.vehicleClass ?? "",
     miles: f.miles?.toString() ?? "",
     weight: f.weight?.toString() ?? "",
@@ -162,8 +173,9 @@ function Labeled({ label, hint, children }: { label: string; hint?: string; chil
 
 /**
  * Shown when the email open in Missive asks for a price quote. The details
- * the email states are filled in; the CSR adds the rest (route miles and the
- * fuel surcharge are never guessed), Quote Engine's rate sheet prices it, and
+ * the email states are filled in, the route miles come from Google Maps for
+ * the pickup and delivery places, the CSR adds the rest (the fuel surcharge is
+ * never guessed), Quote Engine's rate sheet prices it, and
  * the reply with that price is drafted. No quote is saved anywhere and nothing is
  * sent: the CSR puts the reply into Missive and sends it there.
  */
@@ -195,7 +207,19 @@ export function QuoteRequest({
   });
   const [copied, setCopied] = useState(false);
   const [insert, setInsert] = useState<InsertState>({ status: "idle" });
+  // Miles are looked up straight away when the email names both places but no distance.
+  const [milesLookup, setMilesLookup] = useState<MilesState>(() =>
+    form.pickupAddress.trim() && form.deliveryAddress.trim() && !form.miles.trim()
+      ? { status: "loading" }
+      : { status: "idle" },
+  );
   const seqRef = useRef(0);
+  const milesSeqRef = useRef(0);
+  // The form as it is now, for work that finishes after the CSR may have typed more.
+  const formRef = useRef(form);
+  useEffect(() => {
+    formRef.current = form;
+  }, [form]);
 
   async function runCalculation(current: Form) {
     const built = buildInputs(current);
@@ -208,7 +232,10 @@ export function QuoteRequest({
         body: JSON.stringify({
           inputs: built.inputs,
           email,
-          route: { pickupAddress: fields.pickupAddress, deliveryAddress: fields.deliveryAddress },
+          route: {
+            pickupAddress: current.pickupAddress.trim() || null,
+            deliveryAddress: current.deliveryAddress.trim() || null,
+          },
         }),
       });
       const data = (await res.json().catch(() => null)) as
@@ -226,17 +253,65 @@ export function QuoteRequest({
     }
   }
 
+  /**
+   * Fills route miles with Google Maps' driving distance between the pickup and
+   * delivery places. `thenCalculate` prices the quote straight after, when
+   * nothing else is missing (used for the automatic lookup on opening). The
+   * caller shows the lookup as running.
+   */
+  async function lookUpMiles(current: Form, thenCalculate: boolean) {
+    const from = current.pickupAddress.trim();
+    const to = current.deliveryAddress.trim();
+    if (!from || !to) return;
+    const seq = ++milesSeqRef.current;
+    try {
+      const res = await fetch("/api/web-agent/quote/miles", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ from, to }),
+      });
+      const data = (await res.json().catch(() => null)) as
+        | { miles?: number; minutes?: number | null; error?: string }
+        | null;
+      if (seq !== milesSeqRef.current) return;
+      if (!res.ok || typeof data?.miles !== "number") {
+        setMilesLookup({ status: "error", message: data?.error ?? `Google Maps error (${res.status})` });
+        return;
+      }
+      const miles = String(data.miles);
+      setMilesLookup({ status: "ready", minutes: typeof data.minutes === "number" ? data.minutes : null });
+      setForm((prev) => ({ ...prev, miles }));
+      const next = { ...formRef.current, miles };
+      if (thenCalculate && "inputs" in buildInputs(next)) {
+        setCalc({ status: "loading" });
+        void runCalculation(next);
+      }
+    } catch {
+      if (seq === milesSeqRef.current) setMilesLookup({ status: "error", message: "Network error. Try again." });
+    }
+  }
+
   const autoStartedRef = useRef(false);
   useEffect(() => {
-    if (autoStartedRef.current || calc.status !== "loading") return;
+    if (autoStartedRef.current) return;
     autoStartedRef.current = true;
-    void runCalculation(form);
+    // Both only set state once their fetch answers, never synchronously here.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    if (calc.status === "loading") void runCalculation(form);
+    else if (milesLookup.status === "loading") void lookUpMiles(form, true);
     // Runs once for the email this card was opened for.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   function update(patch: Partial<Form>) {
     setForm((prev) => ({ ...prev, ...patch }));
+  }
+
+  function changePlace(patch: Pick<Partial<Form>, "pickupAddress" | "deliveryAddress">) {
+    update(patch);
+    // Miles fetched for the old places no longer apply; a lookup still running is dropped.
+    milesSeqRef.current += 1;
+    setMilesLookup({ status: "idle" });
   }
 
   function changeVehicle(vehicleClass: VehicleClass | "") {
@@ -293,17 +368,19 @@ export function QuoteRequest({
   const missing = "missing" in built ? built.missing : [];
   const boxTruck = form.vehicleClass === "box-truck";
   const notInEmail = [
+    !fields.pickupAddress && "pickup place",
+    !fields.deliveryAddress && "delivery place",
     !fields.vehicleClass && "vehicle",
-    !fields.miles && "route miles",
+    !fields.miles && !(fields.pickupAddress && fields.deliveryAddress) && "route miles",
     !fields.weight && "weight",
     !fields.pickupStart && "pickup time",
     !fields.deliveryEnd && "delivery time",
   ].filter((v): v is string => Boolean(v));
   const assumedTimes = !fields.pickupStart || !fields.deliveryEnd;
-  const directionsUrl =
-    fields.pickupAddress && fields.deliveryAddress
-      ? `https://www.google.com/maps/dir/?api=1&origin=${encodeURIComponent(fields.pickupAddress)}&destination=${encodeURIComponent(fields.deliveryAddress)}`
-      : null;
+  const placesSet = Boolean(form.pickupAddress.trim() && form.deliveryAddress.trim());
+  const directionsUrl = placesSet
+    ? `https://www.google.com/maps/dir/?api=1&origin=${encodeURIComponent(routeAddress(form.pickupAddress))}&destination=${encodeURIComponent(routeAddress(form.deliveryAddress))}`
+    : null;
 
   return (
     <section
@@ -319,28 +396,7 @@ export function QuoteRequest({
       </div>
       {detection.summary && <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">{detection.summary}</p>}
 
-      {(fields.pickupAddress || fields.deliveryAddress || fields.pieces) && (
-        <dl className="mt-3 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-sm">
-          {fields.pickupAddress && (
-            <>
-              <dt className="text-zinc-500 dark:text-zinc-400">From</dt>
-              <dd className="text-zinc-800 dark:text-zinc-200">{fields.pickupAddress}</dd>
-            </>
-          )}
-          {fields.deliveryAddress && (
-            <>
-              <dt className="text-zinc-500 dark:text-zinc-400">To</dt>
-              <dd className="text-zinc-800 dark:text-zinc-200">{fields.deliveryAddress}</dd>
-            </>
-          )}
-          {fields.pieces && (
-            <>
-              <dt className="text-zinc-500 dark:text-zinc-400">Pieces</dt>
-              <dd className="text-zinc-800 dark:text-zinc-200">{fields.pieces}</dd>
-            </>
-          )}
-        </dl>
-      )}
+      {fields.pieces && <p className="mt-2 text-sm text-zinc-600 dark:text-zinc-400">Pieces: {fields.pieces}</p>}
 
       {detection.unreadReason && (
         <p className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:border-amber-900/60 dark:bg-amber-950 dark:text-amber-300">
@@ -365,6 +421,27 @@ export function QuoteRequest({
         }}
         className="mt-4 flex flex-col gap-4"
       >
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Labeled label="Pickup from">
+            <input
+              type="text"
+              value={form.pickupAddress}
+              onChange={(e) => changePlace({ pickupAddress: e.target.value })}
+              placeholder="Business name or address"
+              className={inputClass}
+            />
+          </Labeled>
+          <Labeled label="Deliver to">
+            <input
+              type="text"
+              value={form.deliveryAddress}
+              onChange={(e) => changePlace({ deliveryAddress: e.target.value })}
+              placeholder="Business name or address"
+              className={inputClass}
+            />
+          </Labeled>
+        </div>
+
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
           <Labeled label="Vehicle">
             <select
@@ -390,6 +467,26 @@ export function QuoteRequest({
               onChange={(e) => update({ miles: e.target.value })}
               className={inputClass}
             />
+            <button
+              type="button"
+              onClick={() => {
+                setMilesLookup({ status: "loading" });
+                void lookUpMiles(form, false);
+              }}
+              disabled={!placesSet || milesLookup.status === "loading"}
+              title={placesSet ? "Driving miles between the two places, from Google Maps" : "Enter the pickup and delivery places first"}
+              className="self-start text-xs font-medium text-indigo-600 hover:underline disabled:cursor-not-allowed disabled:text-zinc-400 disabled:no-underline dark:text-indigo-400 dark:disabled:text-zinc-500"
+            >
+              {milesLookup.status === "loading" ? "Getting miles from Google Maps…" : "Get miles from Google Maps"}
+            </button>
+            {milesLookup.status === "ready" && (
+              <span className="text-xs text-emerald-700 dark:text-emerald-400">
+                From Google Maps{milesLookup.minutes !== null && ` · about ${milesLookup.minutes} min drive`}
+              </span>
+            )}
+            {milesLookup.status === "error" && (
+              <span className="text-xs text-red-600 dark:text-red-400">{milesLookup.message}</span>
+            )}
             {directionsUrl && (
               <a
                 href={directionsUrl}

@@ -4,6 +4,7 @@
 
 import { emailForPrompt, todayText, type InquiryEmail } from "./agent";
 import { chatCompletion, isOpenAIConfigured } from "./openai";
+import { fillGaps, readQuoteFieldsByRules } from "./quote-rules";
 import {
   QUOTE_EXTRAS,
   QUOTE_EXTRA_LABELS,
@@ -56,7 +57,7 @@ const DETECT_PROMPT = [
   `vehicleClass: one of ${VEHICLE_CLASSES.join(", ")}, only when the email names the vehicle (car or small package, cargo van, sprinter or cube van, box or straight truck).`,
   "miles: the route distance in miles, only when the email gives a distance.",
   "weight: total weight in pounds (convert kilograms). pieces: number of pieces, boxes or pallets.",
-  "pickupAddress and deliveryAddress: as written, as much of the address or place name as the email gives.",
+  "pickupAddress and deliveryAddress: where the shipment is picked up and where it is delivered, as written, with as much as the email gives (facility or business name, street, city, state, ZIP). Fill them whenever the email names the places, even if it gives only a business name or a city; they are used to look up the driving miles.",
   "pickupStart: when pickup should start. deliveryEnd: the delivery deadline. Both as local Atlanta time in the form YYYY-MM-DDTHH:mm, worked out from today's date given with the email. null when the email gives no time, including when it only says ASAP.",
   `trip: one of ${TRIPS.join(", ")}. roundtrip only when freight is carried in both directions; return for an empty or return-only leg; null when not stated.`,
   `extras: a list with any of ${QUOTE_EXTRAS.join(", ")} the email asks for, else [].`,
@@ -98,27 +99,33 @@ function readFields(value: unknown): QuoteRequestFields {
   };
 }
 
+const RULES_NOTE = "The details below were picked out of the email text by simple rules, so check them.";
+
 /** Why the OpenAI call failed, in words a CSR can act on. */
 function unreadReasonFor(err: unknown): string {
   const message = err instanceof Error ? err.message : "";
   if (/credit_balance_exhausted|insufficient_quota|billing/i.test(message)) {
-    return "The AI couldn't read this email because the OpenAI account is out of credit, so the details below weren't filled in.";
+    return `The AI couldn't read this email: the OpenAI account is out of credit. ${RULES_NOTE}`;
   }
   if (/HTTP 401|invalid_api_key/i.test(message)) {
-    return "The AI couldn't read this email because OpenAI rejected OPENAI_API_KEY, so the details below weren't filled in.";
+    return `The AI couldn't read this email: OpenAI rejected OPENAI_API_KEY. ${RULES_NOTE}`;
   }
-  return "The AI couldn't read this email (OpenAI didn't answer), so the details below weren't filled in.";
+  return `The AI couldn't read this email (OpenAI didn't answer). ${RULES_NOTE}`;
 }
 
 /** Whether the email asks for a price quote, and the shipment details it states. */
 export async function detectQuoteRequest(email: InquiryEmail): Promise<QuoteRequestDetection> {
   const haystack = `${email.subject}\n${email.body}`;
   if (!PRICE_WORDS.test(haystack)) return NOT_A_QUOTE;
-  const explicit = EXPLICIT_QUOTE_WORDS.test(haystack);
-  const byWordsOnly = (unreadReason: string): QuoteRequestDetection =>
-    explicit ? { isQuoteRequest: true, summary: "", fields: EMPTY_FIELDS, unreadReason } : NOT_A_QUOTE;
+  const rules = readQuoteFieldsByRules(email.subject, email.body);
+  // Without the AI: "quote"/"estimate" in so many words, or a price question
+  // ("how much…") that names where the shipment goes from and to.
+  const looksLikeQuote =
+    EXPLICIT_QUOTE_WORDS.test(haystack) || Boolean(rules.pickupAddress && rules.deliveryAddress);
+  const byRulesOnly = (unreadReason: string): QuoteRequestDetection =>
+    looksLikeQuote ? { isQuoteRequest: true, summary: "", fields: rules, unreadReason } : NOT_A_QUOTE;
   if (!isOpenAIConfigured()) {
-    return byWordsOnly("AI reading is off (OPENAI_API_KEY isn't set), so the details below weren't filled in.");
+    return byRulesOnly(`AI reading is off (OPENAI_API_KEY isn't set). ${RULES_NOTE}`);
   }
 
   const now = new Date().toLocaleTimeString("en-US", {
@@ -142,12 +149,16 @@ export async function detectQuoteRequest(email: InquiryEmail): Promise<QuoteRequ
     });
     const data = JSON.parse(res.choices[0]?.message.content ?? "") as Record<string, unknown>;
     if (data.isQuoteRequest !== true) return NOT_A_QUOTE;
-    return { isQuoteRequest: true, summary: text(data.summary) ?? "", fields: readFields(data.fields) };
+    return {
+      isQuoteRequest: true,
+      summary: text(data.summary) ?? "",
+      fields: fillGaps(readFields(data.fields), rules),
+    };
   } catch (err) {
-    // OpenAI is down, out of credit, or sent something unreadable: an email
-    // that plainly says "quote" still opens the card, saying why it is empty.
+    // OpenAI is down, out of credit, or sent something unreadable: the text
+    // rules still fill the card, which says why the AI didn't.
     console.error("Quote request detection failed:", err);
-    return byWordsOnly(unreadReasonFor(err));
+    return byRulesOnly(unreadReasonFor(err));
   }
 }
 
