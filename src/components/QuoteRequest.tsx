@@ -342,7 +342,13 @@ export function QuoteRequest({
         </dl>
       )}
 
-      {notInEmail.length > 0 && (
+      {detection.unreadReason && (
+        <p className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:border-amber-900/60 dark:bg-amber-950 dark:text-amber-300">
+          {detection.unreadReason}
+        </p>
+      )}
+
+      {!detection.unreadReason && notInEmail.length > 0 && (
         <p className="mt-3 text-xs text-zinc-500 dark:text-zinc-400">
           Not in the email: {notInEmail.join(", ")}.
           {assumedTimes && " Times are set to pickup now and delivery in two hours (Atlanta time); change them if needed."}

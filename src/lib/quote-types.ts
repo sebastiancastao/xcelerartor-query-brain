@@ -74,6 +74,8 @@ export type QuoteRequestDetection = {
   /** One line saying what the customer wants priced. */
   summary: string;
   fields: QuoteRequestFields;
+  /** Set when the AI could not read the email, so the fields are empty for that reason, not because the email lacks them. */
+  unreadReason?: string;
 };
 
 /** Everything Quote Engine needs to price a shipment, as the CSR confirmed it. */

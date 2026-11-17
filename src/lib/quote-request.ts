@@ -98,14 +98,28 @@ function readFields(value: unknown): QuoteRequestFields {
   };
 }
 
+/** Why the OpenAI call failed, in words a CSR can act on. */
+function unreadReasonFor(err: unknown): string {
+  const message = err instanceof Error ? err.message : "";
+  if (/credit_balance_exhausted|insufficient_quota|billing/i.test(message)) {
+    return "The AI couldn't read this email because the OpenAI account is out of credit, so the details below weren't filled in.";
+  }
+  if (/HTTP 401|invalid_api_key/i.test(message)) {
+    return "The AI couldn't read this email because OpenAI rejected OPENAI_API_KEY, so the details below weren't filled in.";
+  }
+  return "The AI couldn't read this email (OpenAI didn't answer), so the details below weren't filled in.";
+}
+
 /** Whether the email asks for a price quote, and the shipment details it states. */
 export async function detectQuoteRequest(email: InquiryEmail): Promise<QuoteRequestDetection> {
   const haystack = `${email.subject}\n${email.body}`;
   if (!PRICE_WORDS.test(haystack)) return NOT_A_QUOTE;
-  const byWordsOnly: QuoteRequestDetection = EXPLICIT_QUOTE_WORDS.test(haystack)
-    ? { isQuoteRequest: true, summary: "", fields: EMPTY_FIELDS }
-    : NOT_A_QUOTE;
-  if (!isOpenAIConfigured()) return byWordsOnly;
+  const explicit = EXPLICIT_QUOTE_WORDS.test(haystack);
+  const byWordsOnly = (unreadReason: string): QuoteRequestDetection =>
+    explicit ? { isQuoteRequest: true, summary: "", fields: EMPTY_FIELDS, unreadReason } : NOT_A_QUOTE;
+  if (!isOpenAIConfigured()) {
+    return byWordsOnly("AI reading is off (OPENAI_API_KEY isn't set), so the details below weren't filled in.");
+  }
 
   const now = new Date().toLocaleTimeString("en-US", {
     timeZone: "America/New_York",
@@ -129,10 +143,11 @@ export async function detectQuoteRequest(email: InquiryEmail): Promise<QuoteRequ
     const data = JSON.parse(res.choices[0]?.message.content ?? "") as Record<string, unknown>;
     if (data.isQuoteRequest !== true) return NOT_A_QUOTE;
     return { isQuoteRequest: true, summary: text(data.summary) ?? "", fields: readFields(data.fields) };
-  } catch {
+  } catch (err) {
     // OpenAI is down, out of credit, or sent something unreadable: an email
-    // that plainly says "quote" still opens the card.
-    return byWordsOnly;
+    // that plainly says "quote" still opens the card, saying why it is empty.
+    console.error("Quote request detection failed:", err);
+    return byWordsOnly(unreadReasonFor(err));
   }
 }
 
