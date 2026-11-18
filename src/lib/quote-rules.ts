@@ -177,13 +177,28 @@ function readMiles(text: string): number | null {
 // ── Vehicle, trip and extras ─────────────────────────────────────────────────
 
 function readVehicle(text: string): VehicleClass | null {
-  if (/\b(?:box\s*truck|straight\s*truck|\d{2}\s*(?:'|ft|foot|feet)\s*(?:box\s*)?truck|lift\s*gate|liftgate)\b/i.test(text)) {
+  // A lift gate is an extra, not a named vehicle; the sizing rules turn it into a box truck.
+  if (/\b(?:box\s*truck|straight\s*truck|\d{2}\s*(?:'|ft|foot|feet)\s*(?:box\s*)?truck)\b/i.test(text)) {
     return "box-truck";
   }
   if (/\b(?:sprinter|cube\s*(?:van|truck)|high\s*roof|extended\s*van)\b/i.test(text)) return "cube-sprinter";
   if (/\b(?:cargo\s*van|van|furgoneta|camioneta)\b/i.test(text)) return "cargo-van";
   if (/\b(?:car|sedan|small\s*package|passenger\s*vehicle|courier\s*car|carro)\b/i.test(text)) return "small-package";
   return null;
+}
+
+// Any word for a vehicle, so a vehicle counts as stated only when the email has one.
+const VEHICLE_WORD = /\b(?:cars?|sedan|suv|vans?|sprinters?|cube|trucks?|camioneta|furgoneta|cami[oó]n|carro|auto)\b/i;
+
+/** Whether the email talks about a vehicle at all (the AI sometimes names one the email doesn't). */
+export function mentionsVehicle(subject: string, body: string): boolean {
+  return VEHICLE_WORD.test(`${subject}\n${newestMessage(body)}`);
+}
+
+function readPallets(text: string): number | null {
+  const counted = /\b(\d{1,3})\s*(?:x\s*)?(?:standard\s+)?(?:pallets?|skids?|palets?|tarimas?)\b/i.exec(text);
+  if (counted && Number(counted[1]) > 0) return Number(counted[1]);
+  return /\b(?:a|one|single|un|una)\s+(?:pallet|skid|palet|tarima)\b/i.test(text) ? 1 : null;
 }
 
 function readTrip(text: string): Trip | null {
@@ -212,6 +227,7 @@ export function readQuoteFieldsByRules(subject: string, body: string): QuoteRequ
     miles: readMiles(text),
     weight: readWeight(text, pieces),
     pieces,
+    pallets: readPallets(text),
     pickupStart: null,
     deliveryEnd: null,
     trip: readTrip(text),
@@ -227,6 +243,7 @@ export function fillGaps(ai: QuoteRequestFields, rules: QuoteRequestFields): Quo
     miles: ai.miles ?? rules.miles,
     weight: ai.weight ?? rules.weight,
     pieces: ai.pieces ?? rules.pieces,
+    pallets: ai.pallets ?? rules.pallets,
     pickupAddress: ai.pickupAddress ?? rules.pickupAddress,
     deliveryAddress: ai.deliveryAddress ?? rules.deliveryAddress,
     pickupStart: ai.pickupStart ?? rules.pickupStart,

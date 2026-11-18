@@ -58,6 +58,8 @@ export type QuoteRequestFields = {
   /** Total weight in pounds. */
   weight: number | null;
   pieces: number | null;
+  /** Pallets or skids, when the email gives the count. */
+  pallets: number | null;
   pickupAddress: string | null;
   deliveryAddress: string | null;
   /** Atlanta wall-clock time, "YYYY-MM-DDTHH:mm". */
@@ -69,14 +71,91 @@ export type QuoteRequestFields = {
   dryIcePounds: number | null;
 };
 
+/**
+ * What the AI judged about the load where the email gives no figure. Only
+ * used where the email does not state the value, and always shown on the
+ * card so the CSR can check it. The vehicle itself is never the AI's pick:
+ * `pickVehicle` sizes it from these and the stated details.
+ */
+export type QuoteEstimates = {
+  /** Total pounds, estimated from the items described. */
+  weight: number | null;
+  weightReason: string | null;
+  /** An item too big for a van (furniture, large equipment), in a few words; null when there is none. */
+  truckItem: string | null;
+};
+
+export const NO_ESTIMATES: QuoteEstimates = { weight: null, weightReason: null, truckItem: null };
+
 export type QuoteRequestDetection = {
   isQuoteRequest: boolean;
   /** One line saying what the customer wants priced. */
   summary: string;
   fields: QuoteRequestFields;
+  estimates: QuoteEstimates;
   /** Set when the AI could not read the email, so the fields are empty for that reason, not because the email lacks them. */
   unreadReason?: string;
 };
+
+/**
+ * Cargo each vehicle carries, in pounds. The rate sheet fixes only the box
+ * truck (9,000 lb); the others are standard courier figures, used unless a
+ * CSR enters a different capacity for their vehicle.
+ */
+export const VEHICLE_CAPACITY_LB: Record<VehicleClass, number> = {
+  "small-package": 500,
+  "cargo-van": 3000,
+  "cube-sprinter": 3500,
+  "box-truck": 9000,
+};
+
+/** Standard pallets each vehicle takes. A car takes none; more than a box truck's needs a separate quote. */
+export const VEHICLE_PALLETS: Record<VehicleClass, number> = {
+  "small-package": 0,
+  "cargo-van": 2,
+  "cube-sprinter": 4,
+  "box-truck": 12,
+};
+
+export type LoadForSizing = {
+  weight: number | null;
+  pallets: number | null;
+  truckItem: string | null;
+  extras: QuoteExtra[];
+};
+
+/**
+ * The vehicle to price when the email names none: the smallest one (the
+ * cheapest on the rate sheet, which charges more per vehicle size) that holds
+ * the weight and the pallets, and a box truck for an item too big for a van or
+ * when a lift gate or pallet jack is asked for (box truck only on the sheet).
+ * `reason` names the rule that decided it.
+ */
+export function pickVehicle(load: LoadForSizing): { vehicleClass: VehicleClass; reason: string } {
+  const rank = (v: VehicleClass) => VEHICLE_CLASSES.indexOf(v);
+  let pick: { vehicleClass: VehicleClass; reason: string } =
+    load.weight === null
+      ? { vehicleClass: "small-package", reason: "smallest vehicle, until the weight is known" }
+      : {
+          vehicleClass: VEHICLE_CLASSES.find((v) => load.weight! <= VEHICLE_CAPACITY_LB[v]) ?? "box-truck",
+          reason: `smallest vehicle for ${load.weight.toLocaleString("en-US")} lb`,
+        };
+  const atLeast = (vehicleClass: VehicleClass, reason: string) => {
+    if (rank(vehicleClass) > rank(pick.vehicleClass)) pick = { vehicleClass, reason };
+  };
+  if (load.pallets) {
+    const pallets = load.pallets;
+    atLeast(
+      VEHICLE_CLASSES.find((v) => pallets <= VEHICLE_PALLETS[v]) ?? "box-truck",
+      `${pallets} pallet${pallets === 1 ? "" : "s"}`,
+    );
+  }
+  if (load.truckItem) atLeast("box-truck", load.truckItem);
+  if (load.extras.some((extra) => BOX_TRUCK_ONLY_EXTRAS.includes(extra))) {
+    atLeast("box-truck", "lift gate or pallet jack asked for, box truck only");
+  }
+  return pick;
+}
 
 /** Everything Quote Engine needs to price a shipment, as the CSR confirmed it. */
 export type QuoteInputs = {
@@ -153,6 +232,18 @@ export function easternWallClockToIso(local: string): string | null {
 export function toEasternWallClock(date: Date): string {
   const t = date.getTime();
   return new Date(t + easternOffsetMs(t)).toISOString().slice(0, 16);
+}
+
+/**
+ * The delivery deadline to price when the email gives none: the drive time
+ * plus an hour for loading and unloading after pickup, and never under two
+ * hours. Atlanta wall-clock in and out; `pickupStart` unchanged when malformed.
+ */
+export function assumedDeliveryEnd(pickupStart: string, driveMinutes: number | null): string {
+  const start = easternWallClockToIso(pickupStart);
+  if (!start) return pickupStart;
+  const minutes = Math.max(120, (driveMinutes ?? 0) + 60);
+  return toEasternWallClock(new Date(Date.parse(start) + minutes * 60000));
 }
 
 // Two-letter codes are matched in capitals only, so "in", "me" and "or" in a place name don't count.

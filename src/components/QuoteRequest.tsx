@@ -10,12 +10,16 @@ import {
   QUOTE_EXTRA_LABELS,
   TRIPS,
   TRIP_LABELS,
+  VEHICLE_CAPACITY_LB,
   VEHICLE_CLASSES,
   VEHICLE_LABELS,
+  assumedDeliveryEnd,
   formatCents,
+  pickVehicle,
   routeAddress,
   toEasternWallClock,
   type FuelBasis,
+  type LoadForSizing,
   type QuoteExtra,
   type QuoteInputs,
   type QuoteRequestDetection,
@@ -38,6 +42,17 @@ type Form = {
   trip: Trip;
   extras: QuoteExtra[];
   dryIcePounds: string;
+  // Which values were worked out rather than stated by the email or typed by
+  // the CSR; worked-out ones follow the inputs they depend on.
+  /** Picked by the sizing rules; re-picked when the weight changes. */
+  vehicleAuto: boolean;
+  /** The AI's estimate from the items the email describes. */
+  weightAuto: boolean;
+  pickupAuto: boolean;
+  /** Set from the pickup time and drive time; follows both. */
+  deliveryAuto: boolean;
+  /** Google Maps' drive time for the route, once looked up. */
+  driveMinutes: number | null;
 };
 
 type CalcState =
@@ -54,8 +69,9 @@ type MilesState =
 
 type InsertState = { status: "idle" } | { status: "inserting" } | { status: "inserted" } | { status: "error"; message: string };
 
-// The fuel surcharge and each vehicle's capacity are not on the rate sheet and
-// rarely change, so the last values a CSR used are kept in this browser.
+// The fuel surcharge is not on the rate sheet and rarely changes, so the last
+// value a CSR used is kept in this browser, as is a capacity they entered that
+// differs from the standard one for the vehicle.
 type SavedDefaults = { fuelPercent?: string; fuelBasis?: FuelBasis; capacity?: Partial<Record<VehicleClass, string>> };
 const DEFAULTS_KEY = "web-agent.quote-defaults";
 
@@ -72,8 +88,10 @@ function saveDefaults(form: Form): void {
   try {
     const saved = loadDefaults();
     const capacity = { ...saved.capacity };
-    if (form.vehicleClass && form.vehicleClass !== "box-truck" && form.capacity.trim()) {
-      capacity[form.vehicleClass] = form.capacity.trim();
+    if (form.vehicleClass && form.vehicleClass !== "box-truck") {
+      const value = form.capacity.trim();
+      if (value && Number(value) !== VEHICLE_CAPACITY_LB[form.vehicleClass]) capacity[form.vehicleClass] = value;
+      else delete capacity[form.vehicleClass];
     }
     const next: SavedDefaults = {
       fuelPercent: form.fuelPercent.trim(),
@@ -135,27 +153,49 @@ function buildInputs(form: Form): { inputs: QuoteInputs } | { missing: string[] 
   };
 }
 
+/** The vehicle's cargo capacity: the CSR's own figure saved in this browser, else the standard one. */
+function capacityFor(vehicleClass: VehicleClass, saved: SavedDefaults = loadDefaults()): string {
+  if (vehicleClass === "box-truck") return String(VEHICLE_CAPACITY_LB["box-truck"]);
+  return saved.capacity?.[vehicleClass] || String(VEHICLE_CAPACITY_LB[vehicleClass]);
+}
+
 function initialForm(detection: QuoteRequestDetection): Form {
   const f = detection.fields;
+  const estimates = detection.estimates;
   const saved = loadDefaults();
-  const now = new Date();
+  const weight = f.weight ?? estimates.weight;
+  const vehicleClass =
+    f.vehicleClass ??
+    pickVehicle({ weight, pallets: f.pallets, truckItem: estimates.truckItem, extras: f.extras }).vehicleClass;
+  // With no time in the email the quote is priced as picked up now, and
+  // delivered after the drive plus an hour; the card says so.
+  const pickupStart = f.pickupStart ?? toEasternWallClock(new Date());
   return {
     pickupAddress: f.pickupAddress ?? "",
     deliveryAddress: f.deliveryAddress ?? "",
-    vehicleClass: f.vehicleClass ?? "",
+    vehicleClass,
     miles: f.miles?.toString() ?? "",
-    weight: f.weight?.toString() ?? "",
-    capacity: (f.vehicleClass && saved.capacity?.[f.vehicleClass]) || "",
-    // With no time in the email the quote is priced as picked up now and
-    // delivered within two hours; the card says so, so the CSR can change it.
-    pickupStart: f.pickupStart ?? toEasternWallClock(now),
-    deliveryEnd: f.deliveryEnd ?? toEasternWallClock(new Date(now.getTime() + 2 * 60 * 60 * 1000)),
+    weight: weight?.toString() ?? "",
+    capacity: capacityFor(vehicleClass, saved),
+    pickupStart,
+    deliveryEnd: f.deliveryEnd ?? assumedDeliveryEnd(pickupStart, null),
     fuelPercent: saved.fuelPercent ?? "",
     fuelBasis: saved.fuelBasis ?? "",
     trip: f.trip ?? "one-way",
     extras: f.extras,
     dryIcePounds: f.dryIcePounds?.toString() ?? "",
+    vehicleAuto: !f.vehicleClass,
+    weightAuto: f.weight === null && estimates.weight !== null,
+    pickupAuto: !f.pickupStart,
+    deliveryAuto: !f.deliveryEnd,
+    driveMinutes: null,
   };
+}
+
+function durationText(minutes: number): string {
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  return h && m ? `${h} h ${m} min` : h ? `${h} h` : `${m} min`;
 }
 
 const inputClass =
@@ -173,10 +213,12 @@ function Labeled({ label, hint, children }: { label: string; hint?: string; chil
 
 /**
  * Shown when the email open in Missive asks for a price quote. The details
- * the email states are filled in, the route miles come from Google Maps for
- * the pickup and delivery places, the CSR adds the rest (the fuel surcharge is
- * never guessed), Quote Engine's rate sheet prices it, and
- * the reply with that price is drafted. No quote is saved anywhere and nothing is
+ * the email states are filled in; the route miles and drive time come from
+ * Google Maps; the vehicle, its capacity, the weight and the times the email
+ * leaves out are worked out by the sizing rules and the AI's estimate, and
+ * listed so the CSR can check them; only the fuel surcharge is the CSR's
+ * (remembered in this browser). Quote Engine's rate sheet prices it and the
+ * reply with that price is drafted. No quote is saved anywhere and nothing is
  * sent: the CSR puts the reply into Missive and sends it there.
  */
 export function QuoteRequest({
@@ -193,18 +235,14 @@ export function QuoteRequest({
   cardClass: string;
 }) {
   const fields = detection.fields;
+  const estimates = detection.estimates;
   const [form, setForm] = useState<Form>(() => initialForm(detection));
-  // Priced straight away when the email (plus this browser's saved fuel
-  // surcharge and capacity) already gives everything; otherwise the CSR
-  // fills the gaps and presses Calculate.
-  const [calc, setCalc] = useState<CalcState>(() => {
-    const emailGaveAll = Boolean(
-      fields.vehicleClass && fields.miles && fields.weight && fields.pickupStart && fields.deliveryEnd,
-    );
-    return emailGaveAll && "inputs" in buildInputs(initialForm(detection))
-      ? { status: "loading" }
-      : { status: "idle" };
-  });
+  // Priced straight away when everything is filled in (the miles may still be
+  // on their way from Google Maps, which prices it once they arrive);
+  // otherwise the CSR fills the gaps and presses Calculate.
+  const [calc, setCalc] = useState<CalcState>(() =>
+    "inputs" in buildInputs(form) ? { status: "loading" } : { status: "idle" },
+  );
   const [copied, setCopied] = useState(false);
   const [insert, setInsert] = useState<InsertState>({ status: "idle" });
   // Miles are looked up straight away when the email names both places but no distance.
@@ -279,9 +317,16 @@ export function QuoteRequest({
         return;
       }
       const miles = String(data.miles);
-      setMilesLookup({ status: "ready", minutes: typeof data.minutes === "number" ? data.minutes : null });
-      setForm((prev) => ({ ...prev, miles }));
-      const next = { ...formRef.current, miles };
+      const minutes = typeof data.minutes === "number" ? data.minutes : null;
+      setMilesLookup({ status: "ready", minutes });
+      const withRoute = (prev: Form): Form => ({
+        ...prev,
+        miles,
+        driveMinutes: minutes,
+        deliveryEnd: prev.deliveryAuto ? assumedDeliveryEnd(prev.pickupStart, minutes) : prev.deliveryEnd,
+      });
+      setForm(withRoute);
+      const next = withRoute(formRef.current);
       if (thenCalculate && "inputs" in buildInputs(next)) {
         setCalc({ status: "loading" });
         void runCalculation(next);
@@ -314,9 +359,36 @@ export function QuoteRequest({
     setMilesLookup({ status: "idle" });
   }
 
+  function sizingLoad(weight: number | null, extras: QuoteExtra[]): LoadForSizing {
+    return { weight, pallets: fields.pallets, truckItem: estimates.truckItem, extras };
+  }
+
   function changeVehicle(vehicleClass: VehicleClass | "") {
-    const savedCapacity = vehicleClass ? loadDefaults().capacity?.[vehicleClass] : undefined;
-    update({ vehicleClass, capacity: savedCapacity ?? "" });
+    update({ vehicleClass, vehicleAuto: false, capacity: vehicleClass ? capacityFor(vehicleClass) : "" });
+  }
+
+  function changeWeight(weight: string) {
+    setForm((prev) => {
+      const next: Form = { ...prev, weight, weightAuto: false };
+      // A vehicle the sizing rules picked is re-sized for the new weight.
+      if (prev.vehicleAuto) {
+        const { vehicleClass } = pickVehicle(sizingLoad(num(weight), prev.extras));
+        if (vehicleClass !== prev.vehicleClass) {
+          next.vehicleClass = vehicleClass;
+          next.capacity = capacityFor(vehicleClass);
+        }
+      }
+      return next;
+    });
+  }
+
+  function changePickupStart(pickupStart: string) {
+    setForm((prev) => ({
+      ...prev,
+      pickupStart,
+      pickupAuto: false,
+      deliveryEnd: prev.deliveryAuto ? assumedDeliveryEnd(pickupStart, prev.driveMinutes) : prev.deliveryEnd,
+    }));
   }
 
   function toggleExtra(extra: QuoteExtra) {
@@ -370,13 +442,29 @@ export function QuoteRequest({
   const notInEmail = [
     !fields.pickupAddress && "pickup place",
     !fields.deliveryAddress && "delivery place",
-    !fields.vehicleClass && "vehicle",
     !fields.miles && !(fields.pickupAddress && fields.deliveryAddress) && "route miles",
-    !fields.weight && "weight",
-    !fields.pickupStart && "pickup time",
-    !fields.deliveryEnd && "delivery time",
+    !fields.weight && estimates.weight === null && "weight",
   ].filter((v): v is string => Boolean(v));
-  const assumedTimes = !fields.pickupStart || !fields.deliveryEnd;
+
+  // What was worked out rather than read from the email, while it still stands.
+  const weightNow = num(form.weight);
+  const capacityNow = num(form.capacity);
+  const overCapacity = !boxTruck && weightNow !== null && capacityNow !== null && weightNow > capacityNow;
+  const sized = pickVehicle(sizingLoad(weightNow, form.extras));
+  const vehicleWhy = sized.vehicleClass === form.vehicleClass ? sized.reason : "by the sizing rules";
+  const deliveryMinutes = Math.max(120, (form.driveMinutes ?? 0) + 60);
+  const workedOut = [
+    form.vehicleAuto && form.vehicleClass && `Vehicle: ${VEHICLE_LABELS[form.vehicleClass]} (${vehicleWhy})`,
+    form.weightAuto &&
+      `Weight: about ${Number(form.weight).toLocaleString("en-US")} lb${estimates.weightReason ? ` (${estimates.weightReason})` : ""}`,
+    form.vehicleClass &&
+      !boxTruck &&
+      form.capacity === String(VEHICLE_CAPACITY_LB[form.vehicleClass]) &&
+      `Capacity: ${VEHICLE_CAPACITY_LB[form.vehicleClass].toLocaleString("en-US")} lb, standard for a ${VEHICLE_LABELS[form.vehicleClass].toLowerCase()}`,
+    form.pickupAuto && "Pickup: now (no pickup time in the email)",
+    form.deliveryAuto &&
+      `Delivery by: ${durationText(deliveryMinutes)} after pickup (${form.driveMinutes !== null ? `the ${durationText(form.driveMinutes)} drive plus an hour` : "at least two hours"})`,
+  ].filter((v): v is string => Boolean(v));
   const placesSet = Boolean(form.pickupAddress.trim() && form.deliveryAddress.trim());
   const directionsUrl = placesSet
     ? `https://www.google.com/maps/dir/?api=1&origin=${encodeURIComponent(routeAddress(form.pickupAddress))}&destination=${encodeURIComponent(routeAddress(form.deliveryAddress))}`
@@ -396,7 +484,13 @@ export function QuoteRequest({
       </div>
       {detection.summary && <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">{detection.summary}</p>}
 
-      {fields.pieces && <p className="mt-2 text-sm text-zinc-600 dark:text-zinc-400">Pieces: {fields.pieces}</p>}
+      {(fields.pieces || fields.pallets) && (
+        <p className="mt-2 text-sm text-zinc-600 dark:text-zinc-400">
+          {[fields.pieces && `Pieces: ${fields.pieces}`, fields.pallets && `Pallets: ${fields.pallets}`]
+            .filter(Boolean)
+            .join(" · ")}
+        </p>
+      )}
 
       {detection.unreadReason && (
         <p className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:border-amber-900/60 dark:bg-amber-950 dark:text-amber-300">
@@ -405,10 +499,18 @@ export function QuoteRequest({
       )}
 
       {!detection.unreadReason && notInEmail.length > 0 && (
-        <p className="mt-3 text-xs text-zinc-500 dark:text-zinc-400">
-          Not in the email: {notInEmail.join(", ")}.
-          {assumedTimes && " Times are set to pickup now and delivery in two hours (Atlanta time); change them if needed."}
-        </p>
+        <p className="mt-3 text-xs text-zinc-500 dark:text-zinc-400">Not in the email: {notInEmail.join(", ")}.</p>
+      )}
+
+      {workedOut.length > 0 && (
+        <div className="mt-3 rounded-xl border border-indigo-100 bg-indigo-50/60 px-3 py-2 text-xs text-indigo-900 dark:border-indigo-900/60 dark:bg-indigo-950/40 dark:text-indigo-200">
+          <p className="font-medium">Worked out for you (check before you send it):</p>
+          <ul className="mt-1 list-disc space-y-0.5 pl-4">
+            {workedOut.map((line) => (
+              <li key={line}>{line}</li>
+            ))}
+          </ul>
+        </div>
       )}
 
       <form
@@ -505,11 +607,20 @@ export function QuoteRequest({
               min="0"
               step="0.01"
               value={form.weight}
-              onChange={(e) => update({ weight: e.target.value })}
+              onChange={(e) => changeWeight(e.target.value)}
               className={inputClass}
             />
           </Labeled>
-          <Labeled label="Vehicle capacity (lb)" hint={boxTruck ? "Box truck: fixed at 9,000 lb" : undefined}>
+          <Labeled
+            label="Vehicle capacity (lb)"
+            hint={
+              boxTruck
+                ? "Box truck: fixed at 9,000 lb"
+                : overCapacity
+                  ? "The weight is over this capacity: pick a bigger vehicle"
+                  : undefined
+            }
+          >
             <input
               type="number"
               inputMode="decimal"
@@ -518,6 +629,7 @@ export function QuoteRequest({
               disabled={boxTruck}
               value={boxTruck ? "9000" : form.capacity}
               onChange={(e) => update({ capacity: e.target.value })}
+              aria-invalid={overCapacity}
               className={`${inputClass} disabled:opacity-60`}
             />
           </Labeled>
@@ -525,7 +637,7 @@ export function QuoteRequest({
             <input
               type="datetime-local"
               value={form.pickupStart}
-              onChange={(e) => update({ pickupStart: e.target.value })}
+              onChange={(e) => changePickupStart(e.target.value)}
               className={inputClass}
             />
           </Labeled>
@@ -533,7 +645,7 @@ export function QuoteRequest({
             <input
               type="datetime-local"
               value={form.deliveryEnd}
-              onChange={(e) => update({ deliveryEnd: e.target.value })}
+              onChange={(e) => update({ deliveryEnd: e.target.value, deliveryAuto: false })}
               className={inputClass}
             />
           </Labeled>

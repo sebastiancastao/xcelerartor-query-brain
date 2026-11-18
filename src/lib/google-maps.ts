@@ -65,7 +65,10 @@ export async function routeMiles(from: string, to: string): Promise<RouteMiles> 
     const detail = body?.error?.message ?? `HTTP ${response.status}`;
     if (/API key not valid/i.test(detail)) throw new RouteMilesError(502, "Google Maps rejected GOOGLE_MAPS_API_KEY.");
     if (body?.error?.status === "PERMISSION_DENIED") {
-      throw new RouteMilesError(502, "Google Maps refused the request: turn on the Routes API for this key's Google Cloud project.");
+      throw new RouteMilesError(
+        502,
+        "Google Maps refused the request: the key's Google Cloud project needs billing on and the Routes API turned on, and the key must not be limited to websites (HTTP referrers).",
+      );
     }
     if (response.status === 400) {
       throw new RouteMilesError(422, "Google Maps couldn't find one of these places. Make the address more specific.");
