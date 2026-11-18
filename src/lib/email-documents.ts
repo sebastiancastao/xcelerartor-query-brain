@@ -19,7 +19,9 @@ import {
   type MissiveAttachment,
   type MissiveThreadMessage,
 } from "./missive";
+import { newestBodyText } from "./missive-text";
 import { chatCompletion, isOpenAIConfigured, type UserContentPart } from "./openai";
+import type { ThreadMessage } from "./quote-types";
 
 export type DocumentPreview = "pdf" | "image" | "text";
 
@@ -295,7 +297,13 @@ type DocumentSource =
   | { kind: "attachment"; attachmentId: string; name: string; fileKind: FileKind; extension: string | null }
   | { kind: "link"; fetchUrl: string | null; name: string; fileKind: FileKind };
 
-type Listing = { documents: EmailDocument[]; sources: Map<string, DocumentSource>; expiresAt: number };
+type Listing = {
+  documents: EmailDocument[];
+  sources: Map<string, DocumentSource>;
+  /** The messages the documents came from, newest first, with bodies. */
+  messages: MissiveThreadMessage[];
+  expiresAt: number;
+};
 
 const LISTING_TTL_MS = 5 * 60_000;
 const listings = new Map<string, Listing>();
@@ -385,7 +393,7 @@ function buildListing(conversationId: string, messages: MissiveThreadMessage[]):
       });
     }
   }
-  return { documents, sources, expiresAt: Date.now() + LISTING_TTL_MS };
+  return { documents, sources, messages, expiresAt: Date.now() + LISTING_TTL_MS };
 }
 
 async function getListing(conversationId: string): Promise<Listing> {
@@ -554,17 +562,30 @@ export type FetchedDocument = {
   bytes: Buffer;
 };
 
-async function fetchSource(conversationId: string, docId: string): Promise<{ source: DocumentSource; bytes: Buffer; kind: FileKind }> {
+/** Every attachment's current download link in the conversation, by attachment id. */
+async function freshAttachmentUrls(conversationId: string): Promise<Map<string, string | null>> {
+  const messages = await fetchConversationMessages(conversationId);
+  return new Map(messages.flatMap((m) => m.attachments).map((a) => [a.id, a.url]));
+}
+
+/**
+ * A document's bytes and real kind. `attachmentUrls` (from freshAttachmentUrls)
+ * saves asking Missive again when several attachments are fetched at once.
+ */
+async function fetchSource(
+  conversationId: string,
+  docId: string,
+  attachmentUrls?: Map<string, string | null>,
+): Promise<{ source: DocumentSource; bytes: Buffer; kind: FileKind }> {
   const listing = await getListing(conversationId);
   const source = listing.sources.get(docId);
   if (!source) throw new EmailDocumentError("That document isn't in this email.", 404);
 
   if (source.kind === "attachment") {
     // Download links expire after ~10 minutes, so ask Missive for a fresh one.
-    const messages = await fetchConversationMessages(conversationId);
-    const attachment = messages.flatMap((m) => m.attachments).find((a) => a.id === source.attachmentId);
-    if (!attachment?.url) throw new EmailDocumentError("Missive no longer has that attachment.", 404);
-    const res = await fetch(attachment.url, { signal: AbortSignal.timeout(30_000) }).catch(() => null);
+    const url = (attachmentUrls ?? (await freshAttachmentUrls(conversationId))).get(source.attachmentId);
+    if (!url) throw new EmailDocumentError("Missive no longer has that attachment.", 404);
+    const res = await fetch(url, { signal: AbortSignal.timeout(30_000) }).catch(() => null);
     if (!res?.ok) throw new EmailDocumentError("Couldn't download the attachment from Missive.", 502);
     const bytes = await readCapped(res);
     return { source, bytes, kind: sniffKind(bytes, res.headers.get("content-type") ?? "", source.fileKind) };
@@ -789,9 +810,43 @@ function parseSummary(raw: string | null): DocumentSummary {
   };
 }
 
-function textPart(name: string, text: string): UserContentPart[] {
-  const body = text.trim().slice(0, MAX_TEXT_CHARS);
+function textPart(name: string, text: string, maxChars: number): UserContentPart[] {
+  const body = text.trim().slice(0, maxChars);
   return [{ type: "text", text: `File name: ${name}\n\n<document>\n${body}\n</document>` }];
+}
+
+/**
+ * A fetched document as model input: PDFs and images as files the model
+ * reads itself, Office and text files as their text. "empty" when the file
+ * has no text; null for kinds the model can't take.
+ */
+function documentContent(name: string, bytes: Buffer, kind: FileKind, maxTextChars: number): UserContentPart[] | "empty" | null {
+  if (kind === "pdf") {
+    return [
+      { type: "text", text: `File name: ${name}` },
+      { type: "file", file: { filename: name.endsWith(".pdf") ? name : `${name}.pdf`, file_data: `data:application/pdf;base64,${bytes.toString("base64")}` } },
+    ];
+  }
+  if (kind === "image") {
+    return [
+      { type: "text", text: `File name: ${name}` },
+      { type: "image_url", image_url: { url: `data:${imageMime(bytes)};base64,${bytes.toString("base64")}`, detail: "high" } },
+    ];
+  }
+  const text =
+    kind === "docx"
+      ? docxText(bytes)
+      : kind === "xlsx"
+        ? xlsxText(bytes)
+        : kind === "pptx"
+          ? pptxText(bytes)
+          : kind === "html"
+            ? stripTags(bytes.toString("utf8"))
+            : kind === "text"
+              ? bytes.toString("utf8")
+              : null;
+  if (text === null) return null;
+  return text.trim() ? textPart(name, text, maxTextChars) : "empty";
 }
 
 /** Summarizes one document from the conversation; summaries are kept for a day per file or link. */
@@ -805,35 +860,10 @@ export async function summarizeEmailDocument(conversationId: string, docId: stri
   if (cached && cached.expiresAt > Date.now()) return cached.summary;
 
   const { source, bytes, kind } = await fetchSource(conversationId, docId);
-  let content: UserContentPart[];
-  if (kind === "pdf") {
-    content = [
-      { type: "text", text: `File name: ${source.name}` },
-      { type: "file", file: { filename: source.name.endsWith(".pdf") ? source.name : `${source.name}.pdf`, file_data: `data:application/pdf;base64,${bytes.toString("base64")}` } },
-    ];
-  } else if (kind === "image") {
-    content = [
-      { type: "text", text: `File name: ${source.name}` },
-      { type: "image_url", image_url: { url: `data:${imageMime(bytes)};base64,${bytes.toString("base64")}`, detail: "high" } },
-    ];
-  } else {
-    const text =
-      kind === "docx"
-        ? docxText(bytes)
-        : kind === "xlsx"
-          ? xlsxText(bytes)
-          : kind === "pptx"
-            ? pptxText(bytes)
-            : kind === "html"
-              ? stripTags(bytes.toString("utf8"))
-              : kind === "text"
-                ? bytes.toString("utf8")
-                : null;
-    if (text === null) throw new EmailDocumentError("Summaries aren't available for this kind of file. Open it to view it.", 415);
-    if (!text.trim()) {
-      return { docType: TYPE_LABELS[kind], summary: "The file has no readable text.", keyFacts: [], references: [] };
-    }
-    content = textPart(source.name, text);
+  const content = documentContent(source.name, bytes, kind, MAX_TEXT_CHARS);
+  if (content === null) throw new EmailDocumentError("Summaries aren't available for this kind of file. Open it to view it.", 415);
+  if (content === "empty") {
+    return { docType: TYPE_LABELS[kind], summary: "The file has no readable text.", keyFacts: [], references: [] };
   }
 
   let response;
@@ -861,4 +891,118 @@ export async function summarizeEmailDocument(conversationId: string, docId: stri
   }
   remember(summaries, cacheKey, { summary, expiresAt: Date.now() + SUMMARY_TTL_MS }, 500);
   return summary;
+}
+
+// --- Reading a thread for a quote -------------------------------------------------
+
+/** Most documents read with a quote request, newest first, and the limits on what goes to the model. */
+const QUOTE_MAX_DOCUMENTS = 6;
+const QUOTE_MAX_FILE_BYTES = 10 * 1024 * 1024;
+const QUOTE_MAX_TOTAL_BYTES = 20 * 1024 * 1024;
+const QUOTE_TEXT_CHARS = 15_000;
+const QUOTE_THREAD_CHARS = 2500;
+
+export type QuoteDocument = { name: string; content: UserContentPart[] };
+export type SkippedDocument = { name: string; why: string };
+
+/** The documents a quote reads (the newest readable ones) and the rest with why they aren't read. */
+function planQuoteDocuments(listing: Listing): { toRead: EmailDocument[]; skipped: SkippedDocument[] } {
+  const toRead: EmailDocument[] = [];
+  const skipped: SkippedDocument[] = [];
+  for (const doc of listing.documents) {
+    if (!doc.summarizable) {
+      skipped.push({
+        name: doc.name,
+        why:
+          doc.kind === "link"
+            ? "opens through a sign-in or tracking page"
+            : doc.typeLabel === TYPE_LABELS.other
+              ? "this kind of file can't be read"
+              : `${doc.typeLabel} files can't be read`,
+      });
+    } else if (toRead.length >= QUOTE_MAX_DOCUMENTS) {
+      skipped.push({ name: doc.name, why: `only the newest ${QUOTE_MAX_DOCUMENTS} documents are read` });
+    } else {
+      toRead.push(doc);
+    }
+  }
+  return { toRead, skipped };
+}
+
+/**
+ * The earlier messages of the conversation (its newest one, the email open in
+ * Missive, left out), newest first, as the server's Missive token sees them.
+ * For when Missive's in-page API gives no thread.
+ */
+export async function conversationThreadForQuote(conversationId: string): Promise<ThreadMessage[]> {
+  const listing = await getListing(conversationId);
+  return listing.messages
+    .slice(1)
+    .map((m) => ({ from: m.from, sentAt: m.receivedAt, text: newestBodyText(m.body, QUOTE_THREAD_CHARS) }))
+    .filter((m) => m.text);
+}
+
+/** The names of the documents a quote would read, without fetching them, and the ones it wouldn't. */
+export async function quoteDocumentNames(conversationId: string): Promise<{ toRead: string[]; skipped: SkippedDocument[] }> {
+  const { toRead, skipped } = planQuoteDocuments(await getListing(conversationId));
+  return { toRead: toRead.map((d) => d.name), skipped };
+}
+
+async function mapLimit<T, R>(items: T[], limit: number, work: (item: T) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await work(items[i]);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+/**
+ * The conversation's documents as model input for reading a quote request:
+ * the newest readable ones (PDFs and images as files, Office and text files
+ * as text), within a size budget, plus the ones not read and why.
+ */
+export async function readDocumentsForQuote(
+  conversationId: string,
+): Promise<{ read: QuoteDocument[]; skipped: SkippedDocument[] }> {
+  const listing = await getListing(conversationId);
+  const { toRead, skipped } = planQuoteDocuments(listing);
+  if (toRead.length === 0) return { read: [], skipped };
+
+  // One message list gives every attachment's current download link.
+  const urls = toRead.some((d) => d.kind === "attachment") ? await freshAttachmentUrls(conversationId) : undefined;
+  type Fetched = { skip: string } | { content: UserContentPart[]; binaryBytes: number };
+  const fetched = await mapLimit(toRead, 3, async (doc): Promise<Fetched> => {
+    try {
+      const { bytes, kind } = await fetchSource(conversationId, doc.id, urls);
+      if ((kind === "pdf" || kind === "image") && bytes.length > QUOTE_MAX_FILE_BYTES) {
+        return { skip: "too large to read with the email" };
+      }
+      const content = documentContent(doc.name, bytes, kind, QUOTE_TEXT_CHARS);
+      if (content === null) return { skip: "this kind of file can't be read" };
+      if (content === "empty") return { skip: "has no readable text" };
+      return { content, binaryBytes: kind === "pdf" || kind === "image" ? bytes.length : 0 };
+    } catch (error) {
+      return { skip: error instanceof EmailDocumentError ? error.message.replace(/\.? ?Open it.*$/i, "") : "couldn't be read" };
+    }
+  });
+
+  const read: QuoteDocument[] = [];
+  let total = 0;
+  fetched.forEach((result, i) => {
+    const name = toRead[i].name;
+    if ("skip" in result) {
+      skipped.push({ name, why: result.skip });
+    } else if (total + result.binaryBytes > QUOTE_MAX_TOTAL_BYTES) {
+      skipped.push({ name, why: "the email's files are too large to read together" });
+    } else {
+      total += result.binaryBytes;
+      read.push({ name, content: result.content });
+    }
+  });
+  return { read, skipped };
 }

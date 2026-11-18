@@ -4,7 +4,8 @@ import Script from "next/script";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { MouseEvent } from "react";
 import { extractUuids } from "@/lib/missive-id";
-import { messageBodyText } from "@/lib/missive-text";
+import { messageBodyText, newestBodyText } from "@/lib/missive-text";
+import type { ThreadMessage } from "@/lib/quote-types";
 
 export type MissiveSenseStatus =
   | "loading-script"
@@ -18,13 +19,15 @@ export type MissiveSenseStatus =
 
 type MissiveIframeAddress = { name?: string | null; address?: string | null };
 
-/** The latest message as Missive's in-page API returns it with a conversation. */
+/** A message as Missive's in-page API returns it with a conversation or from fetchMessages. */
 type MissiveIframeMessage = {
   id?: string;
   subject?: string | null;
   preview?: string | null;
   body?: string | null;
   from_field?: MissiveIframeAddress | null;
+  /** Unix seconds. */
+  delivered_at?: number | null;
 };
 
 type MissiveIframeConversation = {
@@ -32,6 +35,8 @@ type MissiveIframeConversation = {
   subject?: string | null;
   authors?: MissiveIframeAddress[] | null;
   latest_message?: MissiveIframeMessage | null;
+  /** Documented by Missive, but it doesn't say when it is filled in. */
+  messages?: MissiveIframeMessage[] | null;
   messages_count?: number;
 };
 
@@ -42,6 +47,7 @@ type MissiveIframeApi = {
     options?: { retroactive?: boolean }
   ) => void;
   fetchConversations: (ids: string[]) => Promise<MissiveIframeConversation[]>;
+  fetchMessages?: (ids: string[]) => Promise<MissiveIframeMessage[]>;
   /** Asks Missive to open a link in the user's browser. */
   openURL: (url: string) => void;
   /** Opens a reply draft to the latest message of the open conversation; sends it only when deliver is true. */
@@ -164,6 +170,59 @@ async function fetchIframeConversation(conversationId: string): Promise<MissiveI
   } catch {
     return null;
   }
+}
+
+/** Most earlier messages of a thread read for a quote, and most text kept from each. */
+const THREAD_MESSAGES_MAX = 10;
+const THREAD_MESSAGE_CHARS = 2500;
+
+/**
+ * The earlier messages of the open email's thread (the latest one left out,
+ * since the page already has it), newest first, through Missive's in-page API,
+ * which reads whatever the signed-in CSR can see. Bodies Missive leaves out of
+ * the conversation are fetched by message id. Null when Missive gives no
+ * message list, so the server can try its own token instead.
+ */
+export async function readMissiveThread(conversationId: string): Promise<ThreadMessage[] | null> {
+  const conversation = await fetchIframeConversation(conversationId);
+  const listed = conversation?.messages;
+  if (!conversation || !Array.isArray(listed)) return null;
+  // An empty list for a conversation with several messages means Missive didn't fill it in.
+  if (listed.length === 0 && (conversation.messages_count ?? 0) > 1) return null;
+  const latestId = conversation.latest_message?.id;
+  let messages = listed.filter((m) => m && m.id !== latestId);
+  if (!latestId) {
+    // Without the latest message's id, drop the newest one by delivery time.
+    const newest = Math.max(...messages.map((m) => m.delivered_at ?? 0));
+    messages = messages.filter((m) => (m.delivered_at ?? 0) !== newest);
+  }
+  messages = messages
+    .sort((a, b) => (b.delivered_at ?? 0) - (a.delivered_at ?? 0))
+    .slice(0, THREAD_MESSAGES_MAX);
+
+  const missive = window.Missive;
+  const withoutBody = messages.filter((m) => m.id && !m.body).map((m) => m.id as string);
+  if (withoutBody.length > 0 && typeof missive?.fetchMessages === "function") {
+    try {
+      const fetched = await Promise.race([missive.fetchMessages(withoutBody), wait(IFRAME_FETCH_TIMEOUT_MS).then(() => null)]);
+      const bodies = new Map((fetched ?? []).map((m) => [m.id, m.body]));
+      messages = messages.map((m) => (m.body || !m.id ? m : { ...m, body: bodies.get(m.id) ?? null }));
+    } catch {
+      // The previews below still say something.
+    }
+  }
+
+  return messages
+    .map((m) => {
+      const address = m.from_field?.address ?? "";
+      const name = m.from_field?.name ?? "";
+      return {
+        from: name && address ? `${name} <${address}>` : name || address,
+        sentAt: m.delivered_at ? new Date(m.delivered_at * 1000).toISOString() : null,
+        text: newestBodyText(m.body, THREAD_MESSAGE_CHARS) || (m.preview ?? "").trim(),
+      };
+    })
+    .filter((m) => m.text);
 }
 
 /**

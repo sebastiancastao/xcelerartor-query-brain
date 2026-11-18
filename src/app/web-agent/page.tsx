@@ -12,13 +12,14 @@ import {
   insertIntoMissiveReply,
   isMissiveHost,
   openLinkInNewTab,
+  readMissiveThread,
   type MissiveSenseStatus,
 } from "@/components/MissiveEmailSense";
 import { EmailDocuments, type EmailDocumentList } from "@/components/EmailDocuments";
 import { UploadDocumentsToOrder } from "@/components/UploadDocumentsToOrder";
 import { useOrderAttachments } from "@/components/useOrderAttachments";
-import { QuoteRequest } from "@/components/QuoteRequest";
-import type { QuoteRequestDetection } from "@/lib/quote-types";
+import { QuoteReadingDocuments, QuoteRequest } from "@/components/QuoteRequest";
+import type { QuoteRequestDetection, ThreadMessage } from "@/lib/quote-types";
 
 type LookupState =
   | { status: "idle" }
@@ -287,6 +288,8 @@ export default function WebAgentHome() {
     id: number;
     email: InquiryEmail;
     detection: QuoteRequestDetection;
+    /** Set while the email's documents are being read; the card waits for them. */
+    readingDocuments?: string[];
   } | null>(null);
   // Numbers each quote check; only the newest email's answer may show.
   const quoteSeqRef = useRef(0);
@@ -435,19 +438,67 @@ export default function WebAgentHome() {
 
   // Asks whether the email is a quote request. Runs beside the order lookup:
   // a quote request usually has no order number, and when it has one both show.
-  async function checkQuoteRequest(email: InquiryEmail) {
+  // The email is read with its thread's earlier messages; when it is a quote
+  // request with attachments or document links, those are read too before
+  // the card opens, since they often hold the weights and addresses.
+  async function checkQuoteRequest(email: InquiryEmail, conversationId: string | null) {
     const seq = ++quoteSeqRef.current;
     setQuoteRequest(null);
     if (!email.body.trim()) return;
-    try {
+    const ask = async (thread: ThreadMessage[] | null, withDocuments: boolean) => {
       const res = await fetch("/api/web-agent/quote/detect", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email }),
+        body: JSON.stringify({ email, conversationId, thread, withDocuments }),
       });
-      const data = (await res.json().catch(() => null)) as { detection?: QuoteRequestDetection } | null;
-      if (seq !== quoteSeqRef.current || !res.ok) return;
-      if (data?.detection?.isQuoteRequest) setQuoteRequest({ id: seq, email, detection: data.detection });
+      const data = (await res.json().catch(() => null)) as {
+        detection?: QuoteRequestDetection;
+        documentsToRead?: string[];
+        error?: string;
+      } | null;
+      return { ok: res.ok, data };
+    };
+    try {
+      // Read through Missive as the signed-in CSR; null lets the server try its own token.
+      const thread = conversationId ? await readMissiveThread(conversationId) : null;
+      if (seq !== quoteSeqRef.current) return;
+      const first = await ask(thread, false);
+      const detection = first.data?.detection;
+      if (seq !== quoteSeqRef.current || !first.ok || !detection?.isQuoteRequest) return;
+      const toRead = first.data?.documentsToRead ?? [];
+      if (toRead.length === 0) {
+        setQuoteRequest({ id: seq, email, detection });
+        return;
+      }
+
+      setQuoteRequest({ id: seq, email, detection, readingDocuments: toRead });
+      let withDocs: Awaited<ReturnType<typeof ask>> | null = null;
+      try {
+        withDocs = await ask(thread, true);
+      } catch {
+        // Kept as the first reading below, with a note.
+      }
+      if (seq !== quoteSeqRef.current) return;
+      const read = withDocs?.data?.detection;
+      if (withDocs?.ok && read) {
+        // A second reading that no longer sees a quote request keeps the first one.
+        setQuoteRequest({ id: seq, email, detection: read.isQuoteRequest ? read : detection });
+        return;
+      }
+      const why = withDocs?.data?.error ?? "Network error";
+      setQuoteRequest({
+        id: seq,
+        email,
+        detection: {
+          ...detection,
+          read: {
+            threadMessages: detection.read?.threadMessages ?? 0,
+            documents: [],
+            skipped: detection.read?.skipped ?? [],
+            documentsUnavailable: `The attachments couldn't be read, so the card has only what the emails say (${why.replace(/\.+$/, "")}).`,
+          },
+        },
+      });
     } catch {
       // Not knowing is treated as "not a quote request"; the order lookup is unaffected.
     }
@@ -461,7 +512,7 @@ export default function WebAgentHome() {
   ) {
     const email = { subject: meta.subject, from: meta.from, fromName: meta.fromName, body: meta.body };
     openEmailRef.current = email;
-    void checkQuoteRequest(email);
+    void checkQuoteRequest(email, meta.conversationId || null);
     setEmailScan((prev) => ({ conversationId: meta.conversationId, scanId: (prev?.scanId ?? 0) + 1 }));
     const top = applyDetectedText(text);
     if (top && top !== lastAutoLookedUpRef.current) {
@@ -646,7 +697,15 @@ export default function WebAgentHome() {
           </p>
         )}
 
-        {quoteRequest && (
+        {quoteRequest?.readingDocuments && (
+          <QuoteReadingDocuments
+            summary={quoteRequest.detection.summary}
+            documents={quoteRequest.readingDocuments}
+            cardClass={card}
+          />
+        )}
+
+        {quoteRequest && !quoteRequest.readingDocuments && (
           <QuoteRequest
             key={quoteRequest.id}
             detection={quoteRequest.detection}

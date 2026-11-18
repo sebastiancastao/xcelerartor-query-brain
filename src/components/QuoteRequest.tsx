@@ -8,6 +8,7 @@ import {
   BOX_TRUCK_ONLY_EXTRAS,
   QUOTE_EXTRAS,
   QUOTE_EXTRA_LABELS,
+  QUOTE_FIELD_LABELS,
   TRIPS,
   TRIP_LABELS,
   VEHICLE_CAPACITY_LB,
@@ -21,6 +22,7 @@ import {
   type FuelBasis,
   type LoadForSizing,
   type QuoteExtra,
+  type QuoteField,
   type QuoteInputs,
   type QuoteRequestDetection,
   type QuoteResult,
@@ -211,6 +213,48 @@ function Labeled({ label, hint, children }: { label: string; hint?: string; chil
   );
 }
 
+function QuoteHeader({ summary }: { summary: string }) {
+  return (
+    <>
+      <div className="flex flex-wrap items-center gap-2">
+        <h2 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">Quote request</h2>
+        <span className="inline-flex items-center gap-1.5 rounded-full bg-indigo-100 px-2.5 py-1 text-xs font-medium text-indigo-700 dark:bg-indigo-900/60 dark:text-indigo-300">
+          <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-current" />
+          This email asks for a price
+        </span>
+      </div>
+      {summary && <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">{summary}</p>}
+    </>
+  );
+}
+
+const cardSectionClass =
+  "rounded-2xl border border-indigo-200 bg-white shadow-sm dark:border-indigo-900/70 dark:bg-zinc-900";
+
+/** Stands in for the quote card while the email's attachments are read for its details. */
+export function QuoteReadingDocuments({
+  summary,
+  documents,
+  cardClass,
+}: {
+  summary: string;
+  documents: string[];
+  cardClass: string;
+}) {
+  return (
+    <section className={`${cardSectionClass} ${cardClass}`} aria-busy="true">
+      <QuoteHeader summary={summary} />
+      <p className="mt-3 flex items-start gap-2 text-sm text-zinc-600 dark:text-zinc-400">
+        <span className="mt-0.5 h-3.5 w-3.5 shrink-0 animate-spin rounded-full border-2 border-indigo-200 border-t-indigo-600 dark:border-indigo-900 dark:border-t-indigo-400" />
+        <span>
+          Reading {documents.length === 1 ? "the attachment" : `${documents.length} attachments`} for the quote
+          details: {documents.join(", ")}…
+        </span>
+      </p>
+    </section>
+  );
+}
+
 /**
  * Shown when the email open in Missive asks for a price quote. The details
  * the email states are filled in; the route miles and drive time come from
@@ -236,6 +280,11 @@ export function QuoteRequest({
 }) {
   const fields = detection.fields;
   const estimates = detection.estimates;
+  const read = detection.read;
+  // Fields taken from an earlier message or a document rather than the open email.
+  const fromElsewhere = Object.entries(detection.fieldSources ?? {}).map(
+    ([field, source]) => `${QUOTE_FIELD_LABELS[field as QuoteField]} (${source})`,
+  );
   const [form, setForm] = useState<Form>(() => initialForm(detection));
   // Priced straight away when everything is filled in (the miles may still be
   // on their way from Google Maps, which prices it once they arrive);
@@ -461,7 +510,7 @@ export function QuoteRequest({
       !boxTruck &&
       form.capacity === String(VEHICLE_CAPACITY_LB[form.vehicleClass]) &&
       `Capacity: ${VEHICLE_CAPACITY_LB[form.vehicleClass].toLocaleString("en-US")} lb, standard for a ${VEHICLE_LABELS[form.vehicleClass].toLowerCase()}`,
-    form.pickupAuto && "Pickup: now (no pickup time in the email)",
+    form.pickupAuto && "Pickup: now (no upcoming pickup time in the email)",
     form.deliveryAuto &&
       `Delivery by: ${durationText(deliveryMinutes)} after pickup (${form.driveMinutes !== null ? `the ${durationText(form.driveMinutes)} drive plus an hour` : "at least two hours"})`,
   ].filter((v): v is string => Boolean(v));
@@ -471,18 +520,30 @@ export function QuoteRequest({
     : null;
 
   return (
-    <section
-      id="quote-request"
-      className={`rounded-2xl border border-indigo-200 bg-white ${cardClass} shadow-sm dark:border-indigo-900/70 dark:bg-zinc-900`}
-    >
-      <div className="flex flex-wrap items-center gap-2">
-        <h2 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">Quote request</h2>
-        <span className="inline-flex items-center gap-1.5 rounded-full bg-indigo-100 px-2.5 py-1 text-xs font-medium text-indigo-700 dark:bg-indigo-900/60 dark:text-indigo-300">
-          <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-current" />
-          This email asks for a price
-        </span>
-      </div>
-      {detection.summary && <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">{detection.summary}</p>}
+    <section id="quote-request" className={`${cardSectionClass} ${cardClass}`}>
+      <QuoteHeader summary={detection.summary} />
+
+      {read && (read.threadMessages > 0 || read.documents.length > 0) && (
+        <p className="mt-2 text-xs text-zinc-500 dark:text-zinc-400">
+          Read from: this email
+          {read.threadMessages > 0 &&
+            `, ${read.threadMessages} earlier message${read.threadMessages === 1 ? "" : "s"} in the thread`}
+          {read.documents.length > 0 && `, ${read.documents.join(", ")}`}.
+        </p>
+      )}
+      {fromElsewhere.length > 0 && (
+        <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+          Taken from the thread and attachments: {fromElsewhere.join(" · ")}.
+        </p>
+      )}
+      {read && read.skipped.length > 0 && (
+        <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+          Not read: {read.skipped.map((s) => `${s.name} (${s.why})`).join("; ")}.
+        </p>
+      )}
+      {read?.documentsUnavailable && (
+        <p className="mt-1 text-xs text-amber-700 dark:text-amber-400">{read.documentsUnavailable}</p>
+      )}
 
       {(fields.pieces || fields.pallets) && (
         <p className="mt-2 text-sm text-zinc-600 dark:text-zinc-400">
@@ -499,7 +560,9 @@ export function QuoteRequest({
       )}
 
       {!detection.unreadReason && notInEmail.length > 0 && (
-        <p className="mt-3 text-xs text-zinc-500 dark:text-zinc-400">Not in the email: {notInEmail.join(", ")}.</p>
+        <p className="mt-3 text-xs text-zinc-500 dark:text-zinc-400">
+          Not in the email{read?.documents.length ? " or its attachments" : ""}: {notInEmail.join(", ")}.
+        </p>
       )}
 
       {workedOut.length > 0 && (

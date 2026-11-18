@@ -87,12 +87,47 @@ export type QuoteEstimates = {
 
 export const NO_ESTIMATES: QuoteEstimates = { weight: null, weightReason: null, truckItem: null };
 
+export type QuoteField = keyof QuoteRequestFields;
+
+export const QUOTE_FIELD_LABELS: Record<QuoteField, string> = {
+  vehicleClass: "Vehicle",
+  miles: "Route miles",
+  weight: "Weight",
+  pieces: "Pieces",
+  pallets: "Pallets",
+  pickupAddress: "Pickup from",
+  deliveryAddress: "Deliver to",
+  pickupStart: "Pickup time",
+  deliveryEnd: "Delivery by",
+  trip: "Trip",
+  extras: "Extras",
+  dryIcePounds: "Dry ice",
+};
+
+/** An earlier message of the open email's thread, as plain text with its quoted history cut off. */
+export type ThreadMessage = { from: string; sentAt: string | null; text: string };
+
+/** What the quote was read from besides the open email. */
+export type QuoteSourcesRead = {
+  /** Earlier messages of the thread that were read. */
+  threadMessages: number;
+  /** Attachments and document links read, by name. */
+  documents: string[];
+  /** Documents that were not read, with why. */
+  skipped: { name: string; why: string }[];
+  /** Why no attachment could be read at all (the app's Missive token can't see the email, ...). */
+  documentsUnavailable: string | null;
+};
+
 export type QuoteRequestDetection = {
   isQuoteRequest: boolean;
   /** One line saying what the customer wants priced. */
   summary: string;
   fields: QuoteRequestFields;
   estimates: QuoteEstimates;
+  /** Where a field came from when it wasn't the open email: "an earlier message" or a document's name. */
+  fieldSources?: Partial<Record<QuoteField, string>>;
+  read?: QuoteSourcesRead;
   /** Set when the AI could not read the email, so the fields are empty for that reason, not because the email lacks them. */
   unreadReason?: string;
 };
