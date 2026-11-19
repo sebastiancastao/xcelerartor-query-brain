@@ -1,4 +1,5 @@
 import { NextResponse, type NextRequest } from "next/server";
+import { fuelSurchargeDefaults } from "@/lib/fuel-defaults";
 import { isSameOrigin } from "@/lib/same-origin";
 import { currentFuelSurcharges, isXceleratorQuoteConfigured } from "@/lib/xcelerator-quote";
 
@@ -9,10 +10,14 @@ function text(value: unknown, max: number): string {
 }
 
 // The quote card's fuel surcharge: the current one Xcelerator keeps for each
-// vehicle (the rate sheet says to ask for it). Answers { fuel: null } when
-// Xcelerator has none or isn't connected; the card then asks the CSR.
+// vehicle (the rate sheet says to ask for it), plus the default for each
+// vehicle the card falls back on. Answers { fuel: null } when Xcelerator has
+// none or isn't connected; `defaults` comes with every answer.
 export async function POST(request: NextRequest) {
-  if (!isXceleratorQuoteConfigured()) return NextResponse.json({ fuel: null });
+  const defaults = fuelSurchargeDefaults();
+  if (!isXceleratorQuoteConfigured()) {
+    return NextResponse.json({ fuel: null, defaults, reason: "Xcelerator's back office isn't connected" });
+  }
   // Reading it reserves (and releases) an order number in Xcelerator, as opening Order Entry does.
   if (!isSameOrigin(request)) {
     return NextResponse.json({ error: "Only allowed from this app's own page." }, { status: 403 });
@@ -27,9 +32,12 @@ export async function POST(request: NextRequest) {
       [text(body?.pickupAddress, 300) || null, text(body?.deliveryAddress, 300) || null],
       day,
     );
-    return NextResponse.json({ fuel });
+    return NextResponse.json({ fuel, defaults });
   } catch (err) {
     console.error("Fuel surcharge lookup failed:", err);
-    return NextResponse.json({ error: "Couldn't read the fuel surcharge from Xcelerator." }, { status: 502 });
+    return NextResponse.json(
+      { error: "Couldn't read the fuel surcharge from Xcelerator.", defaults },
+      { status: 502 },
+    );
   }
 }

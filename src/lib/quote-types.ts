@@ -31,6 +31,32 @@ export const TRIP_LABELS: Record<Trip, string> = {
 
 export type FuelBasis = "transport" | "subtotal";
 
+/** A fuel surcharge as the quote card uses it: a percentage of the transport charge or of all charges. */
+export type FuelSurchargeEntry = {
+  percent: number;
+  basis: FuelBasis;
+  /** Its name in Xcelerator, e.g. "Gas Srch". */
+  name: string;
+};
+
+export type FuelSurchargeDefaults = Record<VehicleClass, FuelSurchargeEntry>;
+
+/**
+ * The fuel surcharge the quote card uses when Xcelerator's current one can't
+ * be read (back office not connected, no answer, or none for the vehicle).
+ * These are Xcelerator's own as read 2026-11-18 on AIRP, AIRGR and PIEDHO:
+ * "Gas Srch" 14.72% for cars, vans and Sprinters, "Diesel Src" 21.7% for
+ * straight trucks, both on the order (transport) charge only. The server can
+ * replace them with QUOTE_FUEL_GAS_PERCENT, QUOTE_FUEL_DIESEL_PERCENT and
+ * QUOTE_FUEL_BASIS (see fuel-defaults.ts).
+ */
+export const DEFAULT_FUEL_SURCHARGES: FuelSurchargeDefaults = {
+  "small-package": { percent: 14.72, basis: "transport", name: "Gas Srch" },
+  "cargo-van": { percent: 14.72, basis: "transport", name: "Gas Srch" },
+  "cube-sprinter": { percent: 14.72, basis: "transport", name: "Gas Srch" },
+  "box-truck": { percent: 21.7, basis: "transport", name: "Diesel Src" },
+};
+
 /** Flat extras on the rate sheet, named as Quote Engine's pricing object names them. */
 export const QUOTE_EXTRAS = [
   "hazmat",

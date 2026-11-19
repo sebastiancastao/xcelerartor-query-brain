@@ -7,6 +7,7 @@ import { insertIntoMissiveReply, openLinkInNewTab } from "@/components/MissiveEm
 import { XceleratorQuoteSave } from "@/components/XceleratorQuoteSave";
 import {
   BOX_TRUCK_ONLY_EXTRAS,
+  DEFAULT_FUEL_SURCHARGES,
   QUOTE_EXTRAS,
   QUOTE_EXTRA_LABELS,
   QUOTE_FIELD_LABELS,
@@ -22,6 +23,8 @@ import {
   routeAddress,
   toEasternWallClock,
   type FuelBasis,
+  type FuelSurchargeDefaults,
+  type FuelSurchargeEntry,
   type LoadForSizing,
   type QuoteExtra,
   type QuoteField,
@@ -61,7 +64,10 @@ type Form = {
   vehicleAuto: boolean;
   /** The vehicle's standard (or saved) capacity, not typed on this card; follows the vehicle. */
   capacityAuto: boolean;
-  /** Not typed on this card: Xcelerator's current fuel surcharge for the vehicle, once read; follows the vehicle. */
+  /**
+   * Not typed on this card: Xcelerator's current fuel surcharge for the
+   * vehicle once read, else the default for the vehicle; follows the vehicle.
+   */
   fuelAuto: boolean;
   /** The AI's estimate from the items the email describes. */
   weightAuto: boolean;
@@ -98,14 +104,39 @@ type InsertState = { status: "idle" } | { status: "inserting" } | { status: "ins
 type FuelState =
   | { status: "loading" }
   | { status: "ready"; table: XceleratorFuelSurcharges }
-  /** Xcelerator has none, isn't connected, or didn't answer: the CSR's last values are used. */
+  /** Xcelerator has none, isn't connected, or didn't answer: the default for the vehicle is used. */
   | { status: "unavailable"; message: string };
 
-// The fuel surcharge is not on the rate sheet; it comes from Xcelerator, and
-// the last value a CSR used is kept in this browser for when Xcelerator can't
-// be read. A capacity a CSR entered that differs from the standard one for the
-// vehicle is kept too.
-type SavedDefaults = { fuelPercent?: string; fuelBasis?: FuelBasis; capacity?: Partial<Record<VehicleClass, string>> };
+/** The fuel surcharge for a vehicle: Xcelerator's current one, else the default. */
+function fuelChoice(
+  vehicleClass: VehicleClass | "",
+  table: XceleratorFuelSurcharges | null,
+  defaults: FuelSurchargeDefaults,
+): { entry: FuelSurchargeEntry; fromXcelerator: boolean } | null {
+  if (!vehicleClass) return null;
+  const current = table?.byVehicle[vehicleClass];
+  return current ? { entry: current, fromXcelerator: true } : { entry: defaults[vehicleClass], fromXcelerator: false };
+}
+
+function isFuelDefaults(value: unknown): value is FuelSurchargeDefaults {
+  if (!value || typeof value !== "object") return false;
+  return VEHICLE_CLASSES.every((v) => {
+    const entry = (value as Record<string, Partial<FuelSurchargeEntry> | undefined>)[v];
+    return (
+      typeof entry?.percent === "number" &&
+      Number.isFinite(entry.percent) &&
+      entry.percent >= 0 &&
+      (entry.basis === "transport" || entry.basis === "subtotal") &&
+      typeof entry.name === "string"
+    );
+  });
+}
+
+// A capacity a CSR entered that differs from the standard one for the vehicle
+// is kept in this browser. (The fuel surcharge used to be kept too; it now
+// comes from Xcelerator or the per-vehicle default, so a gas figure can't
+// follow a CSR onto a box truck.)
+type SavedDefaults = { capacity?: Partial<Record<VehicleClass, string>> };
 const DEFAULTS_KEY = "web-agent.quote-defaults";
 
 function loadDefaults(): SavedDefaults {
@@ -126,11 +157,7 @@ function saveDefaults(form: Form): void {
       if (value && Number(value) !== VEHICLE_CAPACITY_LB[form.vehicleClass]) capacity[form.vehicleClass] = value;
       else delete capacity[form.vehicleClass];
     }
-    const next: SavedDefaults = {
-      fuelPercent: form.fuelPercent.trim(),
-      fuelBasis: form.fuelBasis || undefined,
-      capacity,
-    };
+    const next: SavedDefaults = { capacity };
     window.localStorage.setItem(DEFAULTS_KEY, JSON.stringify(next));
   } catch {
     // Storage can be blocked inside an iframe; the CSR just retypes the values.
@@ -217,6 +244,8 @@ function initialForm(detection: QuoteRequestDetection): Form {
   // With no time in the email the quote is priced as picked up now, and
   // delivered after the drive plus an hour; the card says so.
   const pickupStart = f.pickupStart ?? toEasternWallClock(new Date());
+  // The default fuel surcharge until Xcelerator's current one comes back.
+  const fuel = DEFAULT_FUEL_SURCHARGES[vehicleClass];
   return {
     pickupAddress: f.pickupAddress ?? "",
     deliveryAddress: f.deliveryAddress ?? "",
@@ -226,8 +255,8 @@ function initialForm(detection: QuoteRequestDetection): Form {
     capacity: capacityFor(vehicleClass, saved),
     pickupStart,
     deliveryEnd: f.deliveryEnd ?? assumedDeliveryEnd(pickupStart, null),
-    fuelPercent: saved.fuelPercent ?? "",
-    fuelBasis: saved.fuelBasis ?? "",
+    fuelPercent: String(fuel.percent),
+    fuelBasis: fuel.basis,
     trip: f.trip ?? "one-way",
     extras: f.extras,
     dryIcePounds: f.dryIcePounds?.toString() ?? "",
@@ -354,6 +383,8 @@ export function QuoteRequest({
       : { status: "idle" },
   );
   const [fuel, setFuel] = useState<FuelState>({ status: "loading" });
+  // The per-vehicle fallback: built in, until the server sends its own (which can be set by env).
+  const [fuelDefaults, setFuelDefaults] = useState<FuelSurchargeDefaults>(DEFAULT_FUEL_SURCHARGES);
   const seqRef = useRef(0);
   const milesSeqRef = useRef(0);
   // The form as it is now, for work that finishes after the CSR may have typed more.
@@ -470,10 +501,11 @@ export function QuoteRequest({
   /**
    * Fills the fuel surcharge % and what it applies to with Xcelerator's
    * current surcharge for the vehicle, unless the CSR has typed their own.
-   * Without one, the CSR's last values (kept in this browser) stay.
+   * Without one, the default for the vehicle (from the server) is used.
    */
   async function lookUpFuel(current: Form) {
     let table: XceleratorFuelSurcharges | null = null;
+    let defaults = fuelDefaults;
     try {
       const res = await fetch("/api/web-agent/quote/fuel", {
         method: "POST",
@@ -485,7 +517,13 @@ export function QuoteRequest({
           day: current.deliveryEnd.slice(0, 10),
         }),
       });
-      const data = (await res.json().catch(() => null)) as { fuel?: XceleratorFuelSurcharges | null; error?: string } | null;
+      const data = (await res.json().catch(() => null)) as
+        | { fuel?: XceleratorFuelSurcharges | null; defaults?: unknown; reason?: string; error?: string }
+        | null;
+      if (isFuelDefaults(data?.defaults)) {
+        defaults = data.defaults;
+        setFuelDefaults(defaults);
+      }
       table = res.ok ? (data?.fuel ?? null) : null;
       setFuel(
         table
@@ -493,14 +531,14 @@ export function QuoteRequest({
           : {
               status: "unavailable",
               message: res.ok
-                ? "Xcelerator has no fuel surcharge to use: enter the current one"
+                ? (data?.reason ?? "Xcelerator has no fuel surcharge to use")
                 : (data?.error ?? `Couldn't read the fuel surcharge from Xcelerator (${res.status})`),
             },
       );
     } catch {
       setFuel({ status: "unavailable", message: "Couldn't reach Xcelerator for the fuel surcharge" });
     }
-    const next = applyNow((prev) => withFuel(prev, table));
+    const next = applyNow((prev) => withFuel(prev, table, defaults));
     settleAuto("fuel", next);
   }
 
@@ -520,10 +558,10 @@ export function QuoteRequest({
     setForm((prev) => ({ ...prev, ...patch }));
   }
 
-  /** Xcelerator's fuel surcharge for the form's vehicle, while the CSR hasn't typed their own. */
-  function withFuel(prev: Form, table: XceleratorFuelSurcharges | null): Form {
-    const entry = prev.fuelAuto && prev.vehicleClass ? table?.byVehicle[prev.vehicleClass] : undefined;
-    return entry ? { ...prev, fuelPercent: String(entry.percent), fuelBasis: entry.basis } : prev;
+  /** Xcelerator's (else the default) fuel surcharge for the form's vehicle, while the CSR hasn't typed their own. */
+  function withFuel(prev: Form, table: XceleratorFuelSurcharges | null, defaults: FuelSurchargeDefaults): Form {
+    const choice = prev.fuelAuto ? fuelChoice(prev.vehicleClass, table, defaults) : null;
+    return choice ? { ...prev, fuelPercent: String(choice.entry.percent), fuelBasis: choice.entry.basis } : prev;
   }
 
   /** The form with another vehicle: its capacity follows, and the fuel surcharge unless typed on this card. */
@@ -534,7 +572,7 @@ export function QuoteRequest({
       capacity: vehicleClass ? capacityFor(vehicleClass) : "",
       capacityAuto: true,
     };
-    return withFuel(next, fuel.status === "ready" ? fuel.table : null);
+    return withFuel(next, fuel.status === "ready" ? fuel.table : null, fuelDefaults);
   }
 
   function changePlace(patch: Pick<Partial<Form>, "pickupAddress" | "deliveryAddress">) {
@@ -645,10 +683,26 @@ export function QuoteRequest({
   const vehicleWhy = sized.vehicleClass === form.vehicleClass ? sized.reason : "by the sizing rules";
   const deliveryMinutes = Math.max(120, (form.driveMinutes ?? 0) + 60);
   const vehicleName = form.vehicleClass ? VEHICLE_LABELS[form.vehicleClass].toLowerCase() : "";
-  // Xcelerator's surcharge for this vehicle, and whether the card is using it.
-  const fuelEntry = fuel.status === "ready" && form.vehicleClass ? fuel.table.byVehicle[form.vehicleClass] : undefined;
-  const fuelFromXcelerator =
-    fuelEntry && form.fuelPercent === String(fuelEntry.percent) && form.fuelBasis === fuelEntry.basis ? fuelEntry : null;
+  // The surcharge the card would use for this vehicle (Xcelerator's, else the
+  // default), and whether the fields still hold it.
+  const fuelSuggested = fuelChoice(form.vehicleClass, fuel.status === "ready" ? fuel.table : null, fuelDefaults);
+  const fuelInUse =
+    fuelSuggested &&
+    form.fuelPercent.trim() !== "" &&
+    Number(form.fuelPercent) === fuelSuggested.entry.percent &&
+    form.fuelBasis === fuelSuggested.entry.basis
+      ? fuelSuggested
+      : null;
+  const fuelFromXcelerator = fuelInUse?.fromXcelerator ? fuelInUse.entry : null;
+  const fuelFromDefault = fuelInUse && !fuelInUse.fromXcelerator ? fuelInUse.entry : null;
+  // Why the default is used rather than Xcelerator's.
+  const fuelDefaultWhy =
+    fuel.status === "loading"
+      ? "until Xcelerator's current one comes back"
+      : fuel.status === "unavailable"
+        ? fuel.message.replace(/\.+$/, "")
+        : `Xcelerator has none for a ${vehicleName}`;
+  const basisText = (basis: FuelBasis) => (basis === "transport" ? "the transport charge" : "all charges");
   const capacityText =
     form.capacityAuto && form.vehicleClass
       ? boxTruck
@@ -663,7 +717,10 @@ export function QuoteRequest({
       `Weight: about ${Number(form.weight).toLocaleString("en-US")} lb${estimates.weightReason ? ` (${estimates.weightReason})` : ""}`,
     capacityText,
     fuelFromXcelerator &&
-      `Fuel surcharge: ${fuelFromXcelerator.percent}% of ${fuelFromXcelerator.basis === "transport" ? "the transport charge" : "all charges"}, Xcelerator's current "${fuelFromXcelerator.name}" for a ${vehicleName}`,
+      `Fuel surcharge: ${fuelFromXcelerator.percent}% of ${basisText(fuelFromXcelerator.basis)}, Xcelerator's current "${fuelFromXcelerator.name}" for a ${vehicleName}`,
+    fuelFromDefault &&
+      fuel.status !== "loading" &&
+      `Fuel surcharge: ${fuelFromDefault.percent}% of ${basisText(fuelFromDefault.basis)}, the default "${fuelFromDefault.name}" for a ${vehicleName} (${fuelDefaultWhy}); check it's still current`,
     form.pickupAuto && "Pickup: now (no upcoming pickup time in the email)",
     form.deliveryAuto &&
       `Delivery by: ${durationText(deliveryMinutes)} after pickup (${form.driveMinutes !== null ? `the ${durationText(form.driveMinutes)} drive plus an hour` : "at least two hours"})`,
@@ -673,11 +730,11 @@ export function QuoteRequest({
       ? "Getting the current one from Xcelerator…"
       : fuelFromXcelerator
         ? `From Xcelerator ("${fuelFromXcelerator.name}")`
-        : fuel.status === "unavailable"
-          ? `${fuel.message}${form.fuelPercent ? " (your last value is filled in)" : ""}`
-          : // With one for this vehicle, the "Use Xcelerator's" link below the field says it.
-            !fuelEntry && form.vehicleClass
-            ? `Xcelerator has none for a ${vehicleName}`
+        : fuelFromDefault
+          ? `Default for a ${vehicleName}: ${fuelDefaultWhy}`
+          : // Typed on this card; the link below the field offers the suggested one back.
+            fuel.status === "unavailable"
+            ? fuel.message
             : undefined;
   const placesSet = Boolean(form.pickupAddress.trim() && form.deliveryAddress.trim());
   const directionsUrl = placesSet
@@ -888,19 +945,34 @@ export function QuoteRequest({
               placeholder={fuel.status === "loading" ? "From Xcelerator…" : undefined}
               className={inputClass}
             />
-            {fuelEntry && !fuelFromXcelerator && (
+            {fuelSuggested && !fuelInUse && (
               <button
                 type="button"
                 onClick={() =>
-                  update({ fuelPercent: String(fuelEntry.percent), fuelBasis: fuelEntry.basis, fuelAuto: true })
+                  update({
+                    fuelPercent: String(fuelSuggested.entry.percent),
+                    fuelBasis: fuelSuggested.entry.basis,
+                    fuelAuto: true,
+                  })
                 }
                 className="self-start text-left text-xs font-medium text-indigo-600 hover:underline dark:text-indigo-400"
               >
-                Use Xcelerator&apos;s current {fuelEntry.percent}% (&quot;{fuelEntry.name}&quot;)
+                {fuelSuggested.fromXcelerator ? "Use Xcelerator's current" : "Use the default"}{" "}
+                {fuelSuggested.entry.percent}% of {basisText(fuelSuggested.entry.basis)} (&quot;
+                {fuelSuggested.entry.name}&quot;)
               </button>
             )}
           </Labeled>
-          <Labeled label="Fuel surcharge on" hint={fuelFromXcelerator ? "As Xcelerator applies it" : undefined}>
+          <Labeled
+            label="Fuel surcharge on"
+            hint={
+              fuelFromXcelerator
+                ? "As Xcelerator applies it"
+                : fuelFromDefault
+                  ? "As Xcelerator applies it (default)"
+                  : undefined
+            }
+          >
             <select
               value={form.fuelBasis}
               onChange={(e) => update({ fuelBasis: e.target.value as FuelBasis | "", fuelAuto: false })}
