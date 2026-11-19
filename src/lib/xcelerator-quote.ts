@@ -260,13 +260,25 @@ async function plannedAddress(place: string, side: string): Promise<PlannedAddre
   };
 }
 
-/** The rate sheet's charge lines in Order Entry's charge fields; what has no field of its own goes in Misc. */
+/**
+ * The rate sheet's charge lines in Order Entry's charge fields; what has no
+ * field of its own goes in Misc. The fuel surcharge line is kept apart
+ * (`fuelCents`): it goes in Xcelerator's surcharges when the account has a
+ * matching one, else in Misc (see prepare).
+ */
 function chargeFields(quote: QuoteResult) {
   const f = { OrderCharge: 0, WaitTimeCharge: 0, WeightCharge: 0, AfterHoursCharge: 0, MiscCharge: 0 };
   const lines: { label: string; amount: string }[] = [];
+  let fuelCents = 0;
+  let fuelLabel = "";
   for (const c of quote.charges) {
     const amount = c.quantity * c.rateCents;
     const d = c.description;
+    if (/^Fuel surcharge/.test(d)) {
+      fuelCents += amount;
+      fuelLabel = d;
+      continue;
+    }
     const field: keyof typeof f = /^(One-way transport|Roundtrip|Return|Additional full delivery attempt)/.test(d)
       ? "OrderCharge"
       : /waiting/i.test(d)
@@ -279,11 +291,11 @@ function chargeFields(quote: QuoteResult) {
     f[field] += amount;
     lines.push({ label: d, amount: formatCents(amount, quote.currency) });
   }
-  const total = Object.values(f).reduce((a, b) => a + b, 0);
+  const total = Object.values(f).reduce((a, b) => a + b, 0) + fuelCents;
   if (total !== quote.totalCents) {
     throw new XceleratorQuoteError(500, "The charge lines don't add up to the quoted total, so the quote wasn't saved.");
   }
-  return { fields: f, lines, totalCents: total };
+  return { fields: f, lines, fuelCents, fuelLabel, totalCents: total };
 }
 
 // --- Fuel surcharge --------------------------------------------------------------
@@ -492,7 +504,7 @@ async function prepare(req: QuoteForXcelerator): Promise<Prepared> {
   if (!isXceleratorQuoteConfigured()) {
     throw new XceleratorQuoteError(501, "Xcelerator's back office isn't connected (set XCELERATOR_BACKOFFICE_USERNAME and _PASSWORD).");
   }
-  const { fields: charges, lines, totalCents } = chargeFields(req.quote);
+  const { fields: charges, lines, fuelCents, fuelLabel, totalCents } = chargeFields(req.quote);
   const [account, pickup, delivery] = await Promise.all([
     accountByNumber(req.accountNo),
     plannedAddress(req.pickupAddress, "pickup"),
@@ -541,13 +553,39 @@ async function prepare(req: QuoteForXcelerator): Promise<Prepared> {
       services.find((s) => s.Id === defaults.ServiceId) ?? services.find((s) => s.IsDefault) ?? services[0];
     if (!service) throw new XceleratorQuoteError(422, `Account ${account.accountNo} has no service types in Xcelerator.`);
 
-    // The account's own fuel surcharge, in case it differs from what the quote was priced with.
+    // The fuel surcharge goes on the quote as Xcelerator's own surcharge
+    // ("Gas Srch" / "Diesel Src" in the Surcharges box) when the account has
+    // one for this vehicle and service with the same % and basis: Order Entry
+    // then works out the same amount. With a manual price (OverRide 2) Order
+    // Entry skips surcharges unless OverRideException_Sur is on, so it is
+    // switched on. Otherwise the fuel amount goes in Misc, named, so the
+    // quote's total still matches.
     const fuel = fuelFor(select, req.inputs.vehicleClass, req.inputs.deliveryEnd.slice(0, 10), service.Id);
-    if (fuel && (Math.abs(fuel.percent - req.inputs.fuelPercent) > 0.001 || fuel.basis !== req.inputs.fuelBasis)) {
+    const basisText = (b: FuelBasis) => (b === "transport" ? "transport charges" : "all charges");
+    const fuelMatches =
+      fuel !== null &&
+      Math.abs(fuel.percent - req.inputs.fuelPercent) <= 0.001 &&
+      fuel.basis === req.inputs.fuelBasis;
+    const fuelAsSurcharge = fuelCents > 0 && fuelMatches;
+    const fuelInMisc = fuelCents > 0 && !fuelAsSurcharge;
+    if (fuelAsSurcharge) {
+      lines.push({ label: `${fuelLabel} → Xcelerator surcharge "${fuel!.name}"`, amount: formatCents(fuelCents, req.quote.currency) });
+    } else if (fuelCents > 0) {
+      lines.push({ label: `${fuelLabel} → Misc charge`, amount: formatCents(fuelCents, req.quote.currency) });
       notes.push(
-        `This account's fuel surcharge in Xcelerator is ${fuel.percent}% (${fuel.name}) of ${fuel.basis === "transport" ? "transport charges" : "all charges"}; the quote used ${req.inputs.fuelPercent}% of ${req.inputs.fuelBasis === "transport" ? "transport charges" : "all charges"}.`,
+        fuel
+          ? `This account's fuel surcharge in Xcelerator is ${fuel.percent}% (${fuel.name}) of ${basisText(fuel.basis)}; the quote used ${req.inputs.fuelPercent}% of ${basisText(req.inputs.fuelBasis)}, so the fuel amount is saved in Misc rather than as "${fuel.name}".`
+          : `This account has no fuel surcharge in Xcelerator for a ${vehicle.VehicleName} on ${service.ServiceName}, so the ${req.inputs.fuelPercent}% fuel amount is saved in Misc.`,
       );
     }
+    const miscCents = charges.MiscCharge + (fuelInMisc ? fuelCents : 0);
+    const chargeCents = totalCents - (fuelAsSurcharge ? fuelCents : 0);
+    const miscDetail = [
+      charges.MiscCharge > 0 ? "Rate sheet extras" : "",
+      fuelInMisc ? `Fuel surcharge ${req.inputs.fuelPercent}%` : "",
+    ]
+      .filter(Boolean)
+      .join(" + ");
 
     const packageList = select?.Packages ?? [];
     const pkg = req.pallets
@@ -588,13 +626,15 @@ async function prepare(req: QuoteForXcelerator): Promise<Prepared> {
       OverRideMileage: true,
       // The rate sheet's price, entered by hand (2 = every charge manual, no tariff rules).
       OverRide: 2,
+      // Keeps the account's fuel surcharge on despite the manual price.
+      OverRideException_Sur: fuelAsSurcharge,
       HasRated: true,
       OrderCharge: cents(charges.OrderCharge),
       WaitTimeCharge: cents(charges.WaitTimeCharge),
       WeightCharge: cents(charges.WeightCharge),
       AfterHoursCharge: cents(charges.AfterHoursCharge),
-      MiscCharge: cents(charges.MiscCharge),
-      MiscChargeDtl: charges.MiscCharge > 0 ? "Rate sheet extras" : "",
+      MiscCharge: cents(miscCents),
+      MiscChargeDtl: miscDetail.slice(0, 50),
       ClientDiscountAmt: 0,
       OnlineDiscountAmt: 0,
       OtherChg1: 0,
@@ -607,11 +647,12 @@ async function prepare(req: QuoteForXcelerator): Promise<Prepared> {
       StopOffCharge: 0,
       StopOffExtras: 0,
       TotalExtras: 0,
-      TotalSurcharges: 0,
+      // Order Entry: Subtotal = TotalCharge + TotalSurcharges.
+      TotalSurcharges: cents(fuelAsSurcharge ? fuelCents : 0),
       Tax1Amount: 0,
       Tax2Amount: 0,
       TollCharge: 0,
-      TotalCharge: cents(totalCents),
+      TotalCharge: cents(chargeCents),
       Subtotal: cents(totalCents),
       GrandTotal: cents(totalCents),
       Packages: pkg ? [{ Package: `PkgNum${pkg.PackageId}`, PackageCount: String(pkgCount) }] : [],
@@ -686,5 +727,26 @@ export async function saveXceleratorQuote(req: QuoteForXcelerator): Promise<Save
       `Xcelerator answered without a quote number (got "${quoteRef || "nothing"}"). Check order ${prepared.orderTrackingId} in Xcelerator.`,
     );
   }
-  return { ...prepared.plan, quoteRef };
+  return { ...prepared.plan, quoteRef, notes: [...prepared.plan.notes, ...(await checkSaved(prepared))] };
+}
+
+/** Reads the saved quote back and says if Xcelerator kept a different fuel surcharge or total than was sent. */
+async function checkSaved(prepared: Prepared): Promise<string[]> {
+  const sent = prepared.payload as { TotalSurcharges?: number; GrandTotal?: number };
+  try {
+    const data = await backOfficeRequest<unknown>(
+      `/api/order/getReviewOrderData?_p_OrderTrackingId=${prepared.orderTrackingId}`,
+    );
+    const saved = (Array.isArray(data) ? data[0] : data) as { TotalSurcharges?: number; GrandTotal?: number } | null;
+    if (!saved || typeof saved.GrandTotal !== "number") return [];
+    const off = (a: number | undefined, b: number | undefined) => Math.abs((a ?? 0) - (b ?? 0)) > 0.005;
+    if (off(saved.TotalSurcharges, sent.TotalSurcharges) || off(saved.GrandTotal, sent.GrandTotal)) {
+      return [
+        `Xcelerator stored surcharges of $${(saved.TotalSurcharges ?? 0).toFixed(2)} and a total of $${saved.GrandTotal.toFixed(2)} (sent $${(sent.TotalSurcharges ?? 0).toFixed(2)} and $${(sent.GrandTotal ?? 0).toFixed(2)}); check the quote in Order Entry.`,
+      ];
+    }
+    return [];
+  } catch {
+    return [];
+  }
 }
