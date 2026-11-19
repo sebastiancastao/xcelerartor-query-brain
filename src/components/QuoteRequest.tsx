@@ -244,8 +244,16 @@ function initialForm(detection: QuoteRequestDetection): Form {
   // With no time in the email the quote is priced as picked up now, and
   // delivered after the drive plus an hour; the card says so.
   const pickupStart = f.pickupStart ?? toEasternWallClock(new Date());
-  // The default fuel surcharge until Xcelerator's current one comes back.
-  const fuel = DEFAULT_FUEL_SURCHARGES[vehicleClass];
+  // The fuel surcharge the email states; else the one the reading assigned
+  // (Xcelerator's current one for the vehicle, or the default); else the
+  // built-in default until the card's own lookup answers. A stated % without
+  // a basis takes the assigned basis.
+  const assigned = fuelChoice(
+    vehicleClass,
+    detection.fuel?.xcelerator ?? null,
+    detection.fuel?.defaults ?? DEFAULT_FUEL_SURCHARGES,
+  )!.entry;
+  const fuelStated = f.fuelPercent !== null;
   return {
     pickupAddress: f.pickupAddress ?? "",
     deliveryAddress: f.deliveryAddress ?? "",
@@ -255,8 +263,8 @@ function initialForm(detection: QuoteRequestDetection): Form {
     capacity: capacityFor(vehicleClass, saved),
     pickupStart,
     deliveryEnd: f.deliveryEnd ?? assumedDeliveryEnd(pickupStart, null),
-    fuelPercent: String(fuel.percent),
-    fuelBasis: fuel.basis,
+    fuelPercent: String(fuelStated ? f.fuelPercent : assigned.percent),
+    fuelBasis: (fuelStated ? f.fuelBasis : null) ?? assigned.basis,
     trip: f.trip ?? "one-way",
     extras: f.extras,
     dryIcePounds: f.dryIcePounds?.toString() ?? "",
@@ -269,7 +277,8 @@ function initialForm(detection: QuoteRequestDetection): Form {
     helperRate: "",
     vehicleAuto: !f.vehicleClass,
     capacityAuto: true,
-    fuelAuto: true,
+    // A surcharge the email states stays put when the vehicle changes.
+    fuelAuto: !fuelStated,
     weightAuto: f.weight === null && estimates.weight !== null,
     pickupAuto: !f.pickupStart,
     deliveryAuto: !f.deliveryEnd,
@@ -382,9 +391,19 @@ export function QuoteRequest({
       ? { status: "loading" }
       : { status: "idle" },
   );
-  const [fuel, setFuel] = useState<FuelState>({ status: "loading" });
-  // The per-vehicle fallback: built in, until the server sends its own (which can be set by env).
-  const [fuelDefaults, setFuelDefaults] = useState<FuelSurchargeDefaults>(DEFAULT_FUEL_SURCHARGES);
+  // The reading normally comes with the fuel surcharge looked up; only
+  // without it does the card ask Xcelerator itself.
+  const [fuel, setFuel] = useState<FuelState>(() =>
+    !detection.fuel
+      ? { status: "loading" }
+      : detection.fuel.xcelerator
+        ? { status: "ready", table: detection.fuel.xcelerator }
+        : { status: "unavailable", message: detection.fuel.unavailable ?? "Xcelerator has no fuel surcharge to use" },
+  );
+  // The per-vehicle fallback: the server's (which can be set by env), else built in.
+  const [fuelDefaults, setFuelDefaults] = useState<FuelSurchargeDefaults>(
+    () => detection.fuel?.defaults ?? DEFAULT_FUEL_SURCHARGES,
+  );
   const seqRef = useRef(0);
   const milesSeqRef = useRef(0);
   // The form as it is now, for work that finishes after the CSR may have typed more.
@@ -546,9 +565,11 @@ export function QuoteRequest({
   useEffect(() => {
     if (autoStartedRef.current) return;
     autoStartedRef.current = true;
-    void lookUpFuel(form);
-    // Both only set state once their fetch answers, never synchronously here.
+    // With the fuel surcharge already assigned, pricing waits only for the miles (if any).
+    // The lookups only set state once their fetch answers, never synchronously here.
+    if (detection.fuel) void Promise.resolve().then(() => settleAuto("fuel", formRef.current));
     // eslint-disable-next-line react-hooks/set-state-in-effect
+    else void lookUpFuel(form);
     if (milesLookup.status === "loading") void lookUpMiles(form, true);
     // Runs once for the email this card was opened for.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -693,8 +714,13 @@ export function QuoteRequest({
     form.fuelBasis === fuelSuggested.entry.basis
       ? fuelSuggested
       : null;
-  const fuelFromXcelerator = fuelInUse?.fromXcelerator ? fuelInUse.entry : null;
-  const fuelFromDefault = fuelInUse && !fuelInUse.fromXcelerator ? fuelInUse.entry : null;
+  // A surcharge the email (or its thread or documents) states wins while the field still holds it.
+  const fuelStatedIn = detection.fieldSources?.fuelPercent ?? "the email";
+  const fuelFromEmail =
+    fields.fuelPercent !== null && form.fuelPercent.trim() !== "" && Number(form.fuelPercent) === fields.fuelPercent;
+  const basisFromEmail = fuelFromEmail && fields.fuelBasis !== null && form.fuelBasis === fields.fuelBasis;
+  const fuelFromXcelerator = !fuelFromEmail && fuelInUse?.fromXcelerator ? fuelInUse.entry : null;
+  const fuelFromDefault = !fuelFromEmail && fuelInUse && !fuelInUse.fromXcelerator ? fuelInUse.entry : null;
   // Why the default is used rather than Xcelerator's.
   const fuelDefaultWhy =
     fuel.status === "loading"
@@ -716,6 +742,9 @@ export function QuoteRequest({
     form.weightAuto &&
       `Weight: about ${Number(form.weight).toLocaleString("en-US")} lb${estimates.weightReason ? ` (${estimates.weightReason})` : ""}`,
     capacityText,
+    fuelFromEmail &&
+      form.fuelBasis &&
+      `Fuel surcharge: ${fields.fuelPercent}%${fields.fuelPercent === 0 ? " (waived)" : ""}, stated in ${fuelStatedIn}, on ${basisText(form.fuelBasis)}${basisFromEmail ? "" : " (as Xcelerator applies it)"}`,
     fuelFromXcelerator &&
       `Fuel surcharge: ${fuelFromXcelerator.percent}% of ${basisText(fuelFromXcelerator.basis)}, Xcelerator's current "${fuelFromXcelerator.name}" for a ${vehicleName}`,
     fuelFromDefault &&
@@ -725,8 +754,9 @@ export function QuoteRequest({
     form.deliveryAuto &&
       `Delivery by: ${durationText(deliveryMinutes)} after pickup (${form.driveMinutes !== null ? `the ${durationText(form.driveMinutes)} drive plus an hour` : "at least two hours"})`,
   ].filter((v): v is string => Boolean(v));
-  const fuelHint =
-    fuel.status === "loading"
+  const fuelHint = fuelFromEmail
+    ? `Stated in ${fuelStatedIn}`
+    : fuel.status === "loading"
       ? "Getting the current one from Xcelerator…"
       : fuelFromXcelerator
         ? `From Xcelerator ("${fuelFromXcelerator.name}")`
@@ -966,11 +996,13 @@ export function QuoteRequest({
           <Labeled
             label="Fuel surcharge on"
             hint={
-              fuelFromXcelerator
-                ? "As Xcelerator applies it"
-                : fuelFromDefault
-                  ? "As Xcelerator applies it (default)"
-                  : undefined
+              basisFromEmail
+                ? `Stated in ${fuelStatedIn}`
+                : fuelFromXcelerator || (fuelFromEmail && fuel.status === "ready")
+                  ? "As Xcelerator applies it"
+                  : fuelFromDefault || fuelFromEmail
+                    ? "As Xcelerator applies it (default)"
+                    : undefined
             }
           >
             <select

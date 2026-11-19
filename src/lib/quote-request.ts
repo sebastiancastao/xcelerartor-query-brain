@@ -59,6 +59,8 @@ const EMPTY_FIELDS: QuoteRequestFields = {
   airportRecoveryAttempts: null,
   helperHours: null,
   needsHelper: false,
+  fuelPercent: null,
+  fuelBasis: null,
 };
 
 const NOT_A_QUOTE: QuoteRequestDetection = {
@@ -95,13 +97,15 @@ const DETECT_PROMPT = [
   "pickupWaitMinutes and deliveryWaitMinutes: how long the driver is expected to wait at pickup and at delivery, in minutes, when the email says (for example 'wait while they process the samples, about 45 minutes', or 'wait and bring the cooler back' with a stated time); null when not stated. Do not include the drive. Put a wait only at the end where it happens (waiting at the place the shipment is delivered to is deliveryWaitMinutes) and never copy one wait to both ends.",
   "additionalDeliveryAttempts: delivery attempts beyond the first that the email asks to be priced; airportRecoveryAttempts: airport recovery attempts beyond the first; null when not stated.",
   "needsHelper: true when the email asks for a second person, a helper, a two-man team or team drivers, else false. helperHours: the hours that person is needed, when stated, else null.",
+  "fuelPercent: a fuel surcharge percentage (FSC) the email states should apply, such as 'FSC 18%' or 'our contract fuel surcharge is 15%', as a number (18 for 18%); 0 when it says there is no fuel surcharge or it is waived; null when it says nothing about one. 'Fuel included' or 'all-in price' alone is not a percentage: null.",
+  "fuelBasis: what the stated fuel surcharge applies to: \"transport\" for the transport, linehaul, base or mileage charge only, \"subtotal\" for the total or all charges; null when not stated or fuelPercent is null.",
   "summary: one short sentence saying what the customer wants priced, in English.",
   "estimates: your own judgment about the load where the email gives no figure, so the shipment can be priced. Separate from fields, which stay exactly what the email states.",
   "estimates.weight: when the email gives no weight, the total pounds estimated from the items it describes, using typical weights: an envelope or document 1 lb, a specimen box, cooler or tote 10 lb, a standard carton 25 lb, a loaded pallet 500 lb; multiply by the number of pieces. When the email does not describe the load at all, 10 (a typical medical courier package). null when the email states the weight.",
   "estimates.weightReason: a few words saying how, such as '3 cartons at about 25 lb' or 'no load details, typical package'.",
   "estimates.truckItem: when an item described is too big for a cargo van and needs a truck (furniture, a hospital bed, large equipment or machinery), a few words naming it, such as 'hospital bed'; else null. Boxes, coolers, totes and pallets are never a truckItem.",
   "sources: for every field you filled (not null, not []), where its value came from: \"email\" for the newest email, \"thread\" for an earlier message, or the file name of the document it came from, exactly as given with that document.",
-  'Respond with JSON only: {"isQuoteRequest": true or false, "summary": "...", "fields": {"vehicleClass": ..., "miles": ..., "weight": ..., "pieces": ..., "pallets": ..., "pickupAddress": ..., "deliveryAddress": ..., "pickupStart": ..., "deliveryEnd": ..., "trip": ..., "extras": [...], "dryIcePounds": ..., "pickupWaitMinutes": ..., "deliveryWaitMinutes": ..., "additionalDeliveryAttempts": ..., "airportRecoveryAttempts": ..., "needsHelper": ..., "helperHours": ...}, "estimates": {"weight": ..., "weightReason": ..., "truckItem": ...}, "sources": {"<field>": "email" or "thread" or "<file name>", ...}}.',
+  'Respond with JSON only: {"isQuoteRequest": true or false, "summary": "...", "fields": {"vehicleClass": ..., "miles": ..., "weight": ..., "pieces": ..., "pallets": ..., "pickupAddress": ..., "deliveryAddress": ..., "pickupStart": ..., "deliveryEnd": ..., "trip": ..., "extras": [...], "dryIcePounds": ..., "pickupWaitMinutes": ..., "deliveryWaitMinutes": ..., "additionalDeliveryAttempts": ..., "airportRecoveryAttempts": ..., "needsHelper": ..., "helperHours": ..., "fuelPercent": ..., "fuelBasis": ...}, "estimates": {"weight": ..., "weightReason": ..., "truckItem": ...}, "sources": {"<field>": "email" or "thread" or "<file name>", ...}}.',
 ].join(" ");
 
 function positiveNumber(value: unknown): number | null {
@@ -141,7 +145,22 @@ function readFields(value: unknown): QuoteRequestFields {
     airportRecoveryAttempts: bounded(f.airportRecoveryAttempts, 10),
     helperHours: bounded(f.helperHours, 168),
     needsHelper: f.needsHelper === true || positiveNumber(f.helperHours) !== null,
+    ...readFuelFields(f.fuelPercent, f.fuelBasis),
   };
+}
+
+/** The fuel surcharge the model read: a percentage from 0 to 100 (0 = waived), and its basis only with one. */
+function readFuelFields(percent: unknown, basis: unknown): Pick<QuoteRequestFields, "fuelPercent" | "fuelBasis"> {
+  const n = typeof percent === "number" && Number.isFinite(percent) && percent >= 0 && percent <= 100 ? percent : null;
+  return {
+    fuelPercent: n === null ? null : Math.round(n * 1000) / 1000,
+    fuelBasis: n !== null && (basis === "transport" || basis === "subtotal") ? basis : null,
+  };
+}
+
+/** Whether the email could be a quote request at all (the cheap check run before any model call). */
+export function mightBeQuoteRequest(email: InquiryEmail, thread: ThreadMessage[] = []): boolean {
+  return PRICE_WORDS.test([email.subject, email.body, ...thread.map((m) => m.text)].join("\n"));
 }
 
 /** A positive count or duration no larger than `max`, rounded to whole units except hours. */
@@ -222,6 +241,8 @@ function matchDocument(said: string, documentNames: string[]): string | null {
 /** Text to look for in the emails to check where a value came from; null for values that can't be checked that way. */
 function needlesFor(field: QuoteField, fields: QuoteRequestFields): RegExp[] | null {
   const value = fields[field];
+  // A waived fuel surcharge is read from words, not a "0" in the text.
+  if (field === "fuelPercent" && value === 0) return null;
   if (typeof value === "number") {
     const plain = String(value);
     const grouped = value.toLocaleString("en-US");

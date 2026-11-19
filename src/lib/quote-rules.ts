@@ -2,7 +2,7 @@
 // no AI. Used to fill whatever the AI left empty, and on its own when OpenAI
 // is unavailable. Only what the email states is taken; nothing is estimated.
 
-import type { QuoteExtra, QuoteRequestFields, Trip, VehicleClass } from "./quote-types";
+import type { FuelBasis, QuoteExtra, QuoteRequestFields, Trip, VehicleClass } from "./quote-types";
 
 const LB_PER_KG = 2.20462;
 const MILES_PER_KM = 0.621371;
@@ -247,6 +247,33 @@ function readHelper(text: string): { needsHelper: boolean; helperHours: number |
   return { needsHelper, helperHours: helperHours && helperHours > 0 && helperHours <= 168 ? helperHours : null };
 }
 
+const FUEL_WORD = String.raw`(?:fuel(?:\s+surcharge)?|fsc|recargo\s+(?:de|por)\s+combustible)`;
+
+/**
+ * A fuel surcharge the email states ("FSC 18%", "18% fuel surcharge", "fuel
+ * surcharge waived" → 0) and what it applies to when it says ("on the total"
+ * → subtotal, "on linehaul" → transport).
+ */
+export function readFuel(text: string): { fuelPercent: number | null; fuelBasis: FuelBasis | null } {
+  const stated =
+    new RegExp(String.raw`\b${FUEL_WORD}\b[^%\n.]{0,25}?(\d{1,2}(?:\.\d{1,3})?)\s*%`, "i").exec(text) ??
+    new RegExp(String.raw`(\d{1,2}(?:\.\d{1,3})?)\s*%\s*(?:of\s+)?${FUEL_WORD}\b`, "i").exec(text);
+  const waived =
+    new RegExp(String.raw`\b(?:no|waive[ds]?|without|sin)\s+(?:the\s+|any\s+)?${FUEL_WORD}\b`, "i").exec(text) ??
+    new RegExp(String.raw`\b${FUEL_WORD}\s+(?:is\s+|will\s+be\s+)?waived\b`, "i").exec(text);
+  const match = stated ?? waived;
+  if (!match) return { fuelPercent: null, fuelBasis: null };
+  const fuelPercent = stated ? Number(stated[1]) : 0;
+  if (!(fuelPercent >= 0 && fuelPercent <= 100)) return { fuelPercent: null, fuelBasis: null };
+  const around = text.slice(Math.max(0, match.index - 30), match.index + match[0].length + 60);
+  const fuelBasis = /\b(?:total|all\s+charges|entire|whole\s+(?:invoice|bill)|subtotal|accessorials)\b/i.test(around)
+    ? "subtotal"
+    : /\b(?:line\s*-?\s*haul|transport(?:ation)?|base\s+(?:rate|charge)|freight\s+charge|mileage)\b/i.test(around)
+      ? "transport"
+      : null;
+  return { fuelPercent, fuelBasis };
+}
+
 /** Shipment details the email states, read by text rules alone. Times are left to the AI or the CSR. */
 export function readQuoteFieldsByRules(subject: string, body: string): QuoteRequestFields {
   const text = `${subject}\n${newestMessage(body)}`;
@@ -267,6 +294,7 @@ export function readQuoteFieldsByRules(subject: string, body: string): QuoteRequ
     additionalDeliveryAttempts: null,
     airportRecoveryAttempts: null,
     ...readHelper(text),
+    ...readFuel(text),
   };
 }
 
@@ -291,5 +319,8 @@ export function fillGaps(ai: QuoteRequestFields, rules: QuoteRequestFields): Quo
     airportRecoveryAttempts: ai.airportRecoveryAttempts ?? rules.airportRecoveryAttempts,
     helperHours: ai.helperHours ?? rules.helperHours,
     needsHelper: ai.needsHelper || rules.needsHelper,
+    fuelPercent: ai.fuelPercent ?? rules.fuelPercent,
+    // A basis only goes with the percentage it was stated with.
+    fuelBasis: ai.fuelPercent !== null ? ai.fuelBasis : rules.fuelBasis,
   };
 }

@@ -31,6 +31,8 @@ import {
   VEHICLE_LABELS,
   formatCents,
   type FuelBasis,
+  type FuelSurchargeEntry,
+  type FuelSurchargeTable,
   type QuoteInputs,
   type QuoteResult,
   type VehicleClass,
@@ -308,20 +310,8 @@ function chargeFields(quote: QuoteResult) {
 // trucks, both a percentage of the order charge only, which is where the
 // rate sheet's transport lines are saved (see chargeFields).
 
-export type XceleratorFuelSurcharge = {
-  percent: number;
-  basis: FuelBasis;
-  /** Xcelerator's name for it, e.g. "Gas Srch". */
-  name: string;
-};
-
-export type XceleratorFuelSurcharges = {
-  /** The account it was read from. */
-  accountNo: string;
-  /** Whether that is the sender's own account, rather than any account (the surcharges are company-wide). */
-  sendersAccount: boolean;
-  byVehicle: Partial<Record<VehicleClass, XceleratorFuelSurcharge>>;
-};
+export type XceleratorFuelSurcharge = FuelSurchargeEntry;
+export type XceleratorFuelSurcharges = FuelSurchargeTable;
 
 const FUEL_NAME = /fuel|gas|diesel|fsc/i;
 // ChargePayPercentageOptionsCSV starts with one flag per charge field the percentage is taken of, in this order.

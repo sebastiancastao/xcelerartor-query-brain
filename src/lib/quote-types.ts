@@ -115,6 +115,10 @@ export type QuoteRequestFields = {
   helperHours: number | null;
   /** The email asks for a second person, helper, two-man team or team drivers. */
   needsHelper: boolean;
+  /** A fuel surcharge % the email states (0 when it says there is none or it is waived). */
+  fuelPercent: number | null;
+  /** What the email says the fuel surcharge applies to. */
+  fuelBasis: FuelBasis | null;
 };
 
 /**
@@ -154,6 +158,8 @@ export const QUOTE_FIELD_LABELS: Record<QuoteField, string> = {
   airportRecoveryAttempts: "Airport recovery attempts",
   helperHours: "Helper hours",
   needsHelper: "Second person",
+  fuelPercent: "Fuel surcharge %",
+  fuelBasis: "Fuel surcharge on",
 };
 
 /** An earlier message of the open email's thread, as plain text with its quoted history cut off. */
@@ -182,6 +188,27 @@ export type QuoteRequestDetection = {
   read?: QuoteSourcesRead;
   /** Set when the AI could not read the email, so the fields are empty for that reason, not because the email lacks them. */
   unreadReason?: string;
+  /** The fuel surcharge to assign when the email states none, looked up with the reading. */
+  fuel?: QuoteFuelAssignment;
+};
+
+/** Fuel surcharges by vehicle, as read from one Xcelerator account. */
+export type FuelSurchargeTable = {
+  /** The account it was read from. */
+  accountNo: string;
+  /** Whether that is the sender's own account, rather than any account (the surcharges are company-wide). */
+  sendersAccount: boolean;
+  byVehicle: Partial<Record<VehicleClass, FuelSurchargeEntry>>;
+};
+
+/** What the quote card assigns as the fuel surcharge when the email doesn't state it. */
+export type QuoteFuelAssignment = {
+  /** Xcelerator's current surcharges, when they could be read. */
+  xcelerator: FuelSurchargeTable | null;
+  /** Used for a vehicle Xcelerator has none for, or when it couldn't be read. */
+  defaults: FuelSurchargeDefaults;
+  /** Why Xcelerator's weren't read, when they weren't. */
+  unavailable: string | null;
 };
 
 /**

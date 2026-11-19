@@ -3,7 +3,44 @@ import {
   VEHICLE_CLASSES,
   type FuelBasis,
   type FuelSurchargeDefaults,
+  type QuoteFuelAssignment,
 } from "./quote-types";
+import { currentFuelSurcharges, isXceleratorQuoteConfigured } from "./xcelerator-quote";
+
+/** Longest the quote reading waits for Xcelerator's surcharges before using the defaults. */
+const XCELERATOR_WAIT_MS = 15_000;
+
+/**
+ * The fuel surcharge a quote is given when the email states none: Xcelerator's
+ * current one for each vehicle (from the sender's account, else any account),
+ * with the defaults for any vehicle it has none for. Never throws.
+ */
+export async function fuelAssignmentFor(
+  senderEmail: string,
+  places: (string | null)[],
+  day: string = new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" }),
+): Promise<QuoteFuelAssignment> {
+  const defaults = fuelSurchargeDefaults();
+  if (!isXceleratorQuoteConfigured()) {
+    return { xcelerator: null, defaults, unavailable: "Xcelerator's back office isn't connected" };
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const table = await Promise.race([
+      currentFuelSurcharges(senderEmail, places, day),
+      new Promise<"timeout">((resolve) => {
+        timer = setTimeout(() => resolve("timeout"), XCELERATOR_WAIT_MS);
+      }),
+    ]);
+    if (table === "timeout") return { xcelerator: null, defaults, unavailable: "Xcelerator took too long to answer" };
+    return { xcelerator: table, defaults, unavailable: table ? null : "Xcelerator has no fuel surcharge set up" };
+  } catch (err) {
+    console.error("Fuel surcharge lookup failed:", err);
+    return { xcelerator: null, defaults, unavailable: "Couldn't read the fuel surcharge from Xcelerator" };
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 function percentFromEnv(name: string): number | null {
   const raw = process.env[name]?.trim();

@@ -9,8 +9,10 @@ import {
 } from "@/lib/email-documents";
 import { isMissiveConfigured } from "@/lib/missive";
 import { extractUuid } from "@/lib/missive-id";
-import { detectQuoteRequest } from "@/lib/quote-request";
-import type { QuoteRequestDetection, ThreadMessage } from "@/lib/quote-types";
+import { fuelAssignmentFor } from "@/lib/fuel-defaults";
+import { detectQuoteRequest, mightBeQuoteRequest } from "@/lib/quote-request";
+import { readQuoteFieldsByRules } from "@/lib/quote-rules";
+import type { QuoteFuelAssignment, QuoteRequestDetection, ThreadMessage } from "@/lib/quote-types";
 
 // Says whether the email open in Missive asks for a price quote, and what
 // shipment details it gives, in two steps so ordinary emails stay quick:
@@ -109,6 +111,18 @@ export async function POST(request: Request) {
   }
   thread = notQuotedIn(email, thread ?? []);
 
+  // The fuel surcharge to assign is looked up beside the reading (it is kept
+  // for an hour), so the card opens with it filled in. Only for emails that
+  // could be quote requests: it reserves and releases an order number.
+  const fuel: Promise<QuoteFuelAssignment | undefined> = mightBeQuoteRequest(email, thread)
+    ? (() => {
+        const places = readQuoteFieldsByRules(email.subject, email.body);
+        return fuelAssignmentFor(email.from, [places.pickupAddress, places.deliveryAddress]);
+      })()
+    : Promise.resolve(undefined);
+  const withFuel = async (detection: QuoteRequestDetection): Promise<QuoteRequestDetection> =>
+    detection.isQuoteRequest ? { ...detection, fuel: await fuel } : detection;
+
   try {
     if (!withDocuments) {
       // The document names are listed beside the reading, from the listing the thread came from.
@@ -118,7 +132,10 @@ export async function POST(request: Request) {
             return null;
           })
         : Promise.resolve(null);
-      const [detection, documents] = await Promise.all([detectQuoteRequest(email, { thread, documents: [] }), names]);
+      const [detection, documents] = await Promise.all([
+        detectQuoteRequest(email, { thread, documents: [] }).then(withFuel),
+        names,
+      ]);
       return NextResponse.json({
         detection: {
           ...detection,
@@ -143,7 +160,9 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: unavailableReason(error) }, { status: 502 });
     }
 
-    const detection = await detectQuoteRequest(email, { thread, documents: documents.read }, { rulesFallback: false });
+    const detection = await withFuel(
+      await detectQuoteRequest(email, { thread, documents: documents.read }, { rulesFallback: false }),
+    );
     const result: QuoteRequestDetection = {
       ...detection,
       read: {
