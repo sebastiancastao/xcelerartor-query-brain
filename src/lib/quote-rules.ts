@@ -214,7 +214,37 @@ function readExtras(text: string): QuoteExtra[] {
   if (/\b(?:lift\s*gate|liftgate)\b/i.test(text)) extras.push("liftGate");
   if (/\bpallet\s*jack\b/i.test(text)) extras.push("palletJack");
   if (/\bhold\s*(?:it\s+)?over\b/i.test(text)) extras.push("holdOver");
+  if (/\b(?:pick\s*up|bring|get|buy|purchase)\b[^.\n]{0,25}\bdry\s*ice\b/i.test(text)) extras.push("dryIcePickup");
+  if (/\b(?:second|2nd|two|2)\s+(?:airline\s+)?counters?\b|\b(?:two|2)\s+airlines\b/i.test(text)) extras.push("secondAirlineCounter");
+  if (/\bfax(?:ed|ing)?\b[^.\n]{0,40}\b(?:mawb|awb|paperwork|documents?)\b|\b(?:mawb|awb|paperwork)\b[^.\n]{0,40}\bfax/i.test(text)) {
+    extras.push("paperworkFaxed");
+  }
   return extras;
+}
+
+/** Minutes the driver is told to wait, at pickup or at delivery (delivery when the email doesn't say which). */
+function readWait(text: string): { pickupWaitMinutes: number | null; deliveryWaitMinutes: number | null } {
+  const out = { pickupWaitMinutes: null as number | null, deliveryWaitMinutes: null as number | null };
+  const pattern = /\bwait(?:ing|\s+time)?\b[^.\n]{0,30}?(\d+(?:\.\d+)?)\s*(minutes?|mins?|hours?|hrs?)\b/gi;
+  for (const m of text.matchAll(pattern)) {
+    const minutes = Math.round(Number(m[1]) * (/^h/i.test(m[2]) ? 60 : 1));
+    if (!(minutes > 0 && minutes <= 1440)) continue;
+    const around = text.slice(Math.max(0, m.index - 40), m.index + m[0].length + 40);
+    const atPickup = /\b(?:pick\s*-?\s*up|origin|shipper)\b/i.test(around) && !/\b(?:deliver|destination|drop|consignee)/i.test(around);
+    const key = atPickup ? "pickupWaitMinutes" : "deliveryWaitMinutes";
+    out[key] ??= minutes;
+  }
+  return out;
+}
+
+/** Whether a second person is asked for, and for how many hours when the email says. */
+function readHelper(text: string): { needsHelper: boolean; helperHours: number | null } {
+  const needsHelper = /\b(?:two|2)[-\s]?man\b|\bhelpers?\b|\bsecond\s+person\b|\bextra\s+person\b|\bteam\s+drivers?\b/i.test(text);
+  const hours =
+    /(\d+(?:\.\d+)?)\s*(?:hours?|hrs?)\b[^.\n]{0,25}\b(?:helper|second\s+person)/i.exec(text) ??
+    /\b(?:helper|second\s+person)\b[^.\n]{0,25}?(\d+(?:\.\d+)?)\s*(?:hours?|hrs?)\b/i.exec(text);
+  const helperHours = needsHelper && hours ? Number(hours[1]) : null;
+  return { needsHelper, helperHours: helperHours && helperHours > 0 && helperHours <= 168 ? helperHours : null };
 }
 
 /** Shipment details the email states, read by text rules alone. Times are left to the AI or the CSR. */
@@ -233,6 +263,10 @@ export function readQuoteFieldsByRules(subject: string, body: string): QuoteRequ
     trip: readTrip(text),
     extras: readExtras(text),
     dryIcePounds: readDryIce(text),
+    ...readWait(text),
+    additionalDeliveryAttempts: null,
+    airportRecoveryAttempts: null,
+    ...readHelper(text),
   };
 }
 
@@ -251,5 +285,11 @@ export function fillGaps(ai: QuoteRequestFields, rules: QuoteRequestFields): Quo
     trip: ai.trip ?? rules.trip,
     extras: ai.extras.length > 0 ? ai.extras : rules.extras,
     dryIcePounds: ai.dryIcePounds ?? rules.dryIcePounds,
+    pickupWaitMinutes: ai.pickupWaitMinutes ?? rules.pickupWaitMinutes,
+    deliveryWaitMinutes: ai.deliveryWaitMinutes ?? rules.deliveryWaitMinutes,
+    additionalDeliveryAttempts: ai.additionalDeliveryAttempts ?? rules.additionalDeliveryAttempts,
+    airportRecoveryAttempts: ai.airportRecoveryAttempts ?? rules.airportRecoveryAttempts,
+    helperHours: ai.helperHours ?? rules.helperHours,
+    needsHelper: ai.needsHelper || rules.needsHelper,
   };
 }

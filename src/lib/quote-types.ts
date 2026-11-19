@@ -12,6 +12,14 @@ export const VEHICLE_LABELS: Record<VehicleClass, string> = {
   "box-truck": "Box truck",
 };
 
+/** What the rate sheet assumes for each vehicle, and the waiting and weight it includes. */
+export const VEHICLE_SHEET_NOTES: Record<VehicleClass, string> = {
+  "small-package": "Passenger-class vehicle · 15 min free wait each end · 100 lb included",
+  "cargo-van": "½ ton and up cargo van · 15 min free wait each end · 100 lb included",
+  "cube-sprinter": "15′ cube van or Sprinter · 15 min free wait each end · 100 lb included",
+  "box-truck": "24′–26′ single-axle truck · 60 min free wait each end · 2,000 lb included, 9,000 lb max",
+};
+
 export const TRIPS = ["one-way", "roundtrip", "return"] as const;
 export type Trip = (typeof TRIPS)[number];
 
@@ -69,6 +77,18 @@ export type QuoteRequestFields = {
   trip: Trip | null;
   extras: QuoteExtra[];
   dryIcePounds: number | null;
+  /** Minutes the driver is expected to wait at pickup, only when the email says. */
+  pickupWaitMinutes: number | null;
+  /** Minutes the driver is expected to wait at delivery, only when the email says. */
+  deliveryWaitMinutes: number | null;
+  /** Full delivery attempts beyond the first that the email asks for. */
+  additionalDeliveryAttempts: number | null;
+  /** Airport recovery attempts beyond the first that the email asks for. */
+  airportRecoveryAttempts: number | null;
+  /** Hours of a second person (helper or team driver), when the email gives them. */
+  helperHours: number | null;
+  /** The email asks for a second person, helper, two-man team or team drivers. */
+  needsHelper: boolean;
 };
 
 /**
@@ -102,6 +122,12 @@ export const QUOTE_FIELD_LABELS: Record<QuoteField, string> = {
   trip: "Trip",
   extras: "Extras",
   dryIcePounds: "Dry ice",
+  pickupWaitMinutes: "Wait at pickup",
+  deliveryWaitMinutes: "Wait at delivery",
+  additionalDeliveryAttempts: "Extra delivery attempts",
+  airportRecoveryAttempts: "Airport recovery attempts",
+  helperHours: "Helper hours",
+  needsHelper: "Second person",
 };
 
 /** An earlier message of the open email's thread, as plain text with its quoted history cut off. */
@@ -157,6 +183,8 @@ export type LoadForSizing = {
   pallets: number | null;
   truckItem: string | null;
   extras: QuoteExtra[];
+  /** A second person is asked for; the sheet offers helpers with box trucks only. */
+  helper: boolean;
 };
 
 /**
@@ -189,6 +217,7 @@ export function pickVehicle(load: LoadForSizing): { vehicleClass: VehicleClass; 
   if (load.extras.some((extra) => BOX_TRUCK_ONLY_EXTRAS.includes(extra))) {
     atLeast("box-truck", "lift gate or pallet jack asked for, box truck only");
   }
+  if (load.helper) atLeast("box-truck", "second person asked for, box truck only on the sheet");
   return pick;
 }
 
@@ -208,6 +237,13 @@ export type QuoteInputs = {
   trip: Trip;
   extras: QuoteExtra[];
   dryIcePounds: number;
+  pickupWaitMinutes: number;
+  deliveryWaitMinutes: number;
+  additionalDeliveryAttempts: number;
+  airportRecoveryAttempts: number;
+  helperHours: number;
+  /** The agreed hourly rate for a second person in dollars; the sheet prices helpers by quote only. */
+  helperHourlyRate: number | null;
 };
 
 export type QuoteCharge = { description: string; quantity: number; rateCents: number };

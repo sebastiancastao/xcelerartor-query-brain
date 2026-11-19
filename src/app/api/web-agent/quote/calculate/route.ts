@@ -1,36 +1,7 @@
 import { NextResponse } from "next/server";
 import type { InquiryEmail } from "@/lib/agent";
-import { QuoteEngineError, calculateQuote } from "@/lib/quote-engine";
+import { QuoteEngineError, calculateQuote, readQuoteInputs } from "@/lib/quote-engine";
 import { draftQuoteReply } from "@/lib/quote-request";
-import { QUOTE_EXTRAS, TRIPS, VEHICLE_CLASSES, type QuoteInputs } from "@/lib/quote-types";
-
-function finite(value: unknown): value is number {
-  return typeof value === "number" && Number.isFinite(value);
-}
-
-/** The quote inputs as the page sent them. The rate sheet checks ranges; this only checks the shape. */
-function readInputs(value: unknown): QuoteInputs | null {
-  if (!value || typeof value !== "object") return null;
-  const v = value as Record<string, unknown>;
-  if (!VEHICLE_CLASSES.includes(v.vehicleClass as QuoteInputs["vehicleClass"])) return null;
-  if (!TRIPS.includes(v.trip as QuoteInputs["trip"])) return null;
-  if (!finite(v.miles) || !finite(v.weight) || !finite(v.fuelPercent)) return null;
-  if (v.fuelBasis !== "transport" && v.fuelBasis !== "subtotal") return null;
-  if (typeof v.pickupStart !== "string" || typeof v.deliveryEnd !== "string") return null;
-  return {
-    vehicleClass: v.vehicleClass as QuoteInputs["vehicleClass"],
-    miles: v.miles,
-    weight: v.weight,
-    vehicleCapacityLb: finite(v.vehicleCapacityLb) ? v.vehicleCapacityLb : null,
-    pickupStart: v.pickupStart,
-    deliveryEnd: v.deliveryEnd,
-    fuelPercent: v.fuelPercent,
-    fuelBasis: v.fuelBasis,
-    trip: v.trip as QuoteInputs["trip"],
-    extras: Array.isArray(v.extras) ? QUOTE_EXTRAS.filter((extra) => (v.extras as unknown[]).includes(extra)) : [],
-    dryIcePounds: finite(v.dryIcePounds) ? v.dryIcePounds : 0,
-  };
-}
 
 function readEmail(value: unknown): InquiryEmail | null {
   if (!value || typeof value !== "object") return null;
@@ -54,7 +25,7 @@ function address(value: unknown): string | null {
  */
 export async function POST(request: Request) {
   const body = await request.json().catch(() => null);
-  const inputs = readInputs(body?.inputs);
+  const inputs = readQuoteInputs(body?.inputs);
   if (!inputs) return NextResponse.json({ error: "Fill in the quote details first." }, { status: 400 });
 
   try {

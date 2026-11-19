@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import type { InquiryEmail } from "@/lib/agent";
 import { insertIntoMissiveReply, openLinkInNewTab } from "@/components/MissiveEmailSense";
+import { XceleratorQuoteSave } from "@/components/XceleratorQuoteSave";
 import {
   BOX_TRUCK_ONLY_EXTRAS,
   QUOTE_EXTRAS,
@@ -14,6 +15,7 @@ import {
   VEHICLE_CAPACITY_LB,
   VEHICLE_CLASSES,
   VEHICLE_LABELS,
+  VEHICLE_SHEET_NOTES,
   assumedDeliveryEnd,
   formatCents,
   pickVehicle,
@@ -29,6 +31,7 @@ import {
   type Trip,
   type VehicleClass,
 } from "@/lib/quote-types";
+import type { XceleratorFuelSurcharges } from "@/lib/xcelerator-quote";
 
 type Form = {
   pickupAddress: string;
@@ -44,10 +47,22 @@ type Form = {
   trip: Trip;
   extras: QuoteExtra[];
   dryIcePounds: string;
+  pickupWait: string;
+  deliveryWait: string;
+  deliveryAttempts: string;
+  recoveryAttempts: string;
+  /** A second person (helper or team driver); the sheet prices it by quote only, box truck only. */
+  helper: boolean;
+  helperHours: string;
+  helperRate: string;
   // Which values were worked out rather than stated by the email or typed by
   // the CSR; worked-out ones follow the inputs they depend on.
   /** Picked by the sizing rules; re-picked when the weight changes. */
   vehicleAuto: boolean;
+  /** The vehicle's standard (or saved) capacity, not typed on this card; follows the vehicle. */
+  capacityAuto: boolean;
+  /** Not typed on this card: Xcelerator's current fuel surcharge for the vehicle, once read; follows the vehicle. */
+  fuelAuto: boolean;
   /** The AI's estimate from the items the email describes. */
   weightAuto: boolean;
   pickupAuto: boolean;
@@ -61,7 +76,16 @@ type CalcState =
   | { status: "idle" }
   | { status: "loading" }
   | { status: "error"; message: string }
-  | { status: "ready"; quote: QuoteResult; reply: string };
+  | {
+      status: "ready";
+      quote: QuoteResult;
+      reply: string;
+      /** What it was priced with, so a save to Xcelerator stores exactly this quote. */
+      inputs: QuoteInputs;
+      pickupAddress: string | null;
+      deliveryAddress: string | null;
+      seq: number;
+    };
 
 type MilesState =
   | { status: "idle" }
@@ -71,9 +95,16 @@ type MilesState =
 
 type InsertState = { status: "idle" } | { status: "inserting" } | { status: "inserted" } | { status: "error"; message: string };
 
-// The fuel surcharge is not on the rate sheet and rarely changes, so the last
-// value a CSR used is kept in this browser, as is a capacity they entered that
-// differs from the standard one for the vehicle.
+type FuelState =
+  | { status: "loading" }
+  | { status: "ready"; table: XceleratorFuelSurcharges }
+  /** Xcelerator has none, isn't connected, or didn't answer: the CSR's last values are used. */
+  | { status: "unavailable"; message: string };
+
+// The fuel surcharge is not on the rate sheet; it comes from Xcelerator, and
+// the last value a CSR used is kept in this browser for when Xcelerator can't
+// be read. A capacity a CSR entered that differs from the standard one for the
+// vehicle is kept too.
 type SavedDefaults = { fuelPercent?: string; fuelBasis?: FuelBasis; capacity?: Partial<Record<VehicleClass, string>> };
 const DEFAULTS_KEY = "web-agent.quote-defaults";
 
@@ -128,6 +159,13 @@ function buildInputs(form: Form): { inputs: QuoteInputs } | { missing: string[] 
   if (!form.deliveryEnd) missing.push("delivery by");
   if (fuelPercent === null) missing.push("fuel surcharge %");
   if (!form.fuelBasis) missing.push("fuel surcharge basis");
+  const helperHours = form.helper ? num(form.helperHours) : 0;
+  const helperRate = form.helper ? num(form.helperRate) : null;
+  if (form.helper) {
+    if (!boxTruck) missing.push("a box truck (the sheet offers a second person with box trucks only)");
+    if (!helperHours) missing.push("helper hours");
+    if (!helperRate) missing.push("helper hourly rate (priced by quote)");
+  }
   if (
     missing.length > 0 ||
     !form.vehicleClass ||
@@ -151,6 +189,12 @@ function buildInputs(form: Form): { inputs: QuoteInputs } | { missing: string[] 
       trip: form.trip,
       extras: form.extras.filter((extra) => boxTruck || !BOX_TRUCK_ONLY_EXTRAS.includes(extra)),
       dryIcePounds: num(form.dryIcePounds) ?? 0,
+      pickupWaitMinutes: num(form.pickupWait) ?? 0,
+      deliveryWaitMinutes: num(form.deliveryWait) ?? 0,
+      additionalDeliveryAttempts: Math.round(num(form.deliveryAttempts) ?? 0),
+      airportRecoveryAttempts: Math.round(num(form.recoveryAttempts) ?? 0),
+      helperHours: helperHours ?? 0,
+      helperHourlyRate: helperRate,
     },
   };
 }
@@ -166,9 +210,10 @@ function initialForm(detection: QuoteRequestDetection): Form {
   const estimates = detection.estimates;
   const saved = loadDefaults();
   const weight = f.weight ?? estimates.weight;
+  const helper = f.needsHelper || f.helperHours !== null;
   const vehicleClass =
     f.vehicleClass ??
-    pickVehicle({ weight, pallets: f.pallets, truckItem: estimates.truckItem, extras: f.extras }).vehicleClass;
+    pickVehicle({ weight, pallets: f.pallets, truckItem: estimates.truckItem, extras: f.extras, helper }).vehicleClass;
   // With no time in the email the quote is priced as picked up now, and
   // delivered after the drive plus an hour; the card says so.
   const pickupStart = f.pickupStart ?? toEasternWallClock(new Date());
@@ -186,7 +231,16 @@ function initialForm(detection: QuoteRequestDetection): Form {
     trip: f.trip ?? "one-way",
     extras: f.extras,
     dryIcePounds: f.dryIcePounds?.toString() ?? "",
+    pickupWait: f.pickupWaitMinutes?.toString() ?? "",
+    deliveryWait: f.deliveryWaitMinutes?.toString() ?? "",
+    deliveryAttempts: f.additionalDeliveryAttempts?.toString() ?? "",
+    recoveryAttempts: f.airportRecoveryAttempts?.toString() ?? "",
+    helper,
+    helperHours: f.helperHours?.toString() ?? "",
+    helperRate: "",
     vehicleAuto: !f.vehicleClass,
+    capacityAuto: true,
+    fuelAuto: true,
     weightAuto: f.weight === null && estimates.weight !== null,
     pickupAuto: !f.pickupStart,
     deliveryAuto: !f.deliveryEnd,
@@ -258,12 +312,13 @@ export function QuoteReadingDocuments({
 /**
  * Shown when the email open in Missive asks for a price quote. The details
  * the email states are filled in; the route miles and drive time come from
- * Google Maps; the vehicle, its capacity, the weight and the times the email
- * leaves out are worked out by the sizing rules and the AI's estimate, and
- * listed so the CSR can check them; only the fuel surcharge is the CSR's
- * (remembered in this browser). Quote Engine's rate sheet prices it and the
- * reply with that price is drafted. No quote is saved anywhere and nothing is
- * sent: the CSR puts the reply into Missive and sends it there.
+ * Google Maps; the fuel surcharge and what it applies to come from
+ * Xcelerator's current surcharges for the vehicle; the vehicle, its
+ * capacity, the weight and the times the email leaves out are worked out by
+ * the sizing rules and the AI's estimate. All of it is listed so the CSR can
+ * check it. Quote Engine's rate sheet prices it and the reply with that price
+ * is drafted. Nothing is sent: the CSR puts the reply into Missive and sends
+ * it there.
  */
 export function QuoteRequest({
   detection,
@@ -286,12 +341,10 @@ export function QuoteRequest({
     ([field, source]) => `${QUOTE_FIELD_LABELS[field as QuoteField]} (${source})`,
   );
   const [form, setForm] = useState<Form>(() => initialForm(detection));
-  // Priced straight away when everything is filled in (the miles may still be
-  // on their way from Google Maps, which prices it once they arrive);
-  // otherwise the CSR fills the gaps and presses Calculate.
-  const [calc, setCalc] = useState<CalcState>(() =>
-    "inputs" in buildInputs(form) ? { status: "loading" } : { status: "idle" },
-  );
+  // Priced straight away once the fuel surcharge (and the miles, when they are
+  // looked up) have come back and everything is filled in; otherwise the CSR
+  // fills the gaps and presses Calculate.
+  const [calc, setCalc] = useState<CalcState>({ status: "idle" });
   const [copied, setCopied] = useState(false);
   const [insert, setInsert] = useState<InsertState>({ status: "idle" });
   // Miles are looked up straight away when the email names both places but no distance.
@@ -300,6 +353,7 @@ export function QuoteRequest({
       ? { status: "loading" }
       : { status: "idle" },
   );
+  const [fuel, setFuel] = useState<FuelState>({ status: "loading" });
   const seqRef = useRef(0);
   const milesSeqRef = useRef(0);
   // The form as it is now, for work that finishes after the CSR may have typed more.
@@ -307,6 +361,29 @@ export function QuoteRequest({
   useEffect(() => {
     formRef.current = form;
   }, [form]);
+  // The lookups the first automatic pricing waits for.
+  const autoRef = useRef({ miles: milesLookup.status === "loading", fuel: true, done: false });
+
+  /** Prices the quote once every lookup started on opening has answered, if nothing is missing. */
+  function settleAuto(which: "miles" | "fuel", next: Form) {
+    const auto = autoRef.current;
+    if (auto.done) return;
+    auto[which] = false;
+    if (auto.miles || auto.fuel) return;
+    auto.done = true;
+    if ("inputs" in buildInputs(next)) {
+      setCalc({ status: "loading" });
+      void runCalculation(next);
+    }
+  }
+
+  /** Applies a change to the form now and to `formRef`, so a lookup answering right after sees it. */
+  function applyNow(change: (prev: Form) => Form): Form {
+    const next = change(formRef.current);
+    formRef.current = next;
+    setForm(change);
+    return next;
+  }
 
   async function runCalculation(current: Form) {
     const built = buildInputs(current);
@@ -334,7 +411,15 @@ export function QuoteRequest({
         return;
       }
       saveDefaults(current);
-      setCalc({ status: "ready", quote: data.quote, reply: data.reply });
+      setCalc({
+        status: "ready",
+        quote: data.quote,
+        reply: data.reply,
+        inputs: built.inputs,
+        pickupAddress: current.pickupAddress.trim() || null,
+        deliveryAddress: current.deliveryAddress.trim() || null,
+        seq,
+      });
     } catch {
       if (seq === seqRef.current) setCalc({ status: "error", message: "Network error. Try again." });
     }
@@ -342,9 +427,9 @@ export function QuoteRequest({
 
   /**
    * Fills route miles with Google Maps' driving distance between the pickup and
-   * delivery places. `thenCalculate` prices the quote straight after, when
-   * nothing else is missing (used for the automatic lookup on opening). The
-   * caller shows the lookup as running.
+   * delivery places. `thenCalculate` is for the automatic lookup on opening:
+   * the quote is priced once it (and the fuel lookup) answer, when nothing
+   * else is missing. The caller shows the lookup as running.
    */
   async function lookUpMiles(current: Form, thenCalculate: boolean) {
     const from = current.pickupAddress.trim();
@@ -368,37 +453,88 @@ export function QuoteRequest({
       const miles = String(data.miles);
       const minutes = typeof data.minutes === "number" ? data.minutes : null;
       setMilesLookup({ status: "ready", minutes });
-      const withRoute = (prev: Form): Form => ({
+      applyNow((prev) => ({
         ...prev,
         miles,
         driveMinutes: minutes,
         deliveryEnd: prev.deliveryAuto ? assumedDeliveryEnd(prev.pickupStart, minutes) : prev.deliveryEnd,
-      });
-      setForm(withRoute);
-      const next = withRoute(formRef.current);
-      if (thenCalculate && "inputs" in buildInputs(next)) {
-        setCalc({ status: "loading" });
-        void runCalculation(next);
-      }
+      }));
     } catch {
       if (seq === milesSeqRef.current) setMilesLookup({ status: "error", message: "Network error. Try again." });
+    } finally {
+      // With or without new miles, pricing on opening goes ahead if nothing is missing.
+      if (thenCalculate) settleAuto("miles", formRef.current);
     }
+  }
+
+  /**
+   * Fills the fuel surcharge % and what it applies to with Xcelerator's
+   * current surcharge for the vehicle, unless the CSR has typed their own.
+   * Without one, the CSR's last values (kept in this browser) stay.
+   */
+  async function lookUpFuel(current: Form) {
+    let table: XceleratorFuelSurcharges | null = null;
+    try {
+      const res = await fetch("/api/web-agent/quote/fuel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          senderEmail: email.from,
+          pickupAddress: current.pickupAddress.trim() || null,
+          deliveryAddress: current.deliveryAddress.trim() || null,
+          day: current.deliveryEnd.slice(0, 10),
+        }),
+      });
+      const data = (await res.json().catch(() => null)) as { fuel?: XceleratorFuelSurcharges | null; error?: string } | null;
+      table = res.ok ? (data?.fuel ?? null) : null;
+      setFuel(
+        table
+          ? { status: "ready", table }
+          : {
+              status: "unavailable",
+              message: res.ok
+                ? "Xcelerator has no fuel surcharge to use: enter the current one"
+                : (data?.error ?? `Couldn't read the fuel surcharge from Xcelerator (${res.status})`),
+            },
+      );
+    } catch {
+      setFuel({ status: "unavailable", message: "Couldn't reach Xcelerator for the fuel surcharge" });
+    }
+    const next = applyNow((prev) => withFuel(prev, table));
+    settleAuto("fuel", next);
   }
 
   const autoStartedRef = useRef(false);
   useEffect(() => {
     if (autoStartedRef.current) return;
     autoStartedRef.current = true;
+    void lookUpFuel(form);
     // Both only set state once their fetch answers, never synchronously here.
     // eslint-disable-next-line react-hooks/set-state-in-effect
-    if (calc.status === "loading") void runCalculation(form);
-    else if (milesLookup.status === "loading") void lookUpMiles(form, true);
+    if (milesLookup.status === "loading") void lookUpMiles(form, true);
     // Runs once for the email this card was opened for.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   function update(patch: Partial<Form>) {
     setForm((prev) => ({ ...prev, ...patch }));
+  }
+
+  /** Xcelerator's fuel surcharge for the form's vehicle, while the CSR hasn't typed their own. */
+  function withFuel(prev: Form, table: XceleratorFuelSurcharges | null): Form {
+    const entry = prev.fuelAuto && prev.vehicleClass ? table?.byVehicle[prev.vehicleClass] : undefined;
+    return entry ? { ...prev, fuelPercent: String(entry.percent), fuelBasis: entry.basis } : prev;
+  }
+
+  /** The form with another vehicle: its capacity follows, and the fuel surcharge unless typed on this card. */
+  function withVehicle(prev: Form, vehicleClass: VehicleClass | ""): Form {
+    const next: Form = {
+      ...prev,
+      vehicleClass,
+      capacity: vehicleClass ? capacityFor(vehicleClass) : "",
+      capacityAuto: true,
+    };
+    return withFuel(next, fuel.status === "ready" ? fuel.table : null);
   }
 
   function changePlace(patch: Pick<Partial<Form>, "pickupAddress" | "deliveryAddress">) {
@@ -408,26 +544,31 @@ export function QuoteRequest({
     setMilesLookup({ status: "idle" });
   }
 
-  function sizingLoad(weight: number | null, extras: QuoteExtra[]): LoadForSizing {
-    return { weight, pallets: fields.pallets, truckItem: estimates.truckItem, extras };
+  function sizingLoad(weight: number | null, extras: QuoteExtra[], helper: boolean): LoadForSizing {
+    return { weight, pallets: fields.pallets, truckItem: estimates.truckItem, extras, helper };
+  }
+
+  function toggleHelper(helper: boolean) {
+    setForm((prev) => {
+      const next: Form = { ...prev, helper };
+      // A vehicle the sizing rules picked follows: a second person needs a box truck.
+      if (!prev.vehicleAuto) return next;
+      const { vehicleClass } = pickVehicle(sizingLoad(num(prev.weight), prev.extras, helper));
+      return vehicleClass !== prev.vehicleClass ? withVehicle(next, vehicleClass) : next;
+    });
   }
 
   function changeVehicle(vehicleClass: VehicleClass | "") {
-    update({ vehicleClass, vehicleAuto: false, capacity: vehicleClass ? capacityFor(vehicleClass) : "" });
+    setForm((prev) => withVehicle({ ...prev, vehicleAuto: false }, vehicleClass));
   }
 
   function changeWeight(weight: string) {
     setForm((prev) => {
       const next: Form = { ...prev, weight, weightAuto: false };
       // A vehicle the sizing rules picked is re-sized for the new weight.
-      if (prev.vehicleAuto) {
-        const { vehicleClass } = pickVehicle(sizingLoad(num(weight), prev.extras));
-        if (vehicleClass !== prev.vehicleClass) {
-          next.vehicleClass = vehicleClass;
-          next.capacity = capacityFor(vehicleClass);
-        }
-      }
-      return next;
+      if (!prev.vehicleAuto) return next;
+      const { vehicleClass } = pickVehicle(sizingLoad(num(weight), prev.extras, prev.helper));
+      return vehicleClass !== prev.vehicleClass ? withVehicle(next, vehicleClass) : next;
     });
   }
 
@@ -499,21 +640,45 @@ export function QuoteRequest({
   const weightNow = num(form.weight);
   const capacityNow = num(form.capacity);
   const overCapacity = !boxTruck && weightNow !== null && capacityNow !== null && weightNow > capacityNow;
-  const sized = pickVehicle(sizingLoad(weightNow, form.extras));
+  const sized = pickVehicle(sizingLoad(weightNow, form.extras, form.helper));
+  const freeWait = boxTruck ? 60 : 15;
   const vehicleWhy = sized.vehicleClass === form.vehicleClass ? sized.reason : "by the sizing rules";
   const deliveryMinutes = Math.max(120, (form.driveMinutes ?? 0) + 60);
+  const vehicleName = form.vehicleClass ? VEHICLE_LABELS[form.vehicleClass].toLowerCase() : "";
+  // Xcelerator's surcharge for this vehicle, and whether the card is using it.
+  const fuelEntry = fuel.status === "ready" && form.vehicleClass ? fuel.table.byVehicle[form.vehicleClass] : undefined;
+  const fuelFromXcelerator =
+    fuelEntry && form.fuelPercent === String(fuelEntry.percent) && form.fuelBasis === fuelEntry.basis ? fuelEntry : null;
+  const capacityText =
+    form.capacityAuto && form.vehicleClass
+      ? boxTruck
+        ? "Capacity: 9,000 lb, fixed by the rate sheet for a box truck"
+        : form.capacity === String(VEHICLE_CAPACITY_LB[form.vehicleClass])
+          ? `Capacity: ${VEHICLE_CAPACITY_LB[form.vehicleClass].toLocaleString("en-US")} lb, standard for a ${vehicleName}`
+          : capacityNow !== null && `Capacity: ${capacityNow.toLocaleString("en-US")} lb, the figure saved in this browser for a ${vehicleName}`
+      : null;
   const workedOut = [
     form.vehicleAuto && form.vehicleClass && `Vehicle: ${VEHICLE_LABELS[form.vehicleClass]} (${vehicleWhy})`,
     form.weightAuto &&
       `Weight: about ${Number(form.weight).toLocaleString("en-US")} lb${estimates.weightReason ? ` (${estimates.weightReason})` : ""}`,
-    form.vehicleClass &&
-      !boxTruck &&
-      form.capacity === String(VEHICLE_CAPACITY_LB[form.vehicleClass]) &&
-      `Capacity: ${VEHICLE_CAPACITY_LB[form.vehicleClass].toLocaleString("en-US")} lb, standard for a ${VEHICLE_LABELS[form.vehicleClass].toLowerCase()}`,
+    capacityText,
+    fuelFromXcelerator &&
+      `Fuel surcharge: ${fuelFromXcelerator.percent}% of ${fuelFromXcelerator.basis === "transport" ? "the transport charge" : "all charges"}, Xcelerator's current "${fuelFromXcelerator.name}" for a ${vehicleName}`,
     form.pickupAuto && "Pickup: now (no upcoming pickup time in the email)",
     form.deliveryAuto &&
       `Delivery by: ${durationText(deliveryMinutes)} after pickup (${form.driveMinutes !== null ? `the ${durationText(form.driveMinutes)} drive plus an hour` : "at least two hours"})`,
   ].filter((v): v is string => Boolean(v));
+  const fuelHint =
+    fuel.status === "loading"
+      ? "Getting the current one from Xcelerator…"
+      : fuelFromXcelerator
+        ? `From Xcelerator ("${fuelFromXcelerator.name}")`
+        : fuel.status === "unavailable"
+          ? `${fuel.message}${form.fuelPercent ? " (your last value is filled in)" : ""}`
+          : // With one for this vehicle, the "Use Xcelerator's" link below the field says it.
+            !fuelEntry && form.vehicleClass
+            ? `Xcelerator has none for a ${vehicleName}`
+            : undefined;
   const placesSet = Boolean(form.pickupAddress.trim() && form.deliveryAddress.trim());
   const directionsUrl = placesSet
     ? `https://www.google.com/maps/dir/?api=1&origin=${encodeURIComponent(routeAddress(form.pickupAddress))}&destination=${encodeURIComponent(routeAddress(form.deliveryAddress))}`
@@ -608,7 +773,7 @@ export function QuoteRequest({
         </div>
 
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
-          <Labeled label="Vehicle">
+          <Labeled label="Vehicle" hint={form.vehicleClass ? VEHICLE_SHEET_NOTES[form.vehicleClass] : undefined}>
             <select
               value={form.vehicleClass}
               onChange={(e) => changeVehicle(e.target.value as VehicleClass | "")}
@@ -691,7 +856,7 @@ export function QuoteRequest({
               step="1"
               disabled={boxTruck}
               value={boxTruck ? "9000" : form.capacity}
-              onChange={(e) => update({ capacity: e.target.value })}
+              onChange={(e) => update({ capacity: e.target.value, capacityAuto: false })}
               aria-invalid={overCapacity}
               className={`${inputClass} disabled:opacity-60`}
             />
@@ -712,21 +877,33 @@ export function QuoteRequest({
               className={inputClass}
             />
           </Labeled>
-          <Labeled label="Fuel surcharge %">
+          <Labeled label="Fuel surcharge %" hint={fuelHint}>
             <input
               type="number"
               inputMode="decimal"
               min="0"
               step="0.01"
               value={form.fuelPercent}
-              onChange={(e) => update({ fuelPercent: e.target.value })}
+              onChange={(e) => update({ fuelPercent: e.target.value, fuelAuto: false })}
+              placeholder={fuel.status === "loading" ? "From Xcelerator…" : undefined}
               className={inputClass}
             />
+            {fuelEntry && !fuelFromXcelerator && (
+              <button
+                type="button"
+                onClick={() =>
+                  update({ fuelPercent: String(fuelEntry.percent), fuelBasis: fuelEntry.basis, fuelAuto: true })
+                }
+                className="self-start text-left text-xs font-medium text-indigo-600 hover:underline dark:text-indigo-400"
+              >
+                Use Xcelerator&apos;s current {fuelEntry.percent}% (&quot;{fuelEntry.name}&quot;)
+              </button>
+            )}
           </Labeled>
-          <Labeled label="Fuel surcharge on">
+          <Labeled label="Fuel surcharge on" hint={fuelFromXcelerator ? "As Xcelerator applies it" : undefined}>
             <select
               value={form.fuelBasis}
-              onChange={(e) => update({ fuelBasis: e.target.value as FuelBasis | "" })}
+              onChange={(e) => update({ fuelBasis: e.target.value as FuelBasis | "", fuelAuto: false })}
               className={inputClass}
             >
               <option value="">Choose…</option>
@@ -769,6 +946,92 @@ export function QuoteRequest({
               className={`${inputClass} w-20`}
             />
           </label>
+          <label className="inline-flex items-center gap-1.5 text-sm text-zinc-700 dark:text-zinc-300">
+            <input
+              type="checkbox"
+              checked={form.helper}
+              onChange={(e) => toggleHelper(e.target.checked)}
+              className="h-4 w-4 rounded border-zinc-300 text-indigo-600 dark:border-zinc-700"
+            />
+            Second person (helper)
+          </label>
+        </div>
+
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+          <Labeled label="Wait at pickup (min)" hint={`${freeWait} min free`}>
+            <input
+              type="number"
+              inputMode="numeric"
+              min="0"
+              step="1"
+              value={form.pickupWait}
+              onChange={(e) => update({ pickupWait: e.target.value })}
+              placeholder="0"
+              className={inputClass}
+            />
+          </Labeled>
+          <Labeled label="Wait at delivery (min)" hint={`${freeWait} min free`}>
+            <input
+              type="number"
+              inputMode="numeric"
+              min="0"
+              step="1"
+              value={form.deliveryWait}
+              onChange={(e) => update({ deliveryWait: e.target.value })}
+              placeholder="0"
+              className={inputClass}
+            />
+          </Labeled>
+          <Labeled label="Extra delivery attempts" hint="Each one is the base price again">
+            <input
+              type="number"
+              inputMode="numeric"
+              min="0"
+              step="1"
+              value={form.deliveryAttempts}
+              onChange={(e) => update({ deliveryAttempts: e.target.value })}
+              placeholder="0"
+              className={inputClass}
+            />
+          </Labeled>
+          <Labeled label="Airport recovery attempts" hint="$18.00 each">
+            <input
+              type="number"
+              inputMode="numeric"
+              min="0"
+              step="1"
+              value={form.recoveryAttempts}
+              onChange={(e) => update({ recoveryAttempts: e.target.value })}
+              placeholder="0"
+              className={inputClass}
+            />
+          </Labeled>
+          {form.helper && (
+            <>
+              <Labeled label="Helper hours">
+                <input
+                  type="number"
+                  inputMode="decimal"
+                  min="0"
+                  step="0.25"
+                  value={form.helperHours}
+                  onChange={(e) => update({ helperHours: e.target.value })}
+                  className={inputClass}
+                />
+              </Labeled>
+              <Labeled label="Helper $ per hour" hint="Priced by quote only on the sheet">
+                <input
+                  type="number"
+                  inputMode="decimal"
+                  min="0"
+                  step="0.01"
+                  value={form.helperRate}
+                  onChange={(e) => update({ helperRate: e.target.value })}
+                  className={inputClass}
+                />
+              </Labeled>
+            </>
+          )}
         </div>
 
         <div className="flex flex-wrap items-center gap-3">
@@ -788,8 +1051,12 @@ export function QuoteRequest({
               "Calculate quote"
             )}
           </button>
-          {missing.length > 0 && (
-            <span className="text-xs text-zinc-500 dark:text-zinc-400">Still needed: {missing.join(", ")}.</span>
+          {fuel.status === "loading" && calc.status === "idle" ? (
+            <span className="text-xs text-zinc-500 dark:text-zinc-400">Getting the fuel surcharge from Xcelerator…</span>
+          ) : (
+            missing.length > 0 && (
+              <span className="text-xs text-zinc-500 dark:text-zinc-400">Still needed: {missing.join(", ")}.</span>
+            )
           )}
         </div>
       </form>
@@ -869,6 +1136,17 @@ export function QuoteRequest({
               Couldn&apos;t put the reply into Missive ({insert.message}). Use Copy instead.
             </p>
           )}
+
+          <XceleratorQuoteSave
+            key={calc.seq}
+            inputs={calc.inputs}
+            pickupAddress={calc.pickupAddress}
+            deliveryAddress={calc.deliveryAddress}
+            pieces={fields.pieces}
+            pallets={fields.pallets}
+            senderEmail={email.from}
+            callerName={email.fromName || email.from}
+          />
         </div>
       )}
     </section>

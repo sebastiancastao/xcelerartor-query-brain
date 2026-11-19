@@ -68,7 +68,13 @@ type Session = { jar: CookieJar; lastUsed: number };
 let current: Session | null = null;
 let loggingIn: Promise<Session> | null = null;
 
-async function send(cfg: BackOfficeConfig, jar: CookieJar, path: string, init: RequestInit = {}): Promise<Response> {
+async function send(
+  cfg: BackOfficeConfig,
+  jar: CookieJar,
+  path: string,
+  init: RequestInit = {},
+  timeoutMs = REQUEST_TIMEOUT_MS,
+): Promise<Response> {
   const headers = new Headers(init.headers);
   const cookie = jar.header();
   if (cookie) headers.set("Cookie", cookie);
@@ -76,7 +82,7 @@ async function send(cfg: BackOfficeConfig, jar: CookieJar, path: string, init: R
     ...init,
     headers,
     redirect: "manual",
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   jar.capture(res.headers);
   return res;
@@ -143,6 +149,61 @@ async function postJson<T>(cfg: BackOfficeConfig, s: Session, path: string, body
   } catch {
     if (/<form[^>]*\/account/i.test(text)) throw new BackOfficeSessionEnded();
     throw new Error(`the back office did not return data for ${path.split("?")[0]}`);
+  }
+}
+
+/**
+ * One back-office call as the configured user, for code beyond the POD reads
+ * (the quote writer). `json` posts JSON the way the screens' Ajax helpers do
+ * (`""` when there is no body); `form` posts form fields; neither is a GET.
+ * Answers parsed JSON, or the text when `text` is set. Logs in when there is
+ * no session, and once more if it turns out to have ended.
+ */
+export async function backOfficeRequest<T>(
+  path: string,
+  options: { json?: unknown; form?: URLSearchParams; get?: boolean; text?: boolean; timeoutMs?: number } = {},
+): Promise<T> {
+  const cfg = backOfficeConfigFromEnv();
+  if (!cfg) throw new Error("the back office is not configured (XCELERATOR_BACKOFFICE_USERNAME and _PASSWORD)");
+  const init: RequestInit = options.get
+    ? { method: "GET", headers: { Accept: "application/json", "X-Requested-With": "XMLHttpRequest" } }
+    : options.form
+      ? {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8", "X-Requested-With": "XMLHttpRequest" },
+          body: options.form,
+        }
+      : {
+          method: "POST",
+          headers: { "Content-Type": "application/json; charset=utf-8", Accept: "application/json", "X-Requested-With": "XMLHttpRequest" },
+          body: JSON.stringify(options.json ?? ""),
+        };
+
+  const call = async (fresh: boolean): Promise<T> => {
+    const s = await session(cfg, fresh);
+    const res = await send(cfg, s.jar, path, init, options.timeoutMs);
+    if (res.status === 401 || (res.status >= 300 && res.status < 400)) throw new BackOfficeSessionEnded();
+    const text = await res.text();
+    if (!res.ok) {
+      const detail = /"Details"\s*:\s*"([^"]+)"/.exec(text)?.[1] ?? "";
+      throw new Error(`the back office answered HTTP ${res.status} for ${path.split("?")[0]}${detail ? `: ${detail}` : ""}`);
+    }
+    s.lastUsed = Date.now();
+    if (options.text) return text as T;
+    try {
+      return JSON.parse(text) as T;
+    } catch {
+      if (/<form[^>]*\/account/i.test(text)) throw new BackOfficeSessionEnded();
+      throw new Error(`the back office did not return data for ${path.split("?")[0]}`);
+    }
+  };
+
+  try {
+    return await call(false);
+  } catch (err) {
+    if (!(err instanceof BackOfficeSessionEnded)) throw err;
+    current = null;
+    return call(true);
   }
 }
 

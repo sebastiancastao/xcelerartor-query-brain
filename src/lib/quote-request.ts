@@ -53,6 +53,12 @@ const EMPTY_FIELDS: QuoteRequestFields = {
   trip: null,
   extras: [],
   dryIcePounds: null,
+  pickupWaitMinutes: null,
+  deliveryWaitMinutes: null,
+  additionalDeliveryAttempts: null,
+  airportRecoveryAttempts: null,
+  helperHours: null,
+  needsHelper: false,
 };
 
 const NOT_A_QUOTE: QuoteRequestDetection = {
@@ -77,15 +83,25 @@ const DETECT_PROMPT = [
   "pickupAddress and deliveryAddress: where the shipment is picked up and where it is delivered, as written, with as much as the email gives (facility or business name, street, city, state, ZIP). Fill them whenever the email names the places, even if it gives only a business name or a city; they are used to look up the driving miles.",
   "pickupStart: when pickup should start. deliveryEnd: the delivery deadline. Both as local Atlanta time in the form YYYY-MM-DDTHH:mm, worked out from today's date given with the email. null when the email gives no time, including when it only says ASAP.",
   `trip: one of ${TRIPS.join(", ")}. roundtrip only when freight is carried in both directions; return for an empty or return-only leg; null when not stated.`,
-  `extras: a list with any of ${QUOTE_EXTRAS.join(", ")} the email asks for, else [].`,
+  `extras: a list with any of ${QUOTE_EXTRAS.join(", ")} the email asks for, else []. On the rate sheet these are:`,
+  "hazmat: hazardous materials or dangerous goods (a UN number, a hazard class), but dry ice alone is not hazmat here;",
+  "dryIcePickup: the driver must pick up or bring dry ice (put its pounds in dryIcePounds);",
+  "dryIceReplenish: the dry ice in the shipment must be topped up or replenished on the way;",
+  "secondAirlineCounter: the driver must go to a second airline counter (two airlines, or tender at one and recover at another);",
+  "paperworkFaxed: a master air waybill (MAWB) or other paperwork must be faxed or emailed;",
+  "holdOver: the shipment is held (for example overnight) and shipped later;",
+  "liftGate: a lift gate is needed (pallets or heavy freight with no loading dock); palletJack: a pallet jack is needed to move pallets.",
   "dryIcePounds: pounds of dry ice requested, else null.",
+  "pickupWaitMinutes and deliveryWaitMinutes: how long the driver is expected to wait at pickup and at delivery, in minutes, when the email says (for example 'wait while they process the samples, about 45 minutes', or 'wait and bring the cooler back' with a stated time); null when not stated. Do not include the drive. Put a wait only at the end where it happens (waiting at the place the shipment is delivered to is deliveryWaitMinutes) and never copy one wait to both ends.",
+  "additionalDeliveryAttempts: delivery attempts beyond the first that the email asks to be priced; airportRecoveryAttempts: airport recovery attempts beyond the first; null when not stated.",
+  "needsHelper: true when the email asks for a second person, a helper, a two-man team or team drivers, else false. helperHours: the hours that person is needed, when stated, else null.",
   "summary: one short sentence saying what the customer wants priced, in English.",
   "estimates: your own judgment about the load where the email gives no figure, so the shipment can be priced. Separate from fields, which stay exactly what the email states.",
   "estimates.weight: when the email gives no weight, the total pounds estimated from the items it describes, using typical weights: an envelope or document 1 lb, a specimen box, cooler or tote 10 lb, a standard carton 25 lb, a loaded pallet 500 lb; multiply by the number of pieces. When the email does not describe the load at all, 10 (a typical medical courier package). null when the email states the weight.",
   "estimates.weightReason: a few words saying how, such as '3 cartons at about 25 lb' or 'no load details, typical package'.",
   "estimates.truckItem: when an item described is too big for a cargo van and needs a truck (furniture, a hospital bed, large equipment or machinery), a few words naming it, such as 'hospital bed'; else null. Boxes, coolers, totes and pallets are never a truckItem.",
   "sources: for every field you filled (not null, not []), where its value came from: \"email\" for the newest email, \"thread\" for an earlier message, or the file name of the document it came from, exactly as given with that document.",
-  'Respond with JSON only: {"isQuoteRequest": true or false, "summary": "...", "fields": {"vehicleClass": ..., "miles": ..., "weight": ..., "pieces": ..., "pallets": ..., "pickupAddress": ..., "deliveryAddress": ..., "pickupStart": ..., "deliveryEnd": ..., "trip": ..., "extras": [...], "dryIcePounds": ...}, "estimates": {"weight": ..., "weightReason": ..., "truckItem": ...}, "sources": {"<field>": "email" or "thread" or "<file name>", ...}}.',
+  'Respond with JSON only: {"isQuoteRequest": true or false, "summary": "...", "fields": {"vehicleClass": ..., "miles": ..., "weight": ..., "pieces": ..., "pallets": ..., "pickupAddress": ..., "deliveryAddress": ..., "pickupStart": ..., "deliveryEnd": ..., "trip": ..., "extras": [...], "dryIcePounds": ..., "pickupWaitMinutes": ..., "deliveryWaitMinutes": ..., "additionalDeliveryAttempts": ..., "airportRecoveryAttempts": ..., "needsHelper": ..., "helperHours": ...}, "estimates": {"weight": ..., "weightReason": ..., "truckItem": ...}, "sources": {"<field>": "email" or "thread" or "<file name>", ...}}.',
 ].join(" ");
 
 function positiveNumber(value: unknown): number | null {
@@ -119,7 +135,19 @@ function readFields(value: unknown): QuoteRequestFields {
       ? QUOTE_EXTRAS.filter((extra) => (f.extras as unknown[]).includes(extra))
       : [],
     dryIcePounds: positiveNumber(f.dryIcePounds),
+    pickupWaitMinutes: bounded(f.pickupWaitMinutes, 1440),
+    deliveryWaitMinutes: bounded(f.deliveryWaitMinutes, 1440),
+    additionalDeliveryAttempts: bounded(f.additionalDeliveryAttempts, 10),
+    airportRecoveryAttempts: bounded(f.airportRecoveryAttempts, 10),
+    helperHours: bounded(f.helperHours, 168),
+    needsHelper: f.needsHelper === true || positiveNumber(f.helperHours) !== null,
   };
+}
+
+/** A positive count or duration no larger than `max`, rounded to whole units except hours. */
+function bounded(value: unknown, max: number): number | null {
+  const n = positiveNumber(value);
+  return n !== null && n <= max ? Math.round(n * 100) / 100 : null;
 }
 
 function readEstimates(value: unknown): QuoteEstimates {
@@ -225,7 +253,8 @@ function fieldSourcesFor(
   const emailText = `${email.subject}\n${email.body}`;
   const sources: Partial<Record<QuoteField, string>> = {};
   for (const field of Object.keys(QUOTE_FIELD_LABELS) as QuoteField[]) {
-    const filled = field === "extras" ? fields.extras.length > 0 : fields[field] !== null;
+    const value = fields[field];
+    const filled = Array.isArray(value) ? value.length > 0 : typeof value === "boolean" ? value : value !== null;
     if (!filled) continue;
     const claim = typeof claims[field] === "string" ? (claims[field] as string).trim() : "";
     const claimedDocument = claim ? matchDocument(claim, documentNames) : null;
