@@ -187,7 +187,8 @@ function StatusRow({
   times,
 }: {
   label: string;
-  answer: string;
+  /** Optional line under the label; left out once the stop is done (the times say it). */
+  answer?: string;
   positive: boolean;
   /** Arrival and departure lines shown under the answer, already formatted. */
   times?: { arrived: string; departed: string };
@@ -205,7 +206,7 @@ function StatusRow({
       </span>
       <div>
         <p className="text-sm font-medium text-zinc-900 dark:text-zinc-100">{label}</p>
-        <p className="mt-0.5 text-sm text-zinc-600 dark:text-zinc-400">{answer}</p>
+        {answer && <p className="mt-0.5 text-sm text-zinc-600 dark:text-zinc-400">{answer}</p>}
         {times && (
           <dl className="mt-1 grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 text-sm">
             <dt className="text-zinc-500 dark:text-zinc-400">Arrived</dt>
@@ -281,7 +282,6 @@ export default function WebAgentHome() {
   // That email's documents as the documents panel loaded them, for the link
   // under the search box and the order card's "Upload documents" button.
   const [emailDocs, setEmailDocs] = useState<EmailDocumentList | null>(null);
-  const documentCount = emailDocs?.status === "ready" ? emailDocs.documents.length : null;
   // Set when the open email asks for a price quote: the quote card prices it
   // on the rate sheet. `id` changes per scan so a new email gets a fresh card.
   const [quoteRequest, setQuoteRequest] = useState<{
@@ -665,15 +665,6 @@ export default function WebAgentHome() {
               </div>
             )}
 
-            {documentCount !== null && documentCount > 0 && (
-              <button
-                type="button"
-                onClick={() => document.getElementById("email-documents")?.scrollIntoView({ behavior: "smooth" })}
-                className="self-start text-xs font-medium text-indigo-600 hover:underline dark:text-indigo-400"
-              >
-                View {documentCount} {documentCount === 1 ? "document" : "documents"} in this email
-              </button>
-            )}
           </div>
 
         </section>
@@ -794,7 +785,7 @@ export default function WebAgentHome() {
                   positive={order.pickup.arrived}
                   answer={
                     order.pickup.arrived
-                      ? `Yes — arrived at ${order.pickup.location}`
+                      ? undefined
                       : `Not yet — scheduled for ${formatMaybeDate(order.pickup.scheduledAt)} at ${order.pickup.location}`
                   }
                   times={{
@@ -810,7 +801,7 @@ export default function WebAgentHome() {
                   positive={order.delivery.delivered}
                   answer={
                     order.delivery.delivered
-                      ? `Yes — delivered to ${order.delivery.location}`
+                      ? undefined
                       : `Not yet — scheduled for ${formatMaybeDate(order.delivery.scheduledAt)} at ${order.delivery.location}`
                   }
                   times={{

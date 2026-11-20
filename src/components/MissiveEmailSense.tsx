@@ -271,7 +271,7 @@ function statusLabel(
     case "scanning":
       return "Scanning the selected email…";
     case "ready":
-      return subject ? `Scanned: "${subject}"` : "Scanned the selected email.";
+      return "";
     case "empty":
       return "No order or reference number detected in the selected email.";
     case "not-configured":
@@ -473,7 +473,9 @@ export function MissiveEmailSense({
                   : "bg-zinc-300 dark:bg-zinc-600"
           }`}
         />
-        <span>{statusLabel(status, subject, errorMessage, pasteFallback)}</span>
+        {statusLabel(status, subject, errorMessage, pasteFallback) && (
+          <span>{statusLabel(status, subject, errorMessage, pasteFallback)}</span>
+        )}
         {selectedConversationId && status !== "scanning" && (
           <button
             type="button"
