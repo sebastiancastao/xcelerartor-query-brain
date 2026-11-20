@@ -1,4 +1,4 @@
-// Read-only POD details from Xcelerator's back office: the Review Order
+// Read-only POD details and charge breakdown from Xcelerator's back office: the Review Order
 // screen (/Xcelerator/Orders/ReviewOrder/ReviewOrder?_p_Odata=<tracking id>)
 // that dispatch uses. The ClientPortal callers cannot open it (their session
 // is sent to the back-office login page), so this needs a back-office login:
@@ -13,6 +13,11 @@
 //    "*[PODname] changed from [] to [29763672] by User:rdobbs", "... via
 //    Wireless Device by DriverNo[755]", "AutoNotification email sent [On-POD]"
 //    and memos like "POD is LATE".
+//  - POST /api/order/getSelectData?...&_p_Screen=RO (only for the charge
+//    breakdown): the account's extras and surcharges with this order's
+//    counts and amounts, the way the screen fills its Extras and Surcharges
+//    boxes. getReviewOrderData itself has the charge totals but an empty
+//    Extras list.
 // Reading does not lock the order: the screen only checks for someone else's
 // edits when it saves (confirmed 2026-10-01: LockedBy/IsLocked unchanged
 // after repeated reads). Without a session both calls answer HTTP 401.
@@ -21,6 +26,13 @@
 
 import { CookieJar, portalBaseUrlFromEnv } from "./xcelerator-portal";
 import type { PodActivityEntry } from "./xcelerator";
+import {
+  breakdownFromReviewOrder,
+  type ChargeBreakdown,
+  type ReviewOrderCharges,
+  type SelectExtra,
+  type SelectSurcharge,
+} from "./charge-breakdown";
 
 type BackOfficeConfig = { baseUrl: string; username: string; password: string };
 
@@ -207,10 +219,14 @@ export async function backOfficeRequest<T>(
   }
 }
 
-type ReviewOrderData = {
+type ReviewOrderData = ReviewOrderCharges & {
   PODname?: string | null;
   PODcompletion?: string | null;
+  ClientId?: number | null;
+  TerminalId?: number | null;
 };
+
+type SelectData = { Extras?: SelectExtra[] | null; Surcharges?: SelectSurcharge[] | null };
 
 type ExtendedInfoEntry = {
   Type?: string | null;
@@ -290,12 +306,19 @@ function podActivity(entries: ExtendedInfoEntry[]): PodActivityEntry[] {
     .slice(0, MAX_ACTIVITY_ENTRIES);
 }
 
+export type BackOfficeOrder = {
+  pod: BackOfficePod;
+  charges: ChargeBreakdown;
+  /** Why the extras/surcharges could not be itemized (the totals are still there), or null. */
+  chargesNote: string | null;
+};
+
 /**
- * The POD name, POD date/time and POD activity for one order, by its
- * Xcelerator tracking id (e.g. "105.031826"). Logs in when there is no
- * session, and once more if the session turns out to have ended.
+ * The POD name, POD date/time, POD activity and charge breakdown for one
+ * order, by its Xcelerator tracking id (e.g. "105.031826"). Logs in when
+ * there is no session, and once more if the session turns out to have ended.
  */
-export async function readBackOfficePod(orderTrackingId: string): Promise<BackOfficePod> {
+export async function readBackOfficeOrder(orderTrackingId: string): Promise<BackOfficeOrder> {
   const cfg = backOfficeConfigFromEnv();
   if (!cfg) throw new Error("the back office is not configured (XCELERATOR_BACKOFFICE_USERNAME and _PASSWORD)");
   const id = encodeURIComponent(orderTrackingId.trim());
@@ -316,16 +339,36 @@ export async function readBackOfficePod(orderTrackingId: string): Promise<BackOf
     TimeZoneId: "14",
   }).toString();
 
-  const read = async (fresh: boolean): Promise<BackOfficePod> => {
+  const read = async (fresh: boolean): Promise<BackOfficeOrder> => {
     const s = await session(cfg, fresh);
-    const [order, activity] = await Promise.all([
-      postJson<ReviewOrderData | null>(
-        cfg,
-        s,
-        `/api/order/getReviewOrderData?_p_OrderTrackingId=${id}`,
-        '""',
-        "application/json; charset=utf-8",
-      ),
+    const orderRead = postJson<ReviewOrderData | null>(
+      cfg,
+      s,
+      `/api/order/getReviewOrderData?_p_OrderTrackingId=${id}`,
+      '""',
+      "application/json; charset=utf-8",
+    );
+    // Needs the order's client and terminal, so it follows the order read
+    // (alongside the activity read). Best effort: without it the breakdown
+    // keeps the extras and surcharge totals, just not itemized.
+    const selectRead = orderRead.then(async (order) => {
+      if (!order?.ClientId) return { select: null, note: "the order has no client id to read its extras with" };
+      try {
+        const select = await postJson<SelectData | null>(
+          cfg,
+          s,
+          `/api/order/getSelectData?_p_ClientId=${order.ClientId}&_p_OrderTrackingId=${id}&_p_AltOrderId=0&_p_TerminalId=${order.TerminalId ?? 0}&_p_Screen=RO`,
+          '""',
+          "application/json; charset=utf-8",
+        );
+        return { select, note: null };
+      } catch (err) {
+        if (err instanceof BackOfficeSessionEnded) throw err;
+        return { select: null, note: err instanceof Error ? err.message : String(err) };
+      }
+    });
+    const [order, activity, extras] = await Promise.all([
+      orderRead,
       postJson<ExtendedInfoEntry[] | null>(
         cfg,
         s,
@@ -333,12 +376,17 @@ export async function readBackOfficePod(orderTrackingId: string): Promise<BackOf
         activityQuery,
         "application/x-www-form-urlencoded; charset=UTF-8",
       ),
+      selectRead,
     ]);
     if (!order) throw new Error(`the back office has no order ${orderTrackingId}`);
     return {
-      podName: order.PODname?.trim() || null,
-      podAt: order.PODcompletion?.trim() || null,
-      activity: podActivity(Array.isArray(activity) ? activity : []),
+      pod: {
+        podName: order.PODname?.trim() || null,
+        podAt: order.PODcompletion?.trim() || null,
+        activity: podActivity(Array.isArray(activity) ? activity : []),
+      },
+      charges: breakdownFromReviewOrder(order, extras.select),
+      chargesNote: extras.note,
     };
   };
 

@@ -65,7 +65,8 @@ import {
   type PortalOrderListRow,
 } from "./xcelerator";
 import { firstHitInPriorityOrder } from "./ordered-first-match";
-import { isBackOfficeConfigured, readBackOfficePod, warmBackOfficeSession } from "./xcelerator-backoffice";
+import { isBackOfficeConfigured, readBackOfficeOrder, warmBackOfficeSession } from "./xcelerator-backoffice";
+import { breakdownFromPortalLines, type ChargeBreakdown } from "./charge-breakdown";
 import {
   accountListIsStale,
   loadMemory,
@@ -1086,6 +1087,7 @@ function orderFromWindow(w: OrderWindowFields, referenceNumber: string): OrderIn
       total,
       finalized: w.grandTotal !== null,
       lineItems: w.charges,
+      breakdown: breakdownFromPortalLines(w.charges, w.grandTotal),
     },
     documents: [],
   };
@@ -2056,14 +2058,26 @@ function describePlan(
 /** Longest the back office may hold up a found order (login included). */
 const BACK_OFFICE_POD_TIMEOUT_MS = 12_000;
 
+/** One line for the steps list: "base $26.00, 1 extra, Gas Srch $1.56, total $37.56". */
+function describeBreakdown(b: ChargeBreakdown): string {
+  const parts = [`base $${(b.base ?? 0).toFixed(2)}`];
+  if (b.accessorials.length) parts.push(`${b.accessorials.length} accessorial${b.accessorials.length === 1 ? "" : "s"}`);
+  if (b.extras.length) parts.push(`${b.extras.length} extra${b.extras.length === 1 ? "" : "s"}`);
+  for (const s of b.surcharges) parts.push(`${s.label} $${s.amount.toFixed(2)}`);
+  if (b.grandTotal !== null) parts.push(`total $${b.grandTotal.toFixed(2)}`);
+  if (b.unexplained !== null) parts.push(`$${b.unexplained.toFixed(2)} not explained by the lines`);
+  return parts.join(", ");
+}
+
 /**
- * Adds the back office's Review Order POD details to a found order: POD
- * Name, POD D/T and the activity entries that mention the POD. Optional and
+ * Adds the back office's Review Order details to a found order: POD Name,
+ * POD D/T, the activity entries that mention the POD, and the itemized
+ * charge breakdown (base, accessorials, extras, surcharges). Optional and
  * best effort: without XCELERATOR_BACKOFFICE_* set, or when the back office
- * is slow or refuses, the order keeps the ClientPortal's POD details and the
- * steps say why.
+ * is slow or refuses, the order keeps the ClientPortal's POD details and
+ * charge totals, and the steps say why.
  */
-async function withBackOfficePod(
+async function withBackOfficeDetails(
   order: OrderInquiry,
   orderTrackingId: string | null,
   steps: WebAgentStep[],
@@ -2072,8 +2086,8 @@ async function withBackOfficePod(
   const started = Date.now();
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    const pod = await Promise.race([
-      readBackOfficePod(orderTrackingId),
+    const details = await Promise.race([
+      readBackOfficeOrder(orderTrackingId),
       new Promise<never>((_, reject) => {
         timer = setTimeout(
           () => reject(new Error(`no answer within ${BACK_OFFICE_POD_TIMEOUT_MS / 1000} s`)),
@@ -2081,20 +2095,27 @@ async function withBackOfficePod(
         );
       }),
     ]);
-    const merged = mergePod(order, { receivedBy: pod.podName, signedAt: pod.podAt, activity: pod.activity });
+    const { pod, charges, chargesNote } = details;
+    const withPod = mergePod(order, { receivedBy: pod.podName, signedAt: pod.podAt, activity: pod.activity });
+    const merged: OrderInquiry = { ...withPod, charges: { ...withPod.charges, breakdown: charges } };
     const found = [
       pod.podName ? `POD name ${pod.podName}` : "no POD name",
       pod.podAt ? `POD D/T ${pod.podAt.replace("T", " ").slice(0, 16)}` : "no POD D/T",
       `${pod.activity.length} POD ${pod.activity.length === 1 ? "entry" : "entries"} in the activity log`,
     ];
     steps.push({ caller: "Review Order", action: "read POD", detail: `${found.join(", ")} (${Date.now() - started} ms)` });
+    steps.push({
+      caller: "Review Order",
+      action: "read charges",
+      detail: `${describeBreakdown(charges)}${chargesNote ? `; extras and surcharges not itemized: ${chargesNote}` : ""}`,
+    });
     return merged;
   } catch (err) {
     const why = err instanceof Error ? err.message.split("\n")[0] : String(err);
     steps.push({
       caller: "Review Order",
       action: "POD not read",
-      detail: `${why}; showing the ClientPortal's POD details (${Date.now() - started} ms)`,
+      detail: `${why}; showing the ClientPortal's POD details and charge totals (${Date.now() - started} ms)`,
     });
     return order;
   } finally {
@@ -2335,7 +2356,7 @@ export async function findOrderWithWebAgent(referenceNumber: string): Promise<We
     episode,
     refreshOldAccountLists(memory, configured, accountsRead),
   ]).then(() => {});
-  const order = winner ? await withBackOfficePod(winner.hit.order, winner.hit.orderTrackingId, steps) : null;
+  const order = winner ? await withBackOfficeDetails(winner.hit.order, winner.hit.orderTrackingId, steps) : null;
 
   if (winner) {
     const notes = [

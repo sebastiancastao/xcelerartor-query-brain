@@ -19,6 +19,7 @@ import {
   type MissiveAttachment,
   type MissiveThreadMessage,
 } from "./missive";
+import { HeicConversionError, heicToJpeg, isHeic, jpegName } from "./heic";
 import { newestBodyText } from "./missive-text";
 import { chatCompletion, isOpenAIConfigured, type UserContentPart } from "./openai";
 import type { ThreadMessage } from "./quote-types";
@@ -53,11 +54,14 @@ export type EmailDocument = {
 
 /** File types Xcelerator's ClientPortal accepts on an order (MainFrame.js allowedExtensions). */
 const ORDER_FILE_EXTENSIONS = new Set(["pdf", "jpg", "jpeg", "png", "gif", "bmp"]);
+/** iPhone photos, converted to JPEG whenever they are fetched (see fetchSource). */
+const HEIC_EXTENSIONS = new Set(["heic", "heif", "hif"]);
 const MAX_ORDER_FILE_BYTES = 25 * 1024 * 1024;
 
 function isAttachable(kind: FileKind, extension: string | null, size: number | null): boolean {
   if ((size ?? 0) > MAX_ORDER_FILE_BYTES) return false;
-  return kind === "pdf" || ORDER_FILE_EXTENSIONS.has((extension ?? "").toLowerCase());
+  const ext = (extension ?? "").toLowerCase();
+  return kind === "pdf" || ORDER_FILE_EXTENSIONS.has(ext) || HEIC_EXTENSIONS.has(ext);
 }
 
 export type DocumentSummary = {
@@ -82,7 +86,7 @@ export class EmailDocumentError extends Error {
 
 type FileKind = "pdf" | "image" | "text" | "html" | "docx" | "xlsx" | "pptx" | "other";
 
-const IMAGE_EXTENSIONS = new Set(["png", "jpg", "jpeg", "gif", "webp"]);
+const IMAGE_EXTENSIONS = new Set(["png", "jpg", "jpeg", "gif", "webp", "heic", "heif", "hif"]);
 const TEXT_EXTENSIONS = new Set(["txt", "csv", "tsv", "json", "xml", "log", "eml"]);
 
 function kindFromName(extension: string | null, mediaType: string | null): FileKind {
@@ -111,6 +115,7 @@ const TYPE_LABELS: Record<FileKind, string> = {
 
 function typeLabel(kind: FileKind, extension: string | null): string {
   if (kind === "text" && extension?.toLowerCase() === "csv") return "CSV";
+  if (kind === "image" && HEIC_EXTENSIONS.has(extension?.toLowerCase() ?? "")) return "HEIC photo";
   if (kind === "other" && extension) return extension.toUpperCase();
   return TYPE_LABELS[kind];
 }
@@ -214,7 +219,7 @@ function unwrapLink(raw: string): URL | null {
   return url.protocol === "https:" || url.protocol === "http:" ? url : null;
 }
 
-const DOCUMENT_PATH = /\.(pdf|docx?|xlsx?|csv|txt|pptx?|png|jpe?g|gif|webp|tiff?)$/i;
+const DOCUMENT_PATH = /\.(pdf|docx?|xlsx?|csv|txt|pptx?|png|jpe?g|gif|webp|heic|heif|tiff?)$/i;
 const NOT_A_DOCUMENT = /unsubscribe|opt-?out|preferences|privacy|terms|legal|licen[cs]es|maps\.google|google\.[a-z.]+\/maps/i;
 const SOCIAL_HOST = /(^|\.)(facebook|twitter|x|linkedin|instagram|youtube)\.com$/i;
 const DOCUMENT_WORDS =
@@ -569,10 +574,29 @@ async function freshAttachmentUrls(conversationId: string): Promise<Map<string, 
 }
 
 /**
- * A document's bytes and real kind. `attachmentUrls` (from freshAttachmentUrls)
- * saves asking Missive again when several attachments are fetched at once.
+ * A document's bytes and real kind. HEIC/HEIF photos come back already
+ * converted to JPEG (and named .jpg), so opening, summarizing and attaching
+ * to an Xcelerator order all get a file they can read. `attachmentUrls` (from
+ * freshAttachmentUrls) saves asking Missive again when several attachments
+ * are fetched at once.
  */
 async function fetchSource(
+  conversationId: string,
+  docId: string,
+  attachmentUrls?: Map<string, string | null>,
+): Promise<{ source: DocumentSource; bytes: Buffer; kind: FileKind }> {
+  const fetched = await fetchRawSource(conversationId, docId, attachmentUrls);
+  if (!isHeic(fetched.bytes)) return fetched;
+  try {
+    const jpeg = await heicToJpeg(fetched.bytes);
+    return { source: { ...fetched.source, name: jpegName(fetched.source.name) }, bytes: jpeg, kind: "image" };
+  } catch (error) {
+    if (error instanceof HeicConversionError) throw new EmailDocumentError(`${error.message} Open it to view it.`, 422);
+    throw error;
+  }
+}
+
+async function fetchRawSource(
   conversationId: string,
   docId: string,
   attachmentUrls?: Map<string, string | null>,

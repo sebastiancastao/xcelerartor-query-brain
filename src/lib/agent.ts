@@ -17,6 +17,7 @@
 
 import { getOrderByReferenceNumber, type OrderInquiry } from "./xcelerator";
 import { buildSuggestedReply } from "./email";
+import { breakdownAsLines } from "./charge-breakdown";
 import { chatCompletion, isOpenAIConfigured, type ChatMessage, type ToolDefinition } from "./openai";
 
 type OrderToolResult = {
@@ -256,7 +257,8 @@ function toReplyFacts(order: OrderInquiry): unknown {
       finalized: order.charges.finalized,
       total: order.charges.finalized ? order.charges.total : null,
       currency: order.charges.currency,
-      lineItems: order.charges.lineItems,
+      // Itemized (base, accessorials, extras, fuel surcharge) when the web agent read it.
+      lineItems: order.charges.breakdown ? breakdownAsLines(order.charges.breakdown) : order.charges.lineItems,
     },
     documentsOnFile: order.documents.map((d) => d.name),
   });

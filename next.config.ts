@@ -6,6 +6,10 @@ import type { NextConfig } from "next";
 const frameAncestors = process.env.WEB_AGENT_FRAME_ANCESTORS?.trim();
 
 const nextConfig: NextConfig = {
+  // HEIC photos are decoded by libheif compiled to WebAssembly (Emscripten
+  // loader code); load it from node_modules as-is rather than bundling it.
+  serverExternalPackages: ["heic-convert"],
+
   // The web agent launches @sparticuz/chromium on Vercel. Its compressed
   // Chromium binary (bin/*.br) is read from disk at runtime, not imported,
   // so the file tracer can't see it; include it in the web agent's function.

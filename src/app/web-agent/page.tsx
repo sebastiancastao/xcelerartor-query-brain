@@ -17,6 +17,7 @@ import {
 } from "@/components/MissiveEmailSense";
 import { EmailDocuments, type EmailDocumentList } from "@/components/EmailDocuments";
 import { UploadDocumentsToOrder } from "@/components/UploadDocumentsToOrder";
+import { ChargeBreakdown } from "@/components/ChargeBreakdown";
 import { useOrderAttachments } from "@/components/useOrderAttachments";
 import { QuoteReadingDocuments, QuoteRequest } from "@/components/QuoteRequest";
 import type { QuoteRequestDetection, ThreadMessage } from "@/lib/quote-types";
@@ -875,6 +876,9 @@ export default function WebAgentHome() {
                       : "Still being finalized"
                   }
                 />
+                {order.charges.breakdown && (
+                  <ChargeBreakdown breakdown={order.charges.breakdown} currency={order.charges.currency} />
+                )}
               </div>
             </section>
 

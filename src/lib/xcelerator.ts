@@ -23,6 +23,7 @@ import {
   shouldSkipLogin,
 } from "./login-performance";
 import { firstHitInPriorityOrder, type Skipped } from "./ordered-first-match";
+import type { ChargeBreakdown } from "./charge-breakdown";
 
 export { loginPerformanceSnapshot };
 
@@ -165,6 +166,12 @@ export interface OrderInquiry {
     total: number;
     finalized: boolean;
     lineItems: { label: string; amount: number }[];
+    /**
+     * Base charge, accessorials, extras, fuel/other surcharges, taxes and
+     * tolls (web agent only): itemized from the back office's Review Order
+     * screen when it is configured, else the order window's totals.
+     */
+    breakdown?: ChargeBreakdown | null;
   };
   documents: { name: string | null; fileFormat: string | null }[];
 }
