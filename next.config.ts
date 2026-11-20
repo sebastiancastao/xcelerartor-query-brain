@@ -15,6 +15,8 @@ const nextConfig: NextConfig = {
   outputFileTracingIncludes: {
     "/api/web-agent/**": ["./node_modules/playwright-core/browsers.json"],
     "/api/web-agent/orders/**": ["./node_modules/@sparticuz/chromium/bin/**"],
+    // The MCP server's find_order tool runs the same browser lookup.
+    "/api/web-agent/mcp": ["./node_modules/@sparticuz/chromium/bin/**"],
   },
 
   async headers() {
