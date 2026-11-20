@@ -383,6 +383,8 @@ export function QuoteRequest({
   // looked up) have come back and everything is filled in; otherwise the CSR
   // fills the gaps and presses Calculate.
   const [calc, setCalc] = useState<CalcState>({ status: "idle" });
+  /** Bumped by "Submit to Xcelerator": the save section scrolls into view and checks the quote. */
+  const [submitRequest, setSubmitRequest] = useState(0);
   const [copied, setCopied] = useState(false);
   const [insert, setInsert] = useState<InsertState>({ status: "idle" });
   // Miles are looked up straight away when the email names both places but no distance.
@@ -1155,6 +1157,16 @@ export function QuoteRequest({
               "Calculate quote"
             )}
           </button>
+          {calc.status === "ready" && (
+            <button
+              type="button"
+              onClick={() => setSubmitRequest((n) => n + 1)}
+              title="Checks the priced quote with Xcelerator and shows what it will store. Nothing is saved until you confirm."
+              className="inline-flex items-center justify-center gap-1.5 rounded-xl border border-indigo-300 px-4 py-2 text-sm font-medium text-indigo-700 transition-colors hover:bg-indigo-50 dark:border-indigo-800 dark:text-indigo-300 dark:hover:bg-indigo-950"
+            >
+              Submit to Xcelerator
+            </button>
+          )}
           {fuel.status === "loading" && calc.status === "idle" ? (
             <span className="text-xs text-zinc-500 dark:text-zinc-400">Getting the fuel surcharge from Xcelerator…</span>
           ) : (
@@ -1201,6 +1213,18 @@ export function QuoteRequest({
             </p>
           ))}
 
+          <XceleratorQuoteSave
+            key={calc.seq}
+            inputs={calc.inputs}
+            pickupAddress={calc.pickupAddress}
+            deliveryAddress={calc.deliveryAddress}
+            pieces={fields.pieces}
+            pallets={fields.pallets}
+            senderEmail={email.from}
+            callerName={email.fromName || email.from}
+            submitRequest={submitRequest}
+          />
+
           <div className="mb-3 mt-5 flex flex-wrap items-center justify-between gap-2">
             <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Suggested reply with the quote</h3>
             <div className="flex items-center gap-2">
@@ -1241,16 +1265,6 @@ export function QuoteRequest({
             </p>
           )}
 
-          <XceleratorQuoteSave
-            key={calc.seq}
-            inputs={calc.inputs}
-            pickupAddress={calc.pickupAddress}
-            deliveryAddress={calc.deliveryAddress}
-            pieces={fields.pieces}
-            pallets={fields.pallets}
-            senderEmail={email.from}
-            callerName={email.fromName || email.from}
-          />
         </div>
       )}
     </section>

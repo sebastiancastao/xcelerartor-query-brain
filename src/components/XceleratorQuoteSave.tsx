@@ -24,10 +24,11 @@ const buttonClass =
   "inline-flex items-center justify-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium shadow-sm transition-colors disabled:cursor-not-allowed disabled:opacity-50";
 
 /**
- * The quote card's "Save in Xcelerator" section, shown once a quote is
+ * The quote card's "Submit to Xcelerator" section, shown once a quote is
  * priced. Finds the sender's account (or lets the CSR search for one), shows
  * exactly what Xcelerator would store, and saves it as a quote only when the
- * CSR confirms. Xcelerator keeps quotes under an account only, so a new
+ * CSR confirms. The card's own "Submit to Xcelerator" button (beside
+ * Recalculate) bumps `submitRequest`, which scrolls here and starts the check. Xcelerator keeps quotes under an account only, so a new
  * customer needs an account picked (for example a prospects account).
  */
 export function XceleratorQuoteSave({
@@ -38,6 +39,7 @@ export function XceleratorQuoteSave({
   pallets,
   senderEmail,
   callerName,
+  submitRequest = 0,
 }: {
   /** The inputs the quote was priced with (the server prices them again). */
   inputs: QuoteInputs;
@@ -47,6 +49,8 @@ export function XceleratorQuoteSave({
   pallets: number | null;
   senderEmail: string;
   callerName: string;
+  /** Bumped by the card's "Submit to Xcelerator" button: scroll here and check the quote. */
+  submitRequest?: number;
 }) {
   const [account, setAccount] = useState<XceleratorAccount | null>(null);
   const [candidates, setCandidates] = useState<XceleratorAccount[]>([]);
@@ -56,6 +60,12 @@ export function XceleratorQuoteSave({
   const [searchError, setSearchError] = useState("");
   const [save, setSave] = useState<SaveState>({ status: "idle" });
   const placesSet = Boolean(pickupAddress && deliveryAddress);
+  const sectionRef = useRef<HTMLDivElement>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
+  // The request already answered: a recalculated quote re-creates this section
+  // with the card's current count, which must not start a check by itself.
+  const handledRequest = useRef(submitRequest);
+  const pendingSubmit = useRef(false);
 
   // The sender's account, looked up once for this priced quote.
   const suggestedRef = useRef(false);
@@ -110,6 +120,22 @@ export function XceleratorQuoteSave({
     };
   }, [query]);
 
+  // The card's "Submit to Xcelerator" button: once the sender's account is
+  // looked up, check the quote with Xcelerator, or ask for the account.
+  useEffect(() => {
+    if (submitRequest !== handledRequest.current) {
+      handledRequest.current = submitRequest;
+      pendingSubmit.current = true;
+      sectionRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+    if (!pendingSubmit.current || suggesting) return;
+    pendingSubmit.current = false;
+    if (!account) searchRef.current?.focus();
+    else if (placesSet && (save.status === "idle" || save.status === "error")) void send("preview");
+    // send and the state it reads are current on the render that runs this.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [submitRequest, suggesting]);
+
   function choose(a: XceleratorAccount) {
     setAccount(a);
     setQuery("");
@@ -158,7 +184,7 @@ export function XceleratorQuoteSave({
     return (
       <div className="mt-5 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2.5 text-sm text-emerald-800 dark:border-emerald-900/60 dark:bg-emerald-950 dark:text-emerald-300">
         <p className="font-medium">
-          Saved in Xcelerator as quote {s.quoteRef} under {accountLabel(s.account)}, {s.total}.
+          Submitted to Xcelerator as quote {s.quoteRef} under {accountLabel(s.account)}, {s.total}.
         </p>
         <p className="mt-1 text-xs">
           To book it, open Order Entry, load account {s.account.accountNo} and enter {s.quoteRef} in Quick Ref.
@@ -171,8 +197,8 @@ export function XceleratorQuoteSave({
   const busy = save.status === "checking" || save.status === "saving";
 
   return (
-    <div className="mt-5 border-t border-zinc-100 pt-4 dark:border-zinc-800">
-      <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Save in Xcelerator</h3>
+    <div ref={sectionRef} className="mt-5 border-t border-zinc-100 pt-4 dark:border-zinc-800">
+      <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Submit to Xcelerator</h3>
 
       <div className="mt-2 flex flex-col gap-2 text-sm">
         {account ? (
@@ -196,6 +222,7 @@ export function XceleratorQuoteSave({
         ) : (
           <>
             <input
+              ref={searchRef}
               type="search"
               value={query}
               onChange={(e) => setQuery(e.target.value)}
@@ -268,7 +295,7 @@ export function XceleratorQuoteSave({
               disabled={busy}
               className={`${buttonClass} bg-indigo-600 text-white hover:bg-indigo-500 dark:bg-indigo-500 dark:hover:bg-indigo-400`}
             >
-              {save.status === "saving" ? "Saving…" : "Save quote in Xcelerator"}
+              {save.status === "saving" ? "Submitting…" : "Confirm and submit"}
             </button>
             <button
               type="button"
@@ -285,12 +312,23 @@ export function XceleratorQuoteSave({
             onClick={() => void send("preview")}
             disabled={!account || !placesSet || busy}
             title={!placesSet ? "Fill in the pickup and delivery places first" : !account ? "Choose the account first" : undefined}
-            className={`${buttonClass} border border-indigo-300 text-indigo-700 hover:bg-indigo-50 dark:border-indigo-800 dark:text-indigo-300 dark:hover:bg-indigo-950`}
+            className={`${buttonClass} bg-indigo-600 text-white hover:bg-indigo-500 dark:bg-indigo-500 dark:hover:bg-indigo-400`}
           >
-            {save.status === "checking" ? "Checking with Xcelerator…" : "Check quote for Xcelerator"}
+            {save.status === "checking" ? "Checking with Xcelerator…" : "Submit to Xcelerator"}
           </button>
         )}
-        {!plan && <span className="text-xs text-zinc-500 dark:text-zinc-400">Nothing is saved until you confirm.</span>}
+        {!plan && (
+          <span className="text-xs text-zinc-500 dark:text-zinc-400">
+            {!placesSet
+              ? "Fill in the pickup and delivery places and recalculate first."
+              : !account
+                ? "Choose the account first."
+                : "You'll see what Xcelerator will store before anything is saved."}
+          </span>
+        )}
+        {plan && (
+          <span className="text-xs text-zinc-500 dark:text-zinc-400">Check the details above, then confirm to save the quote.</span>
+        )}
       </div>
 
       {save.status === "error" && <p className="mt-2 text-xs text-red-600 dark:text-red-400">{save.message}</p>}
