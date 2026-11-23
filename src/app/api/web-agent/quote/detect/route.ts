@@ -97,6 +97,8 @@ export async function POST(request: Request) {
   };
   const conversationId = extractUuid(body?.conversationId);
   const withDocuments = body?.withDocuments === true;
+  // Set when the CSR presses "Quote it anyway" on an email not taken for a quote request.
+  const assumeQuote = body?.assumeQuote === true;
   const missive = Boolean(conversationId) && isMissiveConfigured();
 
   // The thread: the page's (read as the CSR), else the app token's.
@@ -114,7 +116,7 @@ export async function POST(request: Request) {
   // The fuel surcharge to assign is looked up beside the reading (it is kept
   // for an hour), so the card opens with it filled in. Only for emails that
   // could be quote requests: it reserves and releases an order number.
-  const fuel: Promise<QuoteFuelAssignment | undefined> = mightBeQuoteRequest(email, thread)
+  const fuel: Promise<QuoteFuelAssignment | undefined> = assumeQuote || mightBeQuoteRequest(email, thread)
     ? (() => {
         const places = readQuoteFieldsByRules(email.subject, email.body);
         return fuelAssignmentFor(email.from, [places.pickupAddress, places.deliveryAddress]);
@@ -133,7 +135,7 @@ export async function POST(request: Request) {
           })
         : Promise.resolve(null);
       const [detection, documents] = await Promise.all([
-        detectQuoteRequest(email, { thread, documents: [] }).then(withFuel),
+        detectQuoteRequest(email, { thread, documents: [] }, { assumeQuote }).then(withFuel),
         names,
       ]);
       return NextResponse.json({
@@ -161,7 +163,7 @@ export async function POST(request: Request) {
     }
 
     const detection = await withFuel(
-      await detectQuoteRequest(email, { thread, documents: documents.read }, { rulesFallback: false }),
+      await detectQuoteRequest(email, { thread, documents: documents.read }, { rulesFallback: false, assumeQuote }),
     );
     const result: QuoteRequestDetection = {
       ...detection,

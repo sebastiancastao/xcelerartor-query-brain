@@ -25,12 +25,11 @@ const nextConfig: NextConfig = {
 
   async headers() {
     if (!frameAncestors) return [];
-    return [
-      {
-        source: "/web-agent",
-        headers: [{ key: "Content-Security-Policy", value: `frame-ancestors 'self' ${frameAncestors}` }],
-      },
-    ];
+    // Both Missive sidebar pages: order lookup and the quote agent.
+    return ["/web-agent", "/quote-agent"].map((source) => ({
+      source,
+      headers: [{ key: "Content-Security-Policy", value: `frame-ancestors 'self' ${frameAncestors}` }],
+    }));
   },
 };
 

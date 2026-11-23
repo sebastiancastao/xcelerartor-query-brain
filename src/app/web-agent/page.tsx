@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import type { OrderInquiry } from "@/lib/xcelerator";
 import type { InquiryEmail } from "@/lib/agent";
@@ -12,7 +12,6 @@ import {
   insertIntoMissiveReply,
   isMissiveHost,
   openLinkInNewTab,
-  readMissiveThread,
   type MissiveSenseStatus,
 } from "@/components/MissiveEmailSense";
 import { EmailDocuments, type EmailDocumentList } from "@/components/EmailDocuments";
@@ -20,7 +19,8 @@ import { UploadDocumentsToOrder } from "@/components/UploadDocumentsToOrder";
 import { ChargeBreakdown } from "@/components/ChargeBreakdown";
 import { useOrderAttachments } from "@/components/useOrderAttachments";
 import { QuoteReadingDocuments, QuoteRequest } from "@/components/QuoteRequest";
-import type { QuoteRequestDetection, ThreadMessage } from "@/lib/quote-types";
+import { useQuoteDetection } from "@/components/useQuoteDetection";
+import { useEmbedded } from "@/components/useEmbedded";
 
 type LookupState =
   | { status: "idle" }
@@ -221,24 +221,6 @@ function StatusRow({
   );
 }
 
-// Embed mode: on automatically when this page runs inside an iframe (e.g. a
-// Missive sidebar or another app), or forced with ?embed=1. Read through
-// useSyncExternalStore so the server render (never embedded) and the first
-// client render agree, then it switches once the browser is known.
-function detectEmbedded(): boolean {
-  try {
-    if (new URLSearchParams(window.location.search).has("embed")) return true;
-    return window.self !== window.top;
-  } catch {
-    return true; // cross-origin access to window.top throws only when framed
-  }
-}
-const noopSubscribe = () => () => {};
-
-function useEmbedded(): boolean {
-  return useSyncExternalStore(noopSubscribe, detectEmbedded, () => false);
-}
-
 export default function WebAgentHome() {
   const embedded = useEmbedded();
   // Card padding shrinks in embed mode, where the page sits in a narrow panel.
@@ -283,17 +265,9 @@ export default function WebAgentHome() {
   // That email's documents as the documents panel loaded them, for the link
   // under the search box and the order card's "Upload documents" button.
   const [emailDocs, setEmailDocs] = useState<EmailDocumentList | null>(null);
-  // Set when the open email asks for a price quote: the quote card prices it
-  // on the rate sheet. `id` changes per scan so a new email gets a fresh card.
-  const [quoteRequest, setQuoteRequest] = useState<{
-    id: number;
-    email: InquiryEmail;
-    detection: QuoteRequestDetection;
-    /** Set while the email's documents are being read; the card waits for them. */
-    readingDocuments?: string[];
-  } | null>(null);
-  // Numbers each quote check; only the newest email's answer may show.
-  const quoteSeqRef = useRef(0);
+  // Whether the open email asks for a price quote: the quote card prices it
+  // on the rate sheet. Shared with /quote-agent.
+  const quote = useQuoteDetection();
 
   useEffect(() => {
     fetch("/api/config")
@@ -437,74 +411,6 @@ export default function WebAgentHome() {
     return top?.value ?? null;
   }
 
-  // Asks whether the email is a quote request. Runs beside the order lookup:
-  // a quote request usually has no order number, and when it has one both show.
-  // The email is read with its thread's earlier messages; when it is a quote
-  // request with attachments or document links, those are read too before
-  // the card opens, since they often hold the weights and addresses.
-  async function checkQuoteRequest(email: InquiryEmail, conversationId: string | null) {
-    const seq = ++quoteSeqRef.current;
-    setQuoteRequest(null);
-    if (!email.body.trim()) return;
-    const ask = async (thread: ThreadMessage[] | null, withDocuments: boolean) => {
-      const res = await fetch("/api/web-agent/quote/detect", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email, conversationId, thread, withDocuments }),
-      });
-      const data = (await res.json().catch(() => null)) as {
-        detection?: QuoteRequestDetection;
-        documentsToRead?: string[];
-        error?: string;
-      } | null;
-      return { ok: res.ok, data };
-    };
-    try {
-      // Read through Missive as the signed-in CSR; null lets the server try its own token.
-      const thread = conversationId ? await readMissiveThread(conversationId) : null;
-      if (seq !== quoteSeqRef.current) return;
-      const first = await ask(thread, false);
-      const detection = first.data?.detection;
-      if (seq !== quoteSeqRef.current || !first.ok || !detection?.isQuoteRequest) return;
-      const toRead = first.data?.documentsToRead ?? [];
-      if (toRead.length === 0) {
-        setQuoteRequest({ id: seq, email, detection });
-        return;
-      }
-
-      setQuoteRequest({ id: seq, email, detection, readingDocuments: toRead });
-      let withDocs: Awaited<ReturnType<typeof ask>> | null = null;
-      try {
-        withDocs = await ask(thread, true);
-      } catch {
-        // Kept as the first reading below, with a note.
-      }
-      if (seq !== quoteSeqRef.current) return;
-      const read = withDocs?.data?.detection;
-      if (withDocs?.ok && read) {
-        // A second reading that no longer sees a quote request keeps the first one.
-        setQuoteRequest({ id: seq, email, detection: read.isQuoteRequest ? read : detection });
-        return;
-      }
-      const why = withDocs?.data?.error ?? "Network error";
-      setQuoteRequest({
-        id: seq,
-        email,
-        detection: {
-          ...detection,
-          read: {
-            threadMessages: detection.read?.threadMessages ?? 0,
-            documents: [],
-            skipped: detection.read?.skipped ?? [],
-            documentsUnavailable: `The attachments couldn't be read, so the card has only what the emails say (${why.replace(/\.+$/, "")}).`,
-          },
-        },
-      });
-    } catch {
-      // Not knowing is treated as "not a quote request"; the order lookup is unaffected.
-    }
-  }
-
   // Called by MissiveEmailSense whenever the CSR opens a different email in
   // Missive: runs detection and looks the top reference up straight away.
   function handleMissiveEmailText(
@@ -513,7 +419,9 @@ export default function WebAgentHome() {
   ) {
     const email = { subject: meta.subject, from: meta.from, fromName: meta.fromName, body: meta.body };
     openEmailRef.current = email;
-    void checkQuoteRequest(email, meta.conversationId || null);
+    // Runs beside the order lookup: a quote request usually has no order
+    // number, and when it has one both show.
+    void quote.check(email, meta.conversationId || null);
     setEmailScan((prev) => ({ conversationId: meta.conversationId, scanId: (prev?.scanId ?? 0) + 1 }));
     const top = applyDetectedText(text);
     if (top && top !== lastAutoLookedUpRef.current) {
@@ -638,8 +546,7 @@ export default function WebAgentHome() {
                 // as it arrives, and this notice can land after that.
                 if (status !== "ready" && status !== "scanning") {
                   openEmailRef.current = null;
-                  quoteSeqRef.current += 1;
-                  setQuoteRequest(null);
+                  quote.clear();
                 }
               }}
               pasteFallback={false}
@@ -689,25 +596,25 @@ export default function WebAgentHome() {
           </p>
         )}
 
-        {quoteRequest?.readingDocuments && (
+        {quote.state.status === "reading-documents" && (
           <QuoteReadingDocuments
-            summary={quoteRequest.detection.summary}
-            documents={quoteRequest.readingDocuments}
+            summary={quote.state.detection.summary}
+            documents={quote.state.documents}
             cardClass={card}
           />
         )}
 
-        {quoteRequest && !quoteRequest.readingDocuments && (
+        {quote.state.status === "ready" && (
           <QuoteRequest
-            key={quoteRequest.id}
-            detection={quoteRequest.detection}
-            email={quoteRequest.email}
+            key={quote.state.id}
+            detection={quote.state.detection}
+            email={quote.state.email}
             missiveHost={missiveHost}
             cardClass={card}
           />
         )}
 
-        {state.status === "idle" && !quoteRequest && (
+        {state.status === "idle" && quote.state.status !== "ready" && quote.state.status !== "reading-documents" && (
           <div className={`flex flex-col items-center gap-3 rounded-2xl border border-dashed border-zinc-300 bg-white/60 px-6 ${embedded ? "py-6" : "py-16"} text-center dark:border-zinc-700 dark:bg-zinc-900/40`}>
             <div className="flex h-12 w-12 items-center justify-center rounded-full bg-indigo-50 text-indigo-600 dark:bg-indigo-950 dark:text-indigo-400">
               <SearchIcon className="h-5 w-5" />

@@ -307,20 +307,25 @@ function isPast(wall: string | null): boolean {
  * thread and its documents state. Without the AI (not set up, or its call
  * failed) text rules read the open email alone; `rulesFallback: false` throws
  * instead, for a second reading with documents whose first answer stands.
+ * `assumeQuote` is for a CSR who says the email is a quote request ("Quote it
+ * anyway"): it is read as one even without price words or the AI agreeing.
  */
 export async function detectQuoteRequest(
   email: InquiryEmail,
   context: QuoteContext = NO_CONTEXT,
-  options: { rulesFallback?: boolean } = {},
+  options: { rulesFallback?: boolean; assumeQuote?: boolean } = {},
 ): Promise<QuoteRequestDetection> {
   const rulesFallback = options.rulesFallback ?? true;
+  const assumeQuote = options.assumeQuote === true;
   const haystack = [email.subject, email.body, ...context.thread.map((m) => m.text)].join("\n");
-  if (!PRICE_WORDS.test(haystack)) return NOT_A_QUOTE;
+  if (!assumeQuote && !PRICE_WORDS.test(haystack)) return NOT_A_QUOTE;
   const rules = readQuoteFieldsByRules(email.subject, email.body);
   // Without the AI: "quote"/"estimate" in so many words, or a price question
   // ("how much…") that names where the shipment goes from and to.
   const looksLikeQuote =
-    EXPLICIT_QUOTE_WORDS.test(haystack) || Boolean(rules.pickupAddress && rules.deliveryAddress);
+    assumeQuote ||
+    EXPLICIT_QUOTE_WORDS.test(haystack) ||
+    Boolean(rules.pickupAddress && rules.deliveryAddress);
   const byRulesOnly = (unreadReason: string): QuoteRequestDetection =>
     // No AI estimates: the card still sizes the vehicle from the weight the rules read.
     looksLikeQuote
@@ -339,6 +344,9 @@ export async function detectQuoteRequest(
   });
   const emailText =
     `Today is ${todayText()}, ${now} in Atlanta.\n\n` +
+    (assumeQuote
+      ? "A CSR has marked this email as a quote request: set isQuoteRequest to true and read the shipment details it gives.\n\n"
+      : "") +
     `Newest email (the one being answered):\n"""\n${emailForPrompt(email)}\n"""` +
     threadForPrompt(context.thread);
   const content: string | UserContentPart[] =
@@ -364,7 +372,7 @@ export async function detectQuoteRequest(
       maxTokens: 800,
     });
     const data = JSON.parse(res.choices[0]?.message.content ?? "") as Record<string, unknown>;
-    if (data.isQuoteRequest !== true) return NOT_A_QUOTE;
+    if (data.isQuoteRequest !== true && !assumeQuote) return NOT_A_QUOTE;
     const aiFields = readFields(data.fields);
     const claimed = data.sources && typeof data.sources === "object" ? (data.sources as Record<string, unknown>) : {};
     // The model sometimes "states" a vehicle for a load the email only

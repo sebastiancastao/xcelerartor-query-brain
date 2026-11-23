@@ -258,7 +258,20 @@ function statusLabel(
   subject: string,
   errorMessage: string,
   pasteFallback: boolean,
+  purpose: "order" | "quote",
 ): string {
+  if (purpose === "quote") {
+    switch (status) {
+      case "not-embedded":
+        return "Not opened inside Missive — paste a quote email below, or start a blank quote.";
+      case "waiting":
+        return "Open an email in Missive — a quote request in it is read and priced here.";
+      case "empty":
+        return "The selected email has no text to read.";
+      case "not-configured":
+        return "Missive isn't connected yet (set MISSIVE_API_TOKEN) — paste a quote email below instead.";
+    }
+  }
   switch (status) {
     case "loading-script":
       return "Connecting to Missive…";
@@ -294,6 +307,7 @@ export function MissiveEmailSense({
   onEmailText,
   onStatusChange,
   pasteFallback = true,
+  purpose = "order",
 }: {
   onEmailText: (
     text: string,
@@ -302,6 +316,8 @@ export function MissiveEmailSense({
   onStatusChange?: (status: MissiveSenseStatus) => void;
   /** Whether the page has a "paste an email" box for the status line to point to. */
   pasteFallback?: boolean;
+  /** What the page does with the email, for the status wording: find its order, or price its quote. */
+  purpose?: "order" | "quote";
 }) {
   const [status, setStatus] = useState<MissiveSenseStatus>("loading-script");
   const [subject, setSubject] = useState("");
@@ -473,8 +489,8 @@ export function MissiveEmailSense({
                   : "bg-zinc-300 dark:bg-zinc-600"
           }`}
         />
-        {statusLabel(status, subject, errorMessage, pasteFallback) && (
-          <span>{statusLabel(status, subject, errorMessage, pasteFallback)}</span>
+        {statusLabel(status, subject, errorMessage, pasteFallback, purpose) && (
+          <span>{statusLabel(status, subject, errorMessage, pasteFallback, purpose)}</span>
         )}
         {selectedConversationId && status !== "scanning" && (
           <button
