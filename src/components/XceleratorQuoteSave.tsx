@@ -59,6 +59,9 @@ export function XceleratorQuoteSave({
   const [results, setResults] = useState<XceleratorAccount[] | null>(null);
   const [searchError, setSearchError] = useState("");
   const [save, setSave] = useState<SaveState>({ status: "idle" });
+  // The back-office login isn't set on this deployment (HTTP 501): submitting
+  // is switched off without a message, so the card stays uncluttered.
+  const [unavailable, setUnavailable] = useState(false);
   const placesSet = Boolean(pickupAddress && deliveryAddress);
   const sectionRef = useRef<HTMLDivElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
@@ -82,7 +85,9 @@ export function XceleratorQuoteSave({
         const data = (await res.json().catch(() => null)) as
           | { account?: XceleratorAccount | null; candidates?: XceleratorAccount[]; error?: string }
           | null;
-        if (!res.ok) {
+        if (res.status === 501) {
+          setUnavailable(true);
+        } else if (!res.ok) {
           setSave({ status: "error", message: data?.error ?? `Xcelerator error (${res.status})` });
         } else {
           setAccount(data?.account ?? null);
@@ -108,8 +113,9 @@ export function XceleratorQuoteSave({
         const res = await fetch(`/api/web-agent/quote/xcelerator/accounts?q=${encodeURIComponent(q)}`);
         const data = (await res.json().catch(() => null)) as { accounts?: XceleratorAccount[]; error?: string } | null;
         if (cancelled) return;
+        if (res.status === 501) setUnavailable(true);
         setResults(res.ok ? (data?.accounts ?? []) : []);
-        setSearchError(res.ok ? "" : (data?.error ?? "The account search failed."));
+        setSearchError(res.ok || res.status === 501 ? "" : (data?.error ?? "The account search failed."));
       } catch {
         if (!cancelled) setSearchError("The account search failed.");
       }
@@ -131,7 +137,7 @@ export function XceleratorQuoteSave({
     if (!pendingSubmit.current || suggesting) return;
     pendingSubmit.current = false;
     if (!account) searchRef.current?.focus();
-    else if (placesSet && (save.status === "idle" || save.status === "error")) void send("preview");
+    else if (placesSet && !unavailable && (save.status === "idle" || save.status === "error")) void send("preview");
     // send and the state it reads are current on the render that runs this.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [submitRequest, suggesting]);
@@ -165,7 +171,10 @@ export function XceleratorQuoteSave({
       const data = (await res.json().catch(() => null)) as
         | { plan?: XceleratorQuotePlan; saved?: SavedXceleratorQuote; error?: string }
         | null;
-      if (!res.ok) {
+      if (res.status === 501) {
+        setUnavailable(true);
+        setSave({ status: "idle" });
+      } else if (!res.ok) {
         setSave({ status: "error", message: data?.error ?? `Xcelerator error (${res.status})` });
       } else if (action === "preview" && data?.plan) {
         setSave({ status: "preview", plan: data.plan });
@@ -247,7 +256,7 @@ export function XceleratorQuoteSave({
             {query.trim().length >= 2 && results?.length === 0 && (
               <span className="text-xs text-zinc-500 dark:text-zinc-400">No account starts with that.</span>
             )}
-            {!suggesting && (
+            {!suggesting && !unavailable && (
               <span className="text-xs text-zinc-500 dark:text-zinc-400">
                 {candidates.length > 0 ? "Pick the sender's account. " : "No account matched the sender. "}
                 Xcelerator keeps quotes under an account only, so for a new customer pick a prospects account or add the
@@ -310,14 +319,22 @@ export function XceleratorQuoteSave({
           <button
             type="button"
             onClick={() => void send("preview")}
-            disabled={!account || !placesSet || busy}
-            title={!placesSet ? "Fill in the pickup and delivery places first" : !account ? "Choose the account first" : undefined}
+            disabled={!account || !placesSet || busy || unavailable}
+            title={
+              unavailable
+                ? "Not connected to Xcelerator's back office"
+                : !placesSet
+                  ? "Fill in the pickup and delivery places first"
+                  : !account
+                    ? "Choose the account first"
+                    : undefined
+            }
             className={`${buttonClass} bg-indigo-600 text-white hover:bg-indigo-500 dark:bg-indigo-500 dark:hover:bg-indigo-400`}
           >
             {save.status === "checking" ? "Checking with Xcelerator…" : "Submit to Xcelerator"}
           </button>
         )}
-        {!plan && (
+        {!plan && !unavailable && (
           <span className="text-xs text-zinc-500 dark:text-zinc-400">
             {!placesSet
               ? "Fill in the pickup and delivery places and recalculate first."

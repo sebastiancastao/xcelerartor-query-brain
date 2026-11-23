@@ -30,6 +30,8 @@ export async function POST(request: Request) {
 
   try {
     const quote = calculateQuote(inputs);
+    // A page that doesn't show the reply asks for none, which skips the AI call.
+    if (body?.draftReply === false) return NextResponse.json({ quote, reply: "" });
     const reply = await draftQuoteReply(readEmail(body?.email), quote, inputs, {
       pickupAddress: address(body?.route?.pickupAddress),
       deliveryAddress: address(body?.route?.deliveryAddress),

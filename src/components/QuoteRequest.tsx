@@ -363,6 +363,7 @@ export function QuoteRequest({
   email,
   missiveHost,
   cardClass,
+  showReply = true,
 }: {
   detection: QuoteRequestDetection;
   /** The email the quote answers. */
@@ -370,6 +371,8 @@ export function QuoteRequest({
   /** Whether Missive is hosting the page, so the reply can go into a draft there. */
   missiveHost: boolean;
   cardClass: string;
+  /** Whether the suggested reply is drafted and shown under the price (off on /quote-agent for now). */
+  showReply?: boolean;
 }) {
   const fields = detection.fields;
   const estimates = detection.estimates;
@@ -448,6 +451,7 @@ export function QuoteRequest({
         body: JSON.stringify({
           inputs: built.inputs,
           email,
+          draftReply: showReply,
           route: {
             pickupAddress: current.pickupAddress.trim() || null,
             deliveryAddress: current.deliveryAddress.trim() || null,
@@ -1225,44 +1229,48 @@ export function QuoteRequest({
             submitRequest={submitRequest}
           />
 
-          <div className="mb-3 mt-5 flex flex-wrap items-center justify-between gap-2">
-            <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Suggested reply with the quote</h3>
-            <div className="flex items-center gap-2">
-              {missiveHost && (
-                <button
-                  type="button"
-                  onClick={() => void handleInsert(calc.reply)}
-                  disabled={insert.status === "inserting"}
-                  title="Opens a reply to this email in Missive with this text in it. Nothing is sent."
-                  className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-2.5 py-1.5 text-xs font-medium text-white shadow-sm transition-colors hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-indigo-500 dark:hover:bg-indigo-400"
-                >
-                  {insert.status === "inserting" ? "Inserting…" : "Insert into reply"}
-                </button>
+          {showReply && (
+            <>
+              <div className="mb-3 mt-5 flex flex-wrap items-center justify-between gap-2">
+                <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Suggested reply with the quote</h3>
+                <div className="flex items-center gap-2">
+                  {missiveHost && (
+                    <button
+                      type="button"
+                      onClick={() => void handleInsert(calc.reply)}
+                      disabled={insert.status === "inserting"}
+                      title="Opens a reply to this email in Missive with this text in it. Nothing is sent."
+                      className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-2.5 py-1.5 text-xs font-medium text-white shadow-sm transition-colors hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-indigo-500 dark:hover:bg-indigo-400"
+                    >
+                      {insert.status === "inserting" ? "Inserting…" : "Insert into reply"}
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => void handleCopy(calc.reply)}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-zinc-300 px-2.5 py-1.5 text-xs font-medium text-zinc-700 transition-colors hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800"
+                  >
+                    {copied ? "Copied!" : "Copy"}
+                  </button>
+                </div>
+              </div>
+              <textarea
+                readOnly
+                value={calc.reply}
+                rows={10}
+                className="w-full resize-none rounded-xl border border-zinc-200 bg-zinc-50 p-3.5 font-mono text-xs leading-relaxed text-zinc-800 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-200"
+              />
+              {insert.status === "inserted" && (
+                <p className="mt-2 text-xs text-emerald-700 dark:text-emerald-400">
+                  Put into a reply in Missive. Nothing was sent: review it there and send it.
+                </p>
               )}
-              <button
-                type="button"
-                onClick={() => void handleCopy(calc.reply)}
-                className="inline-flex items-center gap-1.5 rounded-lg border border-zinc-300 px-2.5 py-1.5 text-xs font-medium text-zinc-700 transition-colors hover:bg-zinc-100 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-800"
-              >
-                {copied ? "Copied!" : "Copy"}
-              </button>
-            </div>
-          </div>
-          <textarea
-            readOnly
-            value={calc.reply}
-            rows={10}
-            className="w-full resize-none rounded-xl border border-zinc-200 bg-zinc-50 p-3.5 font-mono text-xs leading-relaxed text-zinc-800 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-200"
-          />
-          {insert.status === "inserted" && (
-            <p className="mt-2 text-xs text-emerald-700 dark:text-emerald-400">
-              Put into a reply in Missive. Nothing was sent: review it there and send it.
-            </p>
-          )}
-          {insert.status === "error" && (
-            <p className="mt-2 text-xs text-red-600 dark:text-red-400">
-              Couldn&apos;t put the reply into Missive ({insert.message}). Use Copy instead.
-            </p>
+              {insert.status === "error" && (
+                <p className="mt-2 text-xs text-red-600 dark:text-red-400">
+                  Couldn&apos;t put the reply into Missive ({insert.message}). Use Copy instead.
+                </p>
+              )}
+            </>
           )}
 
         </div>

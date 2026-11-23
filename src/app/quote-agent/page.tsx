@@ -290,6 +290,7 @@ export default function QuoteAgentHome() {
             email={s.email}
             missiveHost={missiveHost}
             cardClass={card}
+            showReply={false}
           />
         )}
       </main>
